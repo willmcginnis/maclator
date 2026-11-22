@@ -108,6 +108,17 @@ pub fn cache_dir() -> Option<String> {
     CACHE_DIR.lock().unwrap().clone()
 }
 
+/// Whether guest path `path` is exactly one of the cache prefixes while a cache dir is set: the
+/// guest directory that IS the sysroot (the path rewrite treats it as a directory however the host
+/// reaches the sysroot).
+pub fn is_cache_root(path: &str) -> bool {
+    cache_root_for(path, CACHE_DIR.lock().unwrap().is_some())
+}
+
+fn cache_root_for(path: &str, set: bool) -> bool {
+    set && CACHE_PREFIXES.contains(&path)
+}
+
 /// Find a directory holding the arm64 dyld shared cache when `--sysroot` was not given:
 /// `$MACLATOR_SYSROOT`, then `~/.maclator/sysroot` (a directory, or a file containing one),
 /// then any `~/maclator-sysroot/*` subdirectory that has a `dyld_shared_cache_arm64e`.
@@ -154,5 +165,16 @@ mod tests {
         assert!(normalized_absolute("/../../Library").is_none());
         assert!(overlay_path(&root, "Library/Developer/PrivateFrameworks/Example.framework").is_none());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cache_root_is_a_prefix_exactly() {
+        for p in CACHE_PREFIXES {
+            assert!(cache_root_for(p, true), "{p}");
+            assert!(!cache_root_for(p, false), "{p}: no cache dir set"); // must-fail control
+        }
+        for p in ["/System/Library/dyld/", "/System/Library/dyld/x", "/System/Library", "/", ""] {
+            assert!(!cache_root_for(p, true), "{p}");
+        }
     }
 }

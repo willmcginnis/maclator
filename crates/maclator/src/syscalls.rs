@@ -96,6 +96,20 @@ fn guest_cstr(p: u64, max: usize, mut read: impl FnMut(u64, &mut [u8]) -> bool) 
     None
 }
 
+/// XNU's limit on a path name, its NUL included (sys/syslimits.h PATH_MAX, sys/param.h MAXPATHLEN):
+/// namei's copyinstr refuses a name of 1024 bytes or more with ENAMETOOLONG before any lookup
+/// (measured on macOS 27.0.1, arm64, natively and under Rosetta, and on 27.0.1's x86 kernel: 1023 looks up).
+const MAXPATHLEN: usize = 1024;
+
+/// Whether bsd() may rewrite the name it read. A name XNU would refuse
+/// as too long is passed through untouched, so the host kernel refuses it the same way; translated,
+/// walk_dotdot or the redirect could otherwise shrink it into one that runs. `from_utf8_lossy`
+/// only ever lengthens a name, so a name under the limit in guest bytes may be passed through too:
+/// the host then answers for it, which is the call as it came.
+fn rewritable(name: &str) -> bool {
+    name.len() < MAXPATHLEN
+}
+
 fn guest_name(p: u64) -> Option<String> {
     guest_cstr(p, GUEST_NAME_MAX, crate::guestmem::read)
 }
@@ -208,6 +222,48 @@ fn fd_guest_path(fd: i32) -> Option<String> {
     None
 }
 
+/// The host's own path for descriptor `fd`: F_GETPATH, mapped back
+/// to guest space through the overlay where one is set, else the host path itself. Unlike
+/// fd_guest_path this is NOT gated on an overlay root, because the firmlink correction it serves
+/// applies with only a sysroot set. None if the descriptor has no path (F_GETPATH failed).
+fn host_fd_path(fd: i32) -> Option<String> {
+    if fd < 0 {
+        return None;
+    }
+    let mut path = [0u8; 1024];
+    if unsafe { libc::fcntl(fd, libc::F_GETPATH, path.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let end = path.iter().position(|&c| c == 0)?;
+    let host = std::str::from_utf8(&path[..end]).ok()?;
+    Some(crate::paths::guest_path(host).unwrap_or_else(|| host.to_string()))
+}
+
+/// Whether host path `h` is the sysroot or beneath it: only there is the guest path H
+/// computed the one a descriptor records, since F_GETPATH gives the sysroot's host spelling.
+fn inside_sysroot(h: &str, dir: Option<&str>) -> bool {
+    dir.is_some_and(|d| h.strip_prefix(d).is_some_and(|r| r.is_empty() || r.starts_with('/')))
+}
+
+/// The guest path a descriptor opened by a successful open records. When the host opened
+/// something inside the sysroot: the guest path H
+/// computed, which F_GETPATH cannot map back out of the sysroot. Otherwise the host's own F_GETPATH
+/// (`host`), because what the host opened is where a later relative *at call starts: an un-redirected
+/// open and also a redirected one that climbed out of the prefix, which round 4 recorded
+/// lexically (`<cache dir>/<up>System/Volumes/Data/Applications/..` recorded /System/Volumes/Data, and
+/// a later `../../Library/dyld/<cache file>` then reached the sysroot). If F_GETPATH fails, nothing is
+/// recorded, so a later relative call goes to the host as it came; round 4 fell back to the lexical
+/// path there, which is round 3's bug again. A record is a snapshot taken at the open: a later rename
+/// of the directory is not seen (the host's own descriptor follows it; the record does not), and the
+/// host's spelling is recorded (/private/var where the guest said /var).
+fn descriptor_record(guest: &str, in_sysroot: bool, host: impl FnOnce() -> Option<String>) -> Option<String> {
+    if in_sysroot {
+        Some(recorded_path(guest))
+    } else {
+        host().map(|h| recorded_path(&h))
+    }
+}
+
 fn rewrite_fd_path(cpu: &mut Cpu, args: &[u64; 8]) {
     let mut path = [0u8; 1024];
     if !crate::guestmem::read(args[2], &mut path) {
@@ -300,6 +356,791 @@ fn guest_full_path(name: &str, at: bool, dir: impl FnOnce() -> Option<String>) -
         dir().map(|b| vpath_join(&b, name))
     } else {
         None
+    }
+}
+
+/// What a guest path names, as far as `walk_dotdot` needs to know.
+#[derive(Debug, PartialEq)]
+enum Node {
+    /// a directory that is not a symlink
+    Dir,
+    /// a symlink, with its target as stored
+    Link(String),
+    /// anything else: absent, unreadable, not a directory, a target that is not UTF-8
+    Other,
+}
+
+/// What walk_dotdot decided.
+#[derive(Debug, PartialEq)]
+enum Walk {
+    /// No symlink was met: the path with its `..` taken in the guest's view, or None to keep it as it came.
+    Lexical(Option<String>),
+    /// A symlink stood in what a `.` or `..` looks through: the name for the kernel to look up itself, which
+    /// is the directories walked before the first such link (their `..` already taken) and then the rest of
+    /// the path exactly as written, from that link on.
+    Kernel(String),
+}
+
+/// Where bsd() sends a name that has a `..`.
+#[derive(Debug, PartialEq)]
+enum Dotdot {
+    /// unchanged: the redirect sees the name as it came
+    Keep,
+    /// this guest path, which the redirect then sees
+    Path(String),
+    /// this name to the host as it is, never redirected: the host kernel does every check of the lookup
+    Host(String),
+}
+
+/// What the host kernel answered for a probe name.
+#[derive(Debug, PartialEq)]
+enum Probe {
+    /// the lookup failed (any errno): the real call fails on the way too, for the same reason
+    Refused,
+    /// the lookup succeeded and landed here (the host's spelling, mapped back through an overlay)
+    At(String),
+    /// the lookup succeeded, but where it landed could not be read
+    Unplaced,
+}
+
+/// The `..` components of absolute guest path `path`, taken in the guest's view: a directory
+/// before a `..` is popped, and `..` at / stays at / (xnu bsd/vfs/vfs_lookup.c, lookup's ISDOTDOT case). The
+/// guest's view matters because the redirect matches a cache prefix as a string: before this,
+/// `<cache dir>/../dyld/x` became `<sysroot>/../dyld/x`, the sysroot's HOST parent (test
+/// rows Y7, Y8). `node` says what a guest path names (guest_node_as). Lexical(None), and the caller keeps
+/// `path` exactly as it was, when the path is relative or has no `..` component.
+///
+/// H never walks a symlink. At each `.` and `..`, if any
+/// component of what has been walked is a symlink (explicit, right before the `..`, or implicit, further back,
+/// which the host's own lstat expands), the walk stops with Kernel: the host kernel looks the name up itself,
+/// so its length (linklen + what follows the link >= MAXPATHLEN: ENAMETOOLONG), credential (access and
+/// faccessat without AT_EACCESS walk as the real ids), loop (more than 32 links: ELOOP) and permission checks are XNU's own,
+/// not an emulation of them. Six rounds of review each found another corner where H's own link walk diverged
+/// from XNU's (an expansion's length counted against the wrong remainder, through `.`, after a later link;
+/// a link read with the effective ids where the call looks up with the real ones); H v7 has no link walk.
+/// Links never reach this walk in real use: of 6,442 path calls of 13 real programs on macOS 27.0.1, arm64, none had an
+/// absolute or joined name with a `..`.
+///
+/// Without a link, as H v2-v6: where XNU refuses (a `..` after something that is not a searchable directory
+/// whose `..` is its lexical parent: ENOENT, ENOTDIR, EACCES, a firmlink) the walk stops, and the `..` already
+/// taken are kept while the refused `..` and the rest stay as written, so the host refuses inside the
+/// sysroot rather than in its parent; Lexical(None) if nothing was walked. A `.` after something that is not
+/// a searchable directory stops the same way. A trailing `/` or `/.` is kept: `file/.` is
+/// ENOTDIR where `file` opens. A trailing `..` (or `.`) ends the result in `/.`: rmdir of `x/..` is
+/// EINVAL, which `x/.` is too and `x/` is not (measured on macOS 27.0.1, arm64).
+fn walk_dotdot(path: &str, node: impl Fn(&str) -> Node) -> Walk {
+    if !path.starts_with('/') || !path.split('/').any(|c| c == "..") {
+        return Walk::Lexical(None);
+    }
+    let comps: Vec<&str> = path.split('/').collect();
+    let abs = |acc: &[(&str, usize)]| format!("/{}", acc.iter().map(|(c, _)| *c).collect::<Vec<&str>>().join("/"));
+    let with_rest = |mut out: String, rest: &[&str]| {
+        for r in rest {
+            out.push('/');
+            out.push_str(r);
+        }
+        out
+    };
+    // acc: each walked component, with its index in `comps`, so the kernel's name keeps the rest as written
+    let mut acc: Vec<(&str, usize)> = Vec::new();
+    let mut walked = false;
+    for (i, &c) in comps.iter().enumerate() {
+        if c.is_empty() {
+            continue;
+        }
+        if c != "." && c != ".." {
+            acc.push((c, i));
+            continue;
+        }
+        // A symlink anywhere in what is walked: the kernel looks the name up itself.
+        if let Some(j) = (0..acc.len()).find(|&j| matches!(node(&abs(&acc[..=j])), Node::Link(_))) {
+            let tail = comps[acc[j].1..].join("/");
+            return Walk::Kernel(if j == 0 { format!("/{tail}") } else { format!("{}/{tail}", abs(&acc[..j])) });
+        }
+        if c == "." {
+            // A `.` is a no-op only after a directory the caller can search.
+            // After a file XNU answers ENOTDIR, after a non-searchable dir EACCES: hand the host the `.` and
+            // the rest, which it refuses exactly as XNU does.
+            if !acc.is_empty() && !matches!(node(&abs(&acc)), Node::Dir) {
+                let out = with_rest(format!("{}/.", abs(&acc)), &comps[i + 1..]);
+                return Walk::Lexical((out != path).then_some(out));
+            }
+            continue;
+        }
+        if acc.is_empty() {
+            continue; // `..` at / is /
+        }
+        if matches!(node(&abs(&acc)), Node::Dir) {
+            acc.pop();
+            walked = true;
+            continue;
+        }
+        if !walked {
+            return Walk::Lexical(None);
+        }
+        let out = with_rest(format!("{}/..", abs(&acc)), &comps[i + 1..]);
+        return Walk::Lexical((out != path).then_some(out));
+    }
+    let mut out = abs(&acc);
+    if out.len() > 1 {
+        if matches!(path.rsplit('/').find(|c| !c.is_empty()), Some(".." | ".")) {
+            out.push_str("/.");
+        } else if path.ends_with('/') {
+            out.push('/');
+        }
+    }
+    Walk::Lexical(Some(out))
+}
+
+/// The name the kernel is asked about for Kernel name `k`, and what follows where it lands. The
+/// last component is replaced by `.` components of the same length in bytes: XNU refuses a link whose target
+/// plus what follows it in the name reaches MAXPATHLEN, so the probe keeps every link's remainder exactly as
+/// long as in the real name (measured on macOS 27.0.1, arm64: the probe fails with the real name's errno at every
+/// boundary), while the last component itself, which may exist only in the sysroot,
+/// is not looked up. A name ending in `..`, `.` or `/` is asked about whole.
+fn kernel_name(k: &str) -> (String, String) {
+    let (dir, last) = k.rsplit_once('/').unwrap_or(("", k));
+    match last {
+        "" => (k.to_string(), "/".to_string()),
+        "." | ".." => (k.to_string(), "/.".to_string()),
+        _ => {
+            let mut pad = "./".repeat(last.len() / 2);
+            if last.len() % 2 == 1 {
+                pad.push('.');
+            }
+            (format!("{dir}/{pad}"), format!("/{last}"))
+        }
+    }
+}
+
+/// Where bsd() sends absolute guest path `path`. Without a symlink, walk_dotdot's answer. With one:
+/// a NOFOLLOW_ANY call (`follow` false) goes to the host, which answers ELOOP as XNU does; otherwise `kernel`
+/// looks the probe name up with the call's credentials `ids`. If it lands where `redirected` says the redirect
+/// takes over (a cache prefix, or an overlaid path), the call goes there, through the redirect; in every other
+/// case the host gets the name and does every check itself. A stated limit: the probe walks the host's tree,
+/// so a symlink INSIDE a cache prefix is looked up in the host's own directory there, not in the sysroot
+/// (there are none in macOS 27.0.1's system, its cryptex or the sysroots, measured); and when
+/// the lookup succeeds with the call's credentials but getattrlist (the effective ids) cannot place it, the
+/// host gets the name unredirected.
+fn resolve_dotdot(path: &str, follow: bool, ids: Ids, node: impl Fn(&str) -> Node, kernel: impl Fn(&str, Ids) -> Probe,
+                  redirected: impl Fn(&str) -> bool) -> Dotdot {
+    match walk_dotdot(path, node) {
+        Walk::Lexical(None) => Dotdot::Keep,
+        Walk::Lexical(Some(p)) => Dotdot::Path(p),
+        Walk::Kernel(k) => {
+            if !follow {
+                return Dotdot::Host(k);
+            }
+            let (probe, after) = kernel_name(&k);
+            match kernel(&probe, ids) {
+                Probe::At(at) => {
+                    let landed = format!("{}{after}", at.trim_end_matches('/'));
+                    if redirected(&landed) { Dotdot::Path(landed) } else { Dotdot::Host(k) }
+                }
+                Probe::Refused | Probe::Unplaced => Dotdot::Host(k),
+            }
+        }
+    }
+}
+
+/// The host kernel's lookup of `probe` for resolve_dotdot: faccessat(F_OK) with the call's own
+/// credentials (the real ids for access and faccessat without AT_EACCESS), then where it landed.
+fn kernel_lookup(probe: &str, ids: Ids) -> Probe {
+    let Ok(c) = std::ffi::CString::new(probe) else { return Probe::Refused };
+    let flag = if ids == Ids::Real { 0 } else { libc::AT_EACCESS };
+    if unsafe { libc::faccessat(libc::AT_FDCWD, c.as_ptr(), libc::F_OK, flag) } != 0 {
+        return Probe::Refused;
+    }
+    full_path_of(&c).map_or(Probe::Unplaced, Probe::At)
+}
+
+/// getattrlist(ATTR_CMN_FULLPATH) of `c`, following links: where a lookup lands, spelled as F_GETPATH
+/// spells it (measured on macOS 27.0.1, arm64: the cryptex for /System/Cryptexes/OS/..., /Applications for the
+/// firmlinked /System/Volumes/Data/Applications, /private/tmp for /tmp), but with no descriptor, so no number in
+/// the guest's descriptor table is ever taken, even briefly. Mapped back through an overlay as host_fd_path is.
+fn full_path_of(c: &std::ffi::CStr) -> Option<String> {
+    #[repr(C)]
+    struct AttrList {
+        bitmapcount: u16,
+        reserved: u16,
+        commonattr: u32,
+        volattr: u32,
+        dirattr: u32,
+        fileattr: u32,
+        forkattr: u32,
+    }
+    extern "C" {
+        fn getattrlist(path: *const libc::c_char, list: *mut AttrList, buf: *mut libc::c_void, size: libc::size_t,
+                       options: libc::c_uint) -> libc::c_int;
+    }
+    // ATTR_BIT_MAP_COUNT 5, ATTR_CMN_FULLPATH 0x0800_0000 (sys/attr.h)
+    let mut al = AttrList { bitmapcount: 5, reserved: 0, commonattr: 0x0800_0000, volattr: 0, dirattr: 0, fileattr: 0, forkattr: 0 };
+    let mut buf = vec![0u8; 4 + 8 + MAXPATHLEN + 8];
+    if unsafe { getattrlist(c.as_ptr(), &mut al, buf.as_mut_ptr().cast(), buf.len(), 0) } != 0 {
+        return None;
+    }
+    // u32 length, then an attrreference_t (i32 offset from itself, u32 length), then the string
+    let off = i32::from_ne_bytes(buf.get(4..8)?.try_into().ok()?);
+    let len = u32::from_ne_bytes(buf.get(8..12)?.try_into().ok()?) as usize;
+    let start = usize::try_from(4i64 + i64::from(off)).ok()?;
+    let bytes = buf.get(start..start.checked_add(len)?)?;
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    let host = std::str::from_utf8(&bytes[..end]).ok()?;
+    Some(crate::paths::guest_path(host).unwrap_or_else(|| host.to_string()))
+}
+
+/// Where a path H changed goes when the redirect no longer takes it. `before` is the path
+/// as joined, `full` as normalised. When `before` was under a cache prefix and `full` has climbed out
+/// of it, the name and descriptor the call came with would walk from the sysroot, whose parent is
+/// not the guest's: the host gets `full`, which is also what the descriptor's guest path records. A
+/// path that was never under a prefix is left to the host as it came.
+fn left_the_prefix(before: &str, full: &str, redirect: impl Fn(&str) -> Option<String>) -> Option<String> {
+    (before != full && redirect(before).is_some()).then(|| full.to_string())
+}
+
+/// The guest path a descriptor opened by `p` records: `p` without the trailing `/` and
+/// `/.` that walk_dotdot keeps for the host's sake, so `<cache dir>/sub/..` records `<cache dir>`.
+fn recorded_path(p: &str) -> String {
+    let mut s = p.to_string();
+    while s.len() > 1 {
+        if let Some(t) = s.strip_suffix("/.") {
+            s = if t.is_empty() { "/".to_string() } else { t.to_string() };
+        } else if let Some(t) = s.strip_suffix('/') {
+            s = t.to_string();
+        } else {
+            break;
+        }
+    }
+    s
+}
+
+/// What guest path `p` names, through Maclator's redirect. A cache prefix itself names
+/// the sysroot, which the guest sees as a directory however the host reaches it (a sysroot given
+/// through a symlink is followed: that link is Maclator's plumbing, not a guest symlink); any
+/// other path is the host's lstat of where the redirect puts it, or of the path itself.
+/// `ids` are the credentials the call's own lookup uses.
+fn guest_node_as(p: &str, ids: Ids) -> Node {
+    let host = crate::paths::redirect(p);
+    if crate::paths::is_cache_root(p) {
+        let followed = host.as_deref().and_then(|h| std::fs::metadata(h).ok());
+        return if followed.is_some_and(|m| m.is_dir()) { Node::Dir } else { Node::Other };
+    }
+    host_node_as(&host.unwrap_or_else(|| p.to_string()), ids)
+}
+
+#[cfg(test)]
+fn guest_node(p: &str) -> Node {
+    guest_node_as(p, Ids::Effective)
+}
+
+/// The host's lstat of `h`, as a Node; a directory is searched with the call's credentials `ids`.
+fn host_node_as(h: &str, ids: Ids) -> Node {
+    match std::fs::symlink_metadata(h) {
+        Ok(m) if m.file_type().is_symlink() => {
+            std::fs::read_link(h).ok().and_then(|t| t.to_str().map(str::to_string)).map_or(Node::Other, Node::Link)
+        }
+        Ok(m) if m.is_dir() => {
+            if dir_searchable(h, ids) && dotdot_is_lexical(h) { Node::Dir } else { Node::Other }
+        }
+        _ => Node::Other,
+    }
+}
+
+#[cfg(test)]
+fn host_node(h: &str) -> Node {
+    host_node_as(h, Ids::Effective)
+}
+
+/// Whether the `..` of host directory `h` is its lexical parent. A firmlink breaks that:
+/// /System/Volumes/Data/Applications is firmlinked to
+/// /Applications, so XNU's `..` from it is /, not /System/Volumes/Data (xnu vfs_cache.c, the
+/// firmlink-parent case; measured on macOS 27.0.1, arm64). A lexical pop there hands the host a different
+/// directory, so such an `h` is not a directory H may pop: the walk stops and the host takes that `..`
+/// itself. `stat` follows a link in the parent's spelling, so `lnk/q`'s parent `lnk` compares as
+/// where the link leads, which is what a `..` from `lnk/q` reaches. Two stats per popped `..`.
+fn dotdot_is_lexical(h: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let parent = match h.rsplit_once('/') {
+        Some(("", _)) => "/",
+        Some((p, _)) => p,
+        None => return false,
+    };
+    match (std::fs::metadata(format!("{h}/..")), std::fs::metadata(parent)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+/// Whether the caller may SEARCH directory `h`. XNU checks search
+/// permission on each directory a `..` leaves; `symlink_metadata` does not, so a lexical pop of a
+/// directory the caller cannot search opened a name XNU refuses with EACCES. `faccessat(X_OK,
+/// AT_EACCESS)` is the kernel's own check against the effective ids, so root's directory-search
+/// bypass is honoured (measured on macOS 27.0.1, arm64: a 0600 dir is searchable as root, EACCES as a non-root admin user).
+/// `h` is already known to be a directory, so X_OK here means search, not file-execute.
+/// With the credentials the call itself looks
+/// up with. access() and faccessat() without AT_EACCESS walk the path as the REAL ids (XNU's access1 and
+/// faccessat_internal take a copy of the credential with the real ids for the whole namei), so a real
+/// uid 501 with effective uid 0 is refused at a 0600 directory there while open() is not (measured on
+/// macOS 27.0.1, arm64). `faccessat` with flags 0 is the kernel's own check against the real ids.
+fn dir_searchable(h: &str, ids: Ids) -> bool {
+    let flag = match ids {
+        Ids::Effective => libc::AT_EACCESS,
+        Ids::Real => 0,
+    };
+    std::ffi::CString::new(h).is_ok_and(|c| unsafe {
+        libc::faccessat(libc::AT_FDCWD, c.as_ptr(), libc::X_OK, flag) == 0
+    })
+}
+
+/// Which credentials a call's lookup uses.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Ids {
+    Effective,
+    Real,
+}
+
+/// faccessat's flag to check the effective ids (sys/fcntl.h AT_EACCESS).
+const AT_EACCESS: u64 = 0x0010;
+
+/// The credentials call `n`'s lookup uses: the real ids for access (33) and for
+/// faccessat (466) without AT_EACCESS in its flags slot, the effective ids for everything else bsd()
+/// rewrites. access_extended (284) also uses the real ids, but bsd() does not read its names.
+fn lookup_ids(n: u64, args: &[u64; 8]) -> Ids {
+    match n {
+        33 => Ids::Real,
+        466 if args[3] & AT_EACCESS == 0 => Ids::Real,
+        _ => Ids::Effective,
+    }
+}
+
+/// Whether call `n` may follow a symlink before a `..`: not with a NOFOLLOW_ANY flag,
+/// in its *at slot (nofollow_any) or in open's, open_nocancel's or getattrlist's own.
+fn follows_symlinks(n: u64, args: &[u64; 8]) -> bool {
+    let plain = match n {
+        5 | 398 => args[1] & O_NOFOLLOW_ANY,
+        220 => args[4] & FSOPT_NOFOLLOW_ANY,
+        _ => 0,
+    };
+    plain == 0 && !nofollow_any(n, args)
+}
+
+#[cfg(test)]
+mod dotdot_tests {
+    use super::*;
+
+    // A guest tree: /System/Library/dyld and /t/real/sub are directories, /t/lnk -> real/sub,
+    // /t/abs -> /System/Library/dyld, /t/up -> ../t/real, /t/loop -> loop, /t/empty -> "".
+    fn tree(p: &str) -> Node {
+        match p {
+            "/System" | "/System/Library" | "/System/Library/dyld" | "/t" | "/t/real" | "/t/real/sub" => Node::Dir,
+            "/t/lnk" => Node::Link("real/sub".into()),
+            "/t/abs" => Node::Link("/System/Library/dyld".into()),
+            "/t/up" => Node::Link("../t/real".into()),
+            "/t/loop" => Node::Link("loop".into()),
+            "/t/empty" => Node::Link(String::new()),
+            "/t/two" => Node::Link("lnk".into()),
+            _ => Node::Other,
+        }
+    }
+    /// the walk's lexical answer; a Kernel answer is spelled "kernel:<name>" so one assert covers both
+    fn w(p: &str, node: impl Fn(&str) -> Node) -> Option<String> {
+        match walk_dotdot(p, node) {
+            Walk::Lexical(x) => x,
+            Walk::Kernel(k) => Some(format!("kernel:{k}")),
+        }
+    }
+    fn n(p: &str) -> Option<String> {
+        w(p, tree)
+    }
+
+    #[test]
+    fn dotdot_through_directories_is_popped() {
+        // Rows Y7, Y8: out of the cache dir and back in by its basename
+        assert_eq!(n("/System/Library/dyld/../dyld/x").as_deref(), Some("/System/Library/dyld/x"));
+        assert_eq!(n("/System/Library/dyld/../../Library/dyld/x").as_deref(), Some("/System/Library/dyld/x"));
+        assert_eq!(n("/System/./Library//dyld/../dyld/x").as_deref(), Some("/System/Library/dyld/x"));
+        // `..` at / is /
+        assert_eq!(n("/../System/Library/dyld/x").as_deref(), Some("/System/Library/dyld/x"));
+        assert_eq!(n("/..").as_deref(), Some("/"));
+        // a trailing `..` ends in `/.`, with or without a slash after it; `/x/` keeps its slash
+        assert_eq!(n("/t/real/sub/../").as_deref(), Some("/t/real/."));
+        assert_eq!(n("/t/real/sub/..").as_deref(), Some("/t/real/."));
+        assert_eq!(n("/t/real/../real/sub/").as_deref(), Some("/t/real/sub/"));
+    }
+
+    #[test]
+    fn no_dotdot_or_a_relative_path_is_left_alone() {
+        for p in ["/System/Library/dyld/x", "/System/./Library/dyld/x", "/a..b/c", "/x/..y", "/t/lnk/x", "/", ""] {
+            assert_eq!(n(p), None, "{p}");
+        }
+        assert_eq!(n("System/Library/dyld/../dyld/x"), None); // relative: no guest anchor
+    }
+
+    #[test]
+    fn hv7_a_symlink_in_what_is_walked_goes_to_the_kernel() {
+        // explicit: the link right before the `..`; H v6 followed it itself (/t/real/x)
+        assert_eq!(n("/t/lnk/../x").as_deref(), Some("kernel:/t/lnk/../x"));
+        assert_ne!(n("/t/lnk/../x").as_deref(), Some("/t/x"), "must-fail control: the lexical answer");
+        assert_ne!(n("/t/lnk/../x").as_deref(), Some("/t/real/x"), "must-fail control: H v6's own walk");
+        // the directories walked before the link keep their `..`; the rest goes as written, from the link on
+        assert_eq!(n("/t/real/../lnk/../x").as_deref(), Some("kernel:/t/lnk/../x"));
+        assert_eq!(n("/t/real/sub/../../abs/../dyld/x").as_deref(), Some("kernel:/t/abs/../dyld/x"));
+        // implicit: the link further back, which the host's lstat expands
+        assert_eq!(n("/t/real/../lnk/q/../f").as_deref(), Some("kernel:/t/lnk/q/../f"));
+        // The `.` is the kernel's to see, not dropped before it measures the link
+        assert_eq!(n("/t/lnk/q/./../f").as_deref(), Some("kernel:/t/lnk/q/./../f"));
+        assert_ne!(n("/t/lnk/q/./../f").as_deref(), Some("kernel:/t/lnk/q/../f"), "must-fail control: the `.` dropped");
+        // a link before a `.` only: the kernel too
+        assert_eq!(n("/t/lnk/./x/../y").as_deref(), Some("kernel:/t/lnk/./x/../y"));
+        // a loop, an empty target, a link to a link: the kernel answers (ELOOP, ENOENT) or resolves
+        assert_eq!(n("/t/loop/../x").as_deref(), Some("kernel:/t/loop/../x"));
+        assert_eq!(n("/t/empty/../x").as_deref(), Some("kernel:/t/empty/../x"));
+        assert_eq!(n("/t/two/../x").as_deref(), Some("kernel:/t/two/../x"));
+        // a link AFTER the last `..` is the host's to walk, as before (no `.` or `..` looks through it)
+        assert_eq!(n("/t/real/sub/../../lnk").as_deref(), Some("/t/lnk"));
+        assert_eq!(n("/t/real/../lnk/x").as_deref(), Some("/t/lnk/x"));
+    }
+
+    #[test]
+    fn what_xnu_refuses_is_left_for_the_host_to_refuse() {
+        // a missing component, or a file, before `..` (XNU: ENOENT, ENOTDIR)
+        assert_eq!(n("/System/Library/dyld/no-such/../x"), None);
+        assert_eq!(n("/System/Library/dyld/x/../x"), None);
+    }
+
+    #[test]
+    fn a_refusal_keeps_the_dotdots_already_taken() {
+        // The first `..` leaves the prefix's spelling alone, the second is refused
+        assert_eq!(n("/System/Library/dyld/../dyld/x/../x").as_deref(), Some("/System/Library/dyld/x/../x"));
+        assert_eq!(n("/System/Library/dyld/../dyld/no-such/../x").as_deref(), Some("/System/Library/dyld/no-such/../x"));
+        // the rest comes through as written, its trailing slash too
+        assert_eq!(n("/t/real/../no-such/../x/../y/").as_deref(), Some("/t/no-such/../x/../y/"));
+    }
+
+    #[test]
+    fn a_trailing_dot_is_kept() {
+        // file/. is ENOTDIR where file opens
+        assert_eq!(n("/System/Library/dyld/../dyld/x/.").as_deref(), Some("/System/Library/dyld/x/."));
+        assert_eq!(n("/t/real/sub/../.").as_deref(), Some("/t/real/."));
+        assert_eq!(n("/t/real/./sub/../y").as_deref(), Some("/t/real/y"), "must-fail control: a . inside still goes");
+        assert_eq!(n("/t/real/../..").as_deref(), Some("/"));
+        assert_eq!(n("/t/..").as_deref(), Some("/"));
+    }
+
+    #[test]
+    fn hv4_a_dotdot_through_an_unsearchable_dir_is_left_for_the_host() {
+        // node() is Other for a directory the caller cannot search, so the `..`
+        // is not popped; the host gets the path and answers EACCES. dir_searchable, which makes that
+        // decision from the real mode and euid, is exercised by host_node_reads_the_host below.
+        let t2 = |p: &str| match p {
+            "/g" | "/g/ok_x" | "/g/ok_x/f" => Node::Dir,
+            "/g/no_x" => Node::Other, // a directory the caller cannot search
+            _ => Node::Other,
+        };
+        assert_eq!(w("/g/no_x/../f", t2), None); // unchanged -> host -> EACCES
+        assert_eq!(w("/g/ok_x/../f", t2).as_deref(), Some("/g/f")); // control: popped
+    }
+
+    #[test]
+    fn hv4_a_dot_after_a_non_directory_is_left_for_the_host() {
+        // /t/real/../f/./../f, f a file -- native ENOTDIR at f/. ; dropping the `.`
+        // gave root's lenient f/../f. The `.` now stops where the preceding path is not a searchable dir.
+        let t2 = |p: &str| match p {
+            "/t" | "/t/real" | "/t/d" => Node::Dir,
+            "/t/f" => Node::Other, // a file
+            _ => Node::Other,
+        };
+        assert_eq!(w("/t/real/../f/./../f", t2).as_deref(), Some("/t/f/./../f"));
+        assert_ne!(w("/t/real/../f/./../f", t2).as_deref(), Some("/t/f/../f"),
+            "must-fail control: the `.`-dropped path that succeeds as root");
+        // a `.` after a searchable directory is still a no-op
+        assert_eq!(w("/t/real/../d/./f", t2).as_deref(), Some("/t/d/f"));
+    }
+
+    #[test]
+    fn hv7_kernel_name_keeps_every_remainder_as_long() {
+        // the last component becomes `.` components of the same length: an odd and an even one
+        assert_eq!(kernel_name("/w/l/q/../f"), ("/w/l/q/../.".to_string(), "/f".to_string()));
+        assert_eq!(kernel_name("/w/l/q/../ff"), ("/w/l/q/.././".to_string(), "/ff".to_string()));
+        let k = "/w/lok/t/../../System/Library/dyld/dyld_shared_cache_arm64e";
+        let (probe, after) = kernel_name(k);
+        assert_eq!(probe.len(), k.len(), "every link's remainder is as long as in the real name");
+        assert!(probe.starts_with("/w/lok/t/../../System/Library/dyld/./") && !probe.contains("dyld_shared"));
+        assert_eq!(after, "/dyld_shared_cache_arm64e");
+        // a name ending in `..`, `.` or `/` is asked about whole; where it lands takes `/.` or `/`
+        assert_eq!(kernel_name("/w/l/sub/.."), ("/w/l/sub/..".to_string(), "/.".to_string()));
+        assert_eq!(kernel_name("/w/l/../d/."), ("/w/l/../d/.".to_string(), "/.".to_string()));
+        assert_eq!(kernel_name("/w/l/../d/"), ("/w/l/../d/".to_string(), "/".to_string()));
+        assert_ne!(kernel_name("/w/l/q/../f").0, "/w/l/q/..", "must-fail control: the last component dropped, not padded");
+    }
+
+    #[test]
+    fn hv7_the_kernel_decides_and_the_redirect_takes_only_a_prefix() {
+        let tree2 = |p: &str| match p {
+            "/w" | "/w/d" | "/c" => Node::Dir,
+            "/w/l" => Node::Link("d".into()),
+            _ => Node::Other,
+        };
+        let pre = |m: &str| m.starts_with("/c/");
+        let never = |_: &str, _: Ids| -> Probe { panic!("the kernel must not be asked") };
+        // no link: the walk's answer, the kernel never asked
+        assert_eq!(resolve_dotdot("/w/d/../c/x", true, Ids::Effective, tree2, never, pre), Dotdot::Path("/w/c/x".into()));
+        assert_eq!(resolve_dotdot("/w/x", true, Ids::Effective, tree2, never, pre), Dotdot::Keep);
+        // NOFOLLOW_ANY with a link: the host, unasked (it answers ELOOP)
+        assert_eq!(resolve_dotdot("/w/l/../f", false, Ids::Effective, tree2, never, pre), Dotdot::Host("/w/l/../f".into()));
+        // the kernel refuses (ENAMETOOLONG, EACCES, ELOOP...): the host gets the name and refuses it the same way
+        let refuse = |_: &str, _: Ids| Probe::Refused;
+        assert_eq!(resolve_dotdot("/w/l/../f", true, Ids::Effective, tree2, refuse, pre), Dotdot::Host("/w/l/../f".into()));
+        // it lands under a prefix: the redirect takes it
+        let at_c = |p: &str, _: Ids| { assert_eq!(p, "/w/l/../."); Probe::At("/c".into()) };
+        assert_eq!(resolve_dotdot("/w/l/../f", true, Ids::Effective, tree2, at_c, pre), Dotdot::Path("/c/f".into()));
+        // it lands elsewhere, or cannot be placed: the host, never the redirect
+        let at_w = |_: &str, _: Ids| Probe::At("/w".into());
+        assert_eq!(resolve_dotdot("/w/l/../f", true, Ids::Effective, tree2, at_w, pre), Dotdot::Host("/w/l/../f".into()));
+        let lost = |_: &str, _: Ids| Probe::Unplaced;
+        assert_eq!(resolve_dotdot("/w/l/../f", true, Ids::Effective, tree2, lost, pre), Dotdot::Host("/w/l/../f".into()));
+        // the credentials reach the kernel; a trailing `..` lands with `/.`, at / with no doubled slash
+        let real_only = |_: &str, ids: Ids| if ids == Ids::Real { Probe::Refused } else { Probe::At("/c".into()) };
+        assert_eq!(resolve_dotdot("/w/l/../f", true, Ids::Real, tree2, real_only, pre), Dotdot::Host("/w/l/../f".into()));
+        assert_eq!(resolve_dotdot("/w/l/../f", true, Ids::Effective, tree2, real_only, pre), Dotdot::Path("/c/f".into()),
+            "must-fail control: the effective ids");
+        assert_eq!(resolve_dotdot("/w/l/x/..", true, Ids::Effective, tree2, at_c_whole, pre), Dotdot::Path("/c/sub/.".into()));
+        let at_root = |_: &str, _: Ids| Probe::At("/".into());
+        assert_eq!(resolve_dotdot("/w/l/../f", true, Ids::Effective, tree2, at_root, |m: &str| m == "/f"), Dotdot::Path("/f".into()));
+    }
+
+    fn at_c_whole(p: &str, _: Ids) -> Probe {
+        assert_eq!(p, "/w/l/x/..");
+        Probe::At("/c/sub".into())
+    }
+
+    #[test]
+    fn hv7_the_kernel_lookup_on_the_host() {
+        // On the host's own filesystem through kernel_lookup, measured
+        // natively first: l15/q/./../f is ENAMETOOLONG and l14 opens; a link whose
+        // expansion fits natively (lok) lands back in a stand-in cache dir, one byte longer (lno) is refused.
+        let base = std::env::temp_dir().join(format!("maclator-hv7-test-{}", std::process::id()));
+        let a40 = "a".repeat(40);
+        std::fs::create_dir_all(base.join("w/d/q")).unwrap();
+        std::fs::create_dir_all(base.join(format!("w/d/{a40}"))).unwrap();
+        std::fs::create_dir_all(base.join("c")).unwrap();
+        std::fs::write(base.join("w/d/f"), b"x").unwrap();
+        std::fs::write(base.join("c/cache"), b"x").unwrap();
+        std::os::unix::fs::symlink(&a40, base.join("w/d/t")).unwrap();
+        let mk = |l: usize| format!("{}{}", "./".repeat(if l % 2 == 1 { (l - 1) / 2 } else { (l - 2) / 2 }), if l % 2 == 1 { "d" } else { "/d" });
+        std::os::unix::fs::symlink(mk(1015), base.join("w/l15")).unwrap();
+        std::os::unix::fs::symlink(mk(1014), base.join("w/l14")).unwrap();
+        let b = std::fs::canonicalize(&base).unwrap().to_string_lossy().into_owned();
+        let none = |_: &str| false;
+        // Refused with the `.` kept, which an earlier version dropped
+        let p15 = format!("{b}/w/l15/q/./../f");
+        assert_eq!(kernel_lookup(&kernel_name(&p15).0, Ids::Effective), Probe::Refused);
+        assert_eq!(resolve_dotdot(&p15, true, Ids::Effective, guest_node, kernel_lookup, none), Dotdot::Host(p15.clone()));
+        let p14 = format!("{b}/w/l14/q/./../f");
+        assert_eq!(kernel_lookup(&kernel_name(&p14).0, Ids::Effective), Probe::At(format!("{b}/w/d")), "control: 1014 bytes");
+        assert_eq!(resolve_dotdot(&p14, true, Ids::Effective, guest_node, kernel_lookup, |m: &str| m == format!("{b}/w/d/f")),
+                   Dotdot::Path(format!("{b}/w/d/f")));
+        // rest climbs from w/d/<a40> to / and back into c; lok fits natively, lno does not
+        let depth = b.matches('/').count() + 3;
+        let rest = format!("{}{}/c/cache", "../".repeat(depth), &b[1..]);
+        let lok = 1020 - rest.len();
+        std::os::unix::fs::symlink(mk(lok), base.join("w/lok")).unwrap();
+        std::os::unix::fs::symlink(mk(lok + 1), base.join("w/lno")).unwrap();
+        let c = |m: &str| m.starts_with(&format!("{b}/c/"));
+        let pok = format!("{b}/w/lok/t/{rest}");
+        assert_eq!(resolve_dotdot(&pok, true, Ids::Effective, guest_node, kernel_lookup, c), Dotdot::Path(format!("{b}/c/cache")));
+        let pno = format!("{b}/w/lno/t/{rest}");
+        assert_eq!(resolve_dotdot(&pno, true, Ids::Effective, guest_node, kernel_lookup, c), Dotdot::Host(pno.clone()),
+            "must-fail control: one byte more is ENAMETOOLONG");
+        for l in ["w/l15", "w/l14", "w/lok", "w/lno", "w/d/t", "w/d/f", "c/cache"] {
+            std::fs::remove_file(base.join(l)).unwrap();
+        }
+        for d in [format!("w/d/{a40}"), "w/d/q".into(), "w/d".into(), "w".into(), "c".into()] {
+            std::fs::remove_dir(base.join(d)).unwrap();
+        }
+        std::fs::remove_dir(&base).unwrap();
+    }
+
+    #[test]
+    fn hv7_full_path_of_spells_the_hosts_path() {
+        // getattrlist's FULLPATH as F_GETPATH spells it (/private/var for /var); a missing name gives None
+        let base = std::env::temp_dir().join(format!("maclator-hv7-fp-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("d")).unwrap();
+        std::os::unix::fs::symlink("d", base.join("l")).unwrap();
+        let canon = std::fs::canonicalize(base.join("d")).unwrap().to_string_lossy().into_owned();
+        let cs = |p: std::path::PathBuf| std::ffi::CString::new(p.to_string_lossy().into_owned()).unwrap();
+        assert_eq!(full_path_of(&cs(base.join("l"))).as_deref(), Some(canon.as_str()), "a link is followed");
+        assert_eq!(full_path_of(&cs(base.join("d/."))).as_deref(), Some(canon.as_str()));
+        assert_eq!(full_path_of(&cs(base.join("missing"))), None, "must-fail control: nothing there");
+        std::fs::remove_file(base.join("l")).unwrap();
+        std::fs::remove_dir(base.join("d")).unwrap();
+        std::fs::remove_dir(&base).unwrap();
+    }
+
+    #[test]
+    fn hv5_a_descriptor_records_the_hosts_truth_outside_the_sysroot() {
+        // Inside the sysroot the guest path; elsewhere F_GETPATH; F_GETPATH failing: nothing
+        assert_eq!(descriptor_record("/System/Library/dyld/.", true, || Some("/sys".into())).as_deref(), Some("/System/Library/dyld"));
+        assert_eq!(descriptor_record("/System/Volumes/Data/.", false, || Some("/".into())).as_deref(), Some("/"),
+            "must-fail control: round 4 recorded the lexical /System/Volumes/Data for a redirected climb-out");
+        assert_eq!(descriptor_record("/System/Volumes/Data/.", false, || None), None,
+            "must-fail control: round 4 fell back to the lexical path when F_GETPATH failed");
+        assert!(inside_sysroot("/sys", Some("/sys")) && inside_sysroot("/sys/x", Some("/sys")));
+        assert!(!inside_sysroot("/sysx", Some("/sys")), "must-fail control: a sibling that shares the prefix string");
+        assert!(!inside_sysroot("/System/Volumes/Data/.", Some("/sys")) && !inside_sysroot("/sys", None));
+    }
+
+    #[test]
+    fn hv5_host_fd_path_reads_the_host() {
+        // A unit test that reaches host_fd_path. F_GETPATH gives the host's own spelling
+        // (/private/var for /var); a bad descriptor gives None, which descriptor_record records as nothing.
+        use std::os::unix::io::AsRawFd;
+        let base = std::env::temp_dir().join(format!("maclator-fdpath-test-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let f = std::fs::File::open(&base).unwrap();
+        let canon = std::fs::canonicalize(&base).unwrap().to_string_lossy().into_owned();
+        assert_eq!(host_fd_path(f.as_raw_fd()).as_deref(), Some(canon.as_str()));
+        assert_eq!(host_fd_path(-1), None, "must-fail control: no descriptor");
+        drop(f);
+        std::fs::remove_dir(&base).unwrap();
+    }
+
+    #[test]
+    fn hv5_a_firmlinked_directory_is_not_popped() {
+        // On macOS /System/Volumes/Data/Applications is firmlinked to /Applications, so its
+        // `..` is /. It must not be popped to /System/Volumes/Data. Skipped where that firmlink is absent.
+        let a = "/System/Volumes/Data/Applications";
+        let root = std::fs::metadata("/").unwrap();
+        let up = std::fs::metadata(format!("{a}/.."));
+        use std::os::unix::fs::MetadataExt;
+        if up.is_ok_and(|m| m.ino() == root.ino() && m.dev() == root.dev()) {
+            assert!(!dotdot_is_lexical(a));
+            assert_eq!(host_node(a), Node::Other);
+        }
+        // control: an ordinary directory's `..` is its lexical parent
+        let base = std::env::temp_dir().join(format!("maclator-firm-test-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("d")).unwrap();
+        let d = base.join("d").to_string_lossy().into_owned();
+        assert!(dotdot_is_lexical(&d), "must-fail control: an ordinary directory");
+        assert_eq!(host_node(&d), Node::Dir);
+        std::fs::remove_dir(base.join("d")).unwrap();
+        std::fs::remove_dir(&base).unwrap();
+    }
+
+    #[test]
+    fn hv6_the_lookup_uses_the_calls_credentials() {
+        // access, and faccessat without AT_EACCESS, look up
+        // with the real ids; everything else with the effective ids.
+        let a = |i: usize, v: u64| {
+            let mut x = [0u64; 8];
+            x[i] = v;
+            x
+        };
+        assert_eq!(lookup_ids(33, &a(1, 0)), Ids::Real);
+        assert_eq!(lookup_ids(466, &a(3, 0)), Ids::Real);
+        assert_eq!(lookup_ids(466, &a(3, AT_EACCESS)), Ids::Effective);
+        assert_eq!(lookup_ids(466, &a(3, AT_EACCESS | AT_SYMLINK_NOFOLLOW_ANY)), Ids::Effective);
+        assert_eq!(lookup_ids(466, &a(3, 0x0020)), Ids::Real, "must-fail control: AT_SYMLINK_NOFOLLOW is not AT_EACCESS");
+        assert_eq!(lookup_ids(466, &a(2, AT_EACCESS)), Ids::Real, "must-fail control: the mode slot, not the flags");
+        for n in [5, 398, 58, 188, 190, 220, 338, 340, 463, 464, 469, 470, 473, 476] {
+            assert_eq!(lookup_ids(n, &a(3, 0)), Ids::Effective, "#{n}");
+        }
+        // As non-root the real and effective ids are the same: a 0600 directory is unsearchable both ways.
+        // Root with a real uid of 501 is a row (H34-H37 of mcl-atpaths 1.9.0), not a unit test.
+        if unsafe { libc::geteuid() } != 0 && unsafe { libc::getuid() } == unsafe { libc::geteuid() } {
+            use std::os::unix::fs::PermissionsExt;
+            let base = std::env::temp_dir().join(format!("maclator-hv6-ids-{}", std::process::id()));
+            std::fs::create_dir_all(base.join("nx")).unwrap();
+            std::fs::create_dir_all(base.join("ok")).unwrap();
+            std::fs::set_permissions(base.join("nx"), std::fs::Permissions::from_mode(0o600)).unwrap();
+            let p = |s: &str| base.join(s).to_string_lossy().into_owned();
+            for ids in [Ids::Real, Ids::Effective] {
+                assert!(!dir_searchable(&p("nx"), ids), "{ids:?}");
+                assert!(dir_searchable(&p("ok"), ids), "control {ids:?}");
+            }
+            std::fs::remove_dir(base.join("nx")).unwrap();
+            std::fs::remove_dir(base.join("ok")).unwrap();
+            std::fs::remove_dir(&base).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_name_too_long_for_xnu_is_not_rewritten() {
+        // 1023 bytes looks up, 1024 is ENAMETOOLONG
+        assert!(rewritable(&"a".repeat(MAXPATHLEN - 1)));
+        assert!(!rewritable(&"a".repeat(MAXPATHLEN)), "must-fail control: the 1024-byte name");
+        assert!(!rewritable(&"a".repeat(GUEST_NAME_MAX - 1)));
+    }
+
+    #[test]
+    fn a_descriptor_records_the_path_without_the_marker() {
+        // The `/.` and `/` walk_dotdot keeps for the host are not part of the guest path
+        assert_eq!(recorded_path("/System/Library/dyld/."), "/System/Library/dyld");
+        assert_eq!(recorded_path("/System/Library/dyld/"), "/System/Library/dyld");
+        assert_eq!(recorded_path("/a/./"), "/a");
+        assert_eq!(recorded_path("/."), "/");
+        assert_eq!(recorded_path("/"), "/");
+        assert_eq!(recorded_path("/a/b.c"), "/a/b.c", "must-fail control: a dot inside a name stays");
+        assert_eq!(recorded_path("/a/.."), "/a/..", "must-fail control: only `.` is a marker");
+    }
+
+    #[test]
+    fn a_path_that_climbed_out_goes_to_the_host_normalised() {
+        let redirect = |p: &str| p.starts_with("/System/Library/dyld").then(|| format!("/sys{p}"));
+        assert_eq!(left_the_prefix("/System/Library/dyld/../Frameworks/x", "/System/Library/Frameworks/x", redirect).as_deref(),
+                   Some("/System/Library/Frameworks/x"));
+        // must-fail controls: never under a prefix; nothing changed
+        assert_eq!(left_the_prefix("/tmp/a/../b", "/tmp/b", redirect), None);
+        assert_eq!(left_the_prefix("/System/Library/dyld/x", "/System/Library/dyld/x", redirect), None);
+    }
+
+    #[test]
+    fn follows_symlinks_reads_every_nofollow_any_slot() {
+        let a = |i: usize, v: u64| {
+            let mut x = [0u64; 8];
+            x[i] = v;
+            x
+        };
+        assert!(follows_symlinks(463, &a(2, 0)));
+        assert!(!follows_symlinks(463, &a(2, O_NOFOLLOW_ANY)));
+        assert!(!follows_symlinks(470, &a(3, AT_SYMLINK_NOFOLLOW_ANY)));
+        for k in [5, 398] {
+            assert!(follows_symlinks(k, &a(1, 0x0100))); // O_NOFOLLOW: the last component only
+            assert!(!follows_symlinks(k, &a(1, O_NOFOLLOW_ANY)));
+            assert!(follows_symlinks(k, &a(2, O_NOFOLLOW_ANY))); // must-fail control: wrong slot
+        }
+        assert!(!follows_symlinks(220, &a(4, FSOPT_NOFOLLOW_ANY)));
+        assert!(follows_symlinks(220, &a(3, FSOPT_NOFOLLOW_ANY)));
+        assert!(follows_symlinks(188, &[u64::MAX; 8])); // stat has no flags
+    }
+
+    #[test]
+    fn host_node_reads_the_host() {
+        let base = std::env::temp_dir().join(format!("maclator-h-test-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("d")).unwrap();
+        std::fs::write(base.join("f"), b"x").unwrap();
+        std::os::unix::fs::symlink("d", base.join("l")).unwrap();
+        let p = |s: &str| base.join(s).to_string_lossy().into_owned();
+        assert_eq!(host_node(&p("d")), Node::Dir);
+        assert_eq!(host_node(&p("l")), Node::Link("d".into())); // lstat: the link, not its target
+        assert_eq!(host_node(&p("f")), Node::Other);
+        assert_eq!(host_node(&p("missing")), Node::Other);
+        // guest_node of a path no redirect touches is the host's
+        assert_eq!(guest_node(&p("l")), Node::Link("d".into()));
+        assert!(!crate::paths::is_cache_root(&p("d")));
+        // A directory the caller cannot search is Other, not Dir. Root's directory-
+        // search bypass makes every directory searchable, so only assert this as a non-root caller.
+        if unsafe { libc::geteuid() } != 0 {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::create_dir(base.join("nx")).unwrap();
+            std::fs::set_permissions(base.join("nx"), std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(host_node(&p("nx")), Node::Other);
+            std::fs::remove_dir(base.join("nx")).unwrap();
+        }
+        std::fs::remove_file(base.join("l")).unwrap();
+        std::fs::remove_file(base.join("f")).unwrap();
+        std::fs::remove_dir(base.join("d")).unwrap();
+        std::fs::remove_dir(&base).unwrap();
     }
 }
 
@@ -416,6 +1257,7 @@ fn bsd_read(cpu: &mut Cpu, n: u64, mut args: [u64; 8], read: impl FnOnce(u64) ->
     let (pidx, at) = path_arg(n);
     let mut keep: Option<std::ffi::CString> = None;
     let mut guest_path: Option<String> = None;
+    let mut in_sysroot = false;
     let mut unread: Option<u64> = None;
     if let Some(i) = pidx {
         let name = call_name(n, &args, i, |p| {
@@ -425,12 +1267,24 @@ fn bsd_read(cpu: &mut Cpu, n: u64, mut args: [u64; 8], read: impl FnOnce(u64) ->
             }
             name
         });
-        if let Some(orig) = name {
+        if let Some(orig) = name.filter(|o| rewritable(o)) {
             let full = guest_full_path(&orig, at, || fd_guest_path(args[0] as i32));
             if TRACE.load(Ordering::Relaxed) {
                 eprintln!("[path] #{n} {orig} -> {full:?}");
             }
             if let Some(full) = full {
+                // Resolve a `..` in the guest's view before the redirect sees the path.
+                let before = full;
+                let ids = lookup_ids(n, &args);
+                // A symlink before a `.` or `..` is the kernel's to look up (resolve_dotdot); a name
+                // it sends to the host goes as it is, never through the redirect.
+                let dotdot = resolve_dotdot(&before, follows_symlinks(n, &args), ids, |p| guest_node_as(p, ids), kernel_lookup,
+                                            |m| crate::paths::redirect(m).is_some());
+                let (full, host_as_is) = match dotdot {
+                    Dotdot::Keep => (before.clone(), false),
+                    Dotdot::Path(p) => (p, false),
+                    Dotdot::Host(p) => (p, true),
+                };
                 // A relative path beneath an overlaid directory may be absent
                 // from the payload. In that case fall back to the real guest
                 // absolute path, rather than looking only inside the overlay.
@@ -441,18 +1295,22 @@ fn bsd_read(cpu: &mut Cpu, n: u64, mut args: [u64; 8], read: impl FnOnce(u64) ->
                 };
                 let replacement = if at && keep_descriptor(n, &args, inside) {
                     None
+                } else if host_as_is {
+                    Some(full.clone())
                 } else {
                     crate::paths::redirect(&full).or_else(|| {
                         (at && !orig.starts_with('/') && crate::paths::overlay_root().is_some()).then(|| full.clone())
-                    })
+                    }).or_else(|| left_the_prefix(&before, &full, crate::paths::redirect))
                 };
                 if let Some(new) = replacement {
+                    let ins = inside_sysroot(&new, crate::paths::cache_dir().as_deref());
                     if let Ok(c) = std::ffi::CString::new(new) {
                         args[i] = c.as_ptr() as u64;
                         if at {
                             args[0] = (-2i64) as u64; // AT_FDCWD; path is absolute now
                         }
                         keep = Some(c);
+                        in_sysroot = ins;
                     }
                 }
                 guest_path = Some(full);
@@ -476,8 +1334,10 @@ fn bsd_read(cpu: &mut Cpu, n: u64, mut args: [u64; 8], read: impl FnOnce(u64) ->
             m.remove(&(cpu.x[0] as i32));
         }
         if let Some(g) = guest_path {
-            if g == "/" || g.starts_with("/System") || crate::paths::overlay_root().is_some() {
-                let g = if g.len() > 1 { g.trim_end_matches('/').to_string() } else { g };
+            // Record where the host really is, unless it is inside
+            // the sysroot (descriptor_record). The FD_VPATHS entry was removed just above.
+            let g = descriptor_record(&g, in_sysroot, || host_fd_path(cpu.x[0] as i32));
+            if let Some(g) = g.filter(|g| g == "/" || g.starts_with("/System") || crate::paths::overlay_root().is_some()) {
                 FD_VPATHS.lock().unwrap().get_or_insert_with(Default::default).insert(cpu.x[0] as i32, g);
             }
         }
@@ -1358,6 +2218,42 @@ mod tests {
         drop(d);
         std::fs::remove_file(base.join("f")).unwrap();
         std::fs::remove_dir(&base).unwrap();
+    }
+
+    #[test]
+    fn hv6_a_redirected_climb_out_records_the_hosts_truth() {
+        // A mutant that survived an earlier test set, sysroot-gate-true: bsd_read with a sysroot set, on W3's name. The name
+        // starts under a cache prefix, climbs out of it, and stops at the firmlink
+        // /System/Volumes/Data/Applications, whose `..` is /. The host opens /, so the descriptor records
+        // "/" (F_GETPATH); recording the guest's spelling (the mutant) keeps ".../Applications/..". Skipped
+        // where that firmlink is absent. This sets the process's sysroot: no other test uses a cache prefix.
+        let a = "/System/Volumes/Data/Applications";
+        let root = std::fs::metadata("/").unwrap();
+        use std::os::unix::fs::MetadataExt;
+        if !std::fs::metadata(format!("{a}/..")).is_ok_and(|m| m.ino() == root.ino() && m.dev() == root.dev()) {
+            return;
+        }
+        let sys = std::env::temp_dir().join(format!("maclator-hv6-sys-{}", std::process::id()));
+        std::fs::create_dir_all(&sys).unwrap();
+        crate::paths::set_cache_dir(&sys.to_string_lossy());
+        let name = std::ffi::CString::new(format!("/System/Library/dyld/../../../{}/..", &a[1..])).unwrap();
+        let mut cpu = Cpu::new();
+        let w = bsd_read(&mut cpu, 5, [name.as_ptr() as u64, libc::O_RDONLY as u64 | libc::O_DIRECTORY as u64, 0, 0, 0, 0, 0, 0], guest_name);
+        assert_eq!(w, None);
+        assert_eq!(cpu.cf, 0, "open failed: {}", cpu.x[0]);
+        let fd = cpu.x[0] as i32;
+        let st = unsafe {
+            let mut st: libc::stat = std::mem::zeroed();
+            assert_eq!(libc::fstat(fd, &mut st), 0);
+            st
+        };
+        assert!(st.st_ino as u64 == root.ino() && st.st_dev as u64 == root.dev(), "the host opened / (control)");
+        let recorded = FD_VPATHS.lock().unwrap().as_ref().and_then(|m| m.get(&fd).cloned());
+        let mut c2 = Cpu::new();
+        bsd(&mut c2, 6, [fd as u64, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(recorded.as_deref(), Some("/"), "must-fail control: the guest's spelling recorded for a climb-out");
+        assert!(FD_VPATHS.lock().unwrap().as_ref().is_none_or(|m| !m.contains_key(&fd)), "close removed the record");
+        std::fs::remove_dir(&sys).unwrap();
     }
 
     #[test]
