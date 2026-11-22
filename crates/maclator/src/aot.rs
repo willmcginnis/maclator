@@ -98,6 +98,106 @@ fn image_key(kind: &str, uuid: &[u8; 16], path: &str, start: u64) -> String {
     format!("{kind}-{}-{}-{start:x}", hex(uuid), fnv(&[path.as_bytes()]))
 }
 
+/// How many entries of one image identity the store keeps. 1 means only the entry for the base in use.
+///
+/// The store is keyed by identity PLUS the base the image is loaded at (`image_key`, `cache_key`), because
+/// translated code embeds absolute guest addresses and is valid only at the base it was made for. An image whose
+/// preferred base is declined slides to a fresh base on nearly every exec, so nearly every slid load mints a new key. Nothing retired the
+/// old ones, and the store grew without bound: 999 files and 4.03 GiB in one boot, about 70 MiB a minute, until
+/// the volume filled. Keeping the base in the key is what keeps a slid load from running another base's code;
+/// retiring what that base left behind is what keeps the store finite.
+const AOT_KEEP: usize = 1;
+
+/// `key` without its trailing `-<base>`: the part that names the IMAGE rather than the run. Returns `None` when
+/// the key carries no base, and such a key is never retired.
+///
+/// Every keyed family ends in `-{start:x}` and the hex digits carry no `-`, so the last `-` is the split:
+/// `main-<uuid>-<fnv>-<base>`, `dyld-<uuid>-<fnv>-<base>`, `dsc-<uuid>-<base>`, `lib-<uuid>-<base>`. An
+/// unpatched build's `main-<uuid>-<fnv>` would split into a plausible-looking prefix too -- its fnv is hex as
+/// well -- so the prefix must ITSELF still contain a `-`, which is true of every keyed family above and false of
+/// the two-field unpatched form.
+fn identity_prefix(key: &str) -> Option<&str> {
+    match key.rsplit_once('-') {
+        Some((prefix, base))
+            if !prefix.is_empty()
+                && !base.is_empty()
+                && base.bytes().all(|b| b.is_ascii_hexdigit())
+                && prefix.contains('-') =>
+        {
+            Some(prefix)
+        }
+        _ => None,
+    }
+}
+
+/// Remove the `.aot` and `.profile` of entries in `dir` that share `keep_key`'s identity but name a different
+/// base, newest first, keeping `AOT_KEEP` entries in all (`keep_key` itself is always one of them and is never
+/// removed). Returns how many keys were retired. `site` names the caller, and appears in the line below so a log
+/// shows WHICH call site fired rather than only that retirement happened somewhere.
+///
+/// A `.aot.<pid>.tmp` (build()'s temporary file since upstream #7; `.aot.tmp` before) is a write in flight and is never considered. Unlinking a file another process has open is safe
+/// on this platform, and `load_file` copies an AOT into the JIT code cache rather than mapping it, so a retired
+/// entry cannot be pulled out from under a running process.
+fn retire_superseded(dir: &std::path::Path, keep_key: &str, site: &str) -> usize {
+    let prefix = match identity_prefix(keep_key) {
+        Some(p) => p,
+        None => return 0,
+    };
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(_) => return 0,
+    };
+    let mut others: Vec<(std::time::SystemTime, String)> = Vec::new();
+    for ent in rd.flatten() {
+        let name = ent.file_name();
+        let name = match name.to_str() {
+            Some(n) => n,
+            None => continue,
+        };
+        let stem = match name.strip_suffix(".aot") {
+            Some(s) => s,
+            None => match name.strip_suffix(".profile") {
+                Some(s) => s,
+                None => continue,
+            },
+        };
+        if stem == keep_key || identity_prefix(stem) != Some(prefix) {
+            continue;
+        }
+        let t = ent
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        match others.iter_mut().find(|(_, s)| s == stem) {
+            // One key, two files: rank it by the newer of the pair.
+            Some(slot) => {
+                if t > slot.0 {
+                    slot.0 = t;
+                }
+            }
+            None => others.push((t, stem.to_string())),
+        }
+    }
+    others.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let mut retired = 0;
+    for (_, stem) in others.into_iter().skip(AOT_KEEP.saturating_sub(1)) {
+        let _ = std::fs::remove_file(dir.join(format!("{stem}.aot")));
+        let _ = std::fs::remove_file(dir.join(format!("{stem}.profile")));
+        retired += 1;
+    }
+    // Say so, in the engine's own shape, and name the call site. Ungated, so a daemon emits it too -- but only
+    // when something really went, so a run whose base did not move stays silent. One line per slid exec at most.
+    if retired > 0 {
+        eprintln!(
+            "[maclator] aot: retired {retired} superseded {} at {site} for {prefix}, keeping {AOT_KEEP} ({keep_key})",
+            if retired == 1 { "entry" } else { "entries" }
+        );
+    } else if std::env::var_os("MACLATOR_TRACE").is_some() || std::env::var_os("MACLATOR_STATS").is_some() {
+        eprintln!("[maclator] aot: retired 0 superseded entries at {site} for {prefix} ({keep_key})");
+    }
+    retired
+}
+
 fn flags_word() -> u32 {
     crate::jit::commpage_checks() as u32 | ((crate::jit::emit::native_fma() as u32) << 1)
         | ((crate::jit::emit::direct_operands() as u32) << 2)
@@ -391,6 +491,7 @@ pub fn save_profile() {
                 buf.extend_from_slice(&pc.to_le_bytes());
             }
             let _ = std::fs::write(&path, buf);
+            retire_superseded(&cache_dir(), &img.key, "save_profile");
             rebuild.push((img.clone(), prof));
         }
     }
@@ -549,6 +650,9 @@ fn build(img: &Image, profile: &BTreeSet<u64>) -> std::io::Result<()> {
     f.write_all(&code)?;
     drop(f);
     std::fs::rename(tmp, path)?;
+    // This image is now cached for the base it is loaded at; anything cached for a base it will never be at
+    // again is dead weight. Without this the store grows by one entry per slid exec, for ever.
+    retire_superseded(&cache_dir(), &img.key, "build");
     Ok(())
 }
 
@@ -740,5 +844,168 @@ mod image_key_tests {
         let u = [9u8; 16];
         assert_ne!(cache_key(&u, 0x6_0000_0000), cache_key(&u, 0x6_0000_4000), "two bases, one cache key");
         assert_eq!(cache_key(&u, 0x6_0000_0000), cache_key(&u, 0x6_0000_0000), "one base, one cache key");
+    }
+}
+
+#[cfg(test)]
+mod retire_tests {
+    use super::*;
+
+    /// A store of our own, so a test never touches the real one.
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "maclator-retire-{tag}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|x| x.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn put(dir: &std::path::Path, stem: &str, bytes: usize) {
+        std::fs::write(dir.join(format!("{stem}.aot")), vec![0u8; bytes]).unwrap();
+        std::fs::write(dir.join(format!("{stem}.profile")), vec![0u8; 8]).unwrap();
+    }
+
+    fn count(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir).unwrap().flatten().count()
+    }
+
+    #[test]
+    fn the_prefix_is_the_key_without_its_base() {
+        let u = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            identity_prefix(&format!("main-{u}-aabbccddeeff0011-500000000")),
+            Some(format!("main-{u}-aabbccddeeff0011").as_str())
+        );
+        assert_eq!(
+            identity_prefix(&format!("dsc-{u}-600000000")),
+            Some(format!("dsc-{u}").as_str())
+        );
+        assert_eq!(
+            identity_prefix(&format!("lib-{u}-106340000")),
+            Some(format!("lib-{u}").as_str())
+        );
+        // Two fields only: an unpatched build's key, which names no base and is never retired.
+        assert_eq!(identity_prefix(&format!("dsc-{u}")), None);
+        // A trailing field that is not hex is not a base.
+        assert_eq!(identity_prefix("main-aa-bb-zznothex"), None);
+        assert_eq!(identity_prefix("nodashes"), None);
+    }
+
+    /// ⭐ The reading this patch exists for: repeated slid loads of ONE binary leave the store bounded.
+    #[test]
+    fn repeated_slid_loads_of_one_binary_stay_bounded() {
+        let d = tmpdir("bounded");
+        let ident = "main-0123456789abcdef0123456789abcdef-aabbccddeeff0011";
+        let mut high = 0usize;
+        for i in 0..200u64 {
+            // A declined hint slides to a fresh base, so each exec mints a new key.
+            let key = format!("{ident}-{:x}", 0x5_0000_0000u64 + i * 0x4000);
+            put(&d, &key, 4096);
+            // The peak is HERE, between the write and the retire that follows it. Reading it after the retire
+            // would only ever see the bound, so the high-water assertion below could not fail.
+            high = high.max(count(&d));
+            retire_superseded(&d, &key, "test");
+        }
+        assert_eq!(
+            count(&d),
+            AOT_KEEP * 2,
+            "after 200 slid loads the store holds {} files, not the {} the bound allows",
+            count(&d),
+            AOT_KEEP * 2
+        );
+        // The peak is one pair over the bound: the new entry's two files exist for the moment between the write
+        // and the retire that follows it. Asserting the PEAK and not only the end state is what rules out a
+        // store that balloons mid-loop and is tidied only at the end.
+        assert_eq!(
+            high,
+            AOT_KEEP * 2 + 2,
+            "high-water mark {high} files, want {} -- the bound plus the pair just written",
+            AOT_KEEP * 2 + 2
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// The negative control: WITHOUT the retire call the same loop grows without bound, so the test above is
+    /// capable of failing. A test that cannot see the defect proves nothing about the fix.
+    #[test]
+    fn without_retirement_the_same_loop_grows() {
+        let d = tmpdir("control");
+        let ident = "main-0123456789abcdef0123456789abcdef-aabbccddeeff0011";
+        for i in 0..200u64 {
+            put(&d, &format!("{ident}-{:x}", 0x5_0000_0000u64 + i * 0x4000), 4096);
+        }
+        assert_eq!(count(&d), 400, "the control must accumulate every entry");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// Another image is untouched: retirement is scoped to one identity.
+    #[test]
+    fn another_images_entries_survive() {
+        let d = tmpdir("scope");
+        let mine = "main-0123456789abcdef0123456789abcdef-aabbccddeeff0011";
+        let theirs = "main-fedcba9876543210fedcba9876543210-1122334455667788";
+        let cache = "dsc-0123456789abcdef0123456789abcdef";
+        put(&d, &format!("{mine}-500000000"), 16);
+        put(&d, &format!("{theirs}-500000000"), 16);
+        put(&d, &format!("{theirs}-500004000"), 16);
+        put(&d, &format!("{cache}-600000000"), 16);
+        let keep = format!("{mine}-500008000");
+        put(&d, &keep, 16);
+        let gone = retire_superseded(&d, &keep, "test");
+        assert_eq!(gone, 1, "exactly my own superseded entry should go");
+        assert!(d.join(format!("{keep}.aot")).exists(), "the entry in use must stay");
+        assert!(!d.join(format!("{mine}-500000000.aot")).exists(), "my superseded entry must go");
+        assert!(d.join(format!("{theirs}-500000000.aot")).exists(), "another image must be untouched");
+        assert!(d.join(format!("{theirs}-500004000.aot")).exists(), "including its own older base");
+        assert!(d.join(format!("{cache}-600000000.aot")).exists(), "and so must the shared cache's");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A write in flight (`.aot.<pid>.tmp`, or the older `.aot.tmp`) is never removed, and a key naming no base is never retired.
+    #[test]
+    fn a_write_in_flight_and_an_unkeyed_entry_are_left_alone() {
+        let d = tmpdir("inflight");
+        let ident = "main-0123456789abcdef0123456789abcdef-aabbccddeeff0011";
+        put(&d, &format!("{ident}-500000000"), 16);
+        std::fs::write(d.join(format!("{ident}-500004000.aot.tmp")), [0u8; 4]).unwrap();
+        std::fs::write(d.join(format!("{ident}-500004000.aot.4242.tmp")), [0u8; 4]).unwrap();
+        std::fs::write(d.join(format!("{ident}.aot")), [0u8; 4]).unwrap();
+        let keep = format!("{ident}-500008000");
+        put(&d, &keep, 16);
+        retire_superseded(&d, &keep, "test");
+        assert!(d.join(format!("{ident}-500004000.aot.tmp")).exists(), "a temp file is a write in flight");
+        assert!(d.join(format!("{ident}-500004000.aot.4242.tmp")).exists(), "so is build()'s per-pid temp file");
+        assert!(d.join(format!("{ident}.aot")).exists(), "a key with no base names no run and is not ours to retire");
+        assert_eq!(retire_superseded(&d, ident, "test"), 0, "and such a key retires nothing");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// Running it twice changes nothing the second time.
+    #[test]
+    fn retirement_is_idempotent() {
+        let d = tmpdir("idem");
+        let ident = "dyld-0123456789abcdef0123456789abcdef-aabbccddeeff0011";
+        put(&d, &format!("{ident}-580000000"), 16);
+        let keep = format!("{ident}-580004000");
+        put(&d, &keep, 16);
+        assert_eq!(retire_superseded(&d, &keep, "test"), 1);
+        assert_eq!(retire_superseded(&d, &keep, "test"), 0, "the second run has nothing left to do");
+        assert_eq!(count(&d), 2);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// An empty or missing directory is not an error.
+    #[test]
+    fn a_missing_store_is_not_an_error() {
+        let d = tmpdir("missing");
+        let gone = d.join("no-such-dir");
+        assert_eq!(retire_superseded(&gone, "main-aa-bb-500000000", "test"), 0);
+        assert_eq!(retire_superseded(&d, "main-aa-bb-500000000", "test"), 0);
+        std::fs::remove_dir_all(&d).ok();
     }
 }
