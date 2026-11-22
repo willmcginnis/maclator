@@ -7,6 +7,8 @@ use std::io::{self, Read, Seek, SeekFrom};
 pub const MH_MAGIC_64: u32 = 0xfeed_facf;
 pub use crate::slices::CPU_TYPE_ARM64;
 pub const CPU_SUBTYPE_ARM64E: u32 = 2;
+/// Capability bits of a cpusubtype (mach/machine.h); the subtype proper is the rest.
+pub const CPU_SUBTYPE_MASK: u32 = 0xff00_0000;
 
 pub const LC_SEGMENT_64: u32 = 0x19;
 pub const LC_UNIXTHREAD: u32 = 0x5;
@@ -65,6 +67,18 @@ fn cstr(b: &[u8]) -> String {
     String::from_utf8_lossy(&b[..end]).into_owned()
 }
 
+/// Rank an arm64 slice's subtype; lower is better. Plain arm64 (ALL, V8) and
+/// arm64e come first, ordered by `prefer_e`. Any other subtype comes last:
+/// macOS 27 ships a third slice, `arm64e.x1` (subtype 0x0c), whose code uses
+/// FEAT_PAuth_LR (`pacibsppc`), and it must not win just for not being arm64e.
+/// The subtype is the low 24 bits: the top 8 are capability flags
+/// (`CPU_SUBTYPE_MASK`), so 0x100 or 0x102 is an unknown subtype, not ALL or arm64e.
+fn slice_rank(subtype: u32, prefer_e: bool) -> (bool, bool) {
+    let s = subtype & !CPU_SUBTYPE_MASK;
+    let known = s <= CPU_SUBTYPE_ARM64E; // 0 ALL, 1 V8, 2 arm64e
+    (!known, (s == CPU_SUBTYPE_ARM64E) != prefer_e)
+}
+
 impl MachO {
     /// Open `path` and select the arm64 (preferring arm64e when `prefer_e`)
     /// slice.
@@ -72,7 +86,7 @@ impl MachO {
         let mut f = File::open(path)?;
         let slices = crate::slices::read_slices(&mut f)?;
         let slice = slices.iter().filter(|s| s.cpu == CPU_TYPE_ARM64)
-            .min_by_key(|s| ((s.subtype & 0xff) == CPU_SUBTYPE_ARM64E) != prefer_e)
+            .min_by_key(|s| slice_rank(s.subtype, prefer_e))
             .ok_or_else(|| invalid("no arm64 slice"))?;
         let (off, size) = (slice.offset, slice.size);
         if size < 32 { return Err(invalid("truncated Mach-O header")); }
@@ -282,6 +296,27 @@ mod tests {
         c[4..8].copy_from_slice(&72u32.to_le_bytes());
         c[64..68].copy_from_slice(&1u32.to_le_bytes());
         assert!(MachO::parse_header(&header(&c)).is_err());
+    }
+    #[test]
+    fn slice_rank_prefers_known_subtypes() {
+        // macOS 27's fat files: arm64e 0x80000002 and arm64e.x1 0x8000000c
+        let pick = |subs: &[u32], e: bool| *subs.iter().min_by_key(|&&s| slice_rank(s, e)).unwrap();
+        assert_eq!(pick(&[0x8000_0002, 0x8000_000c], false), 0x8000_0002);
+        assert_eq!(pick(&[0x8000_000c, 0x8000_0002], true), 0x8000_0002);
+        assert_eq!(pick(&[0x8000_0002, 0], false), 0);
+        assert_eq!(pick(&[0, 0x8000_0002], true), 0x8000_0002);
+        assert_eq!(pick(&[0x8000_000c], false), 0x8000_000c);
+    }
+    #[test]
+    fn slice_rank_uses_the_24_bit_subtype() {
+        // 0x100 and 0x102 are unknown subtypes; masking with 0xff would read them as ALL
+        // and arm64e and let them beat a known slice (constructed, not seen in Apple files).
+        let pick = |subs: &[u32], e: bool| *subs.iter().min_by_key(|&&s| slice_rank(s, e)).unwrap();
+        assert_eq!(pick(&[0x0000_0100, 0x8000_0002], false), 0x8000_0002);
+        assert_eq!(pick(&[0x0000_0102, 0], true), 0);
+        // the capability bits alone do not make a subtype unknown
+        assert_eq!(slice_rank(0x8000_0002, true), (false, false));
+        assert_eq!(slice_rank(0x0100_0000, false), (false, false));
     }
     #[test]
     fn function_start_overflow_and_truncation_stop_cleanly() {
