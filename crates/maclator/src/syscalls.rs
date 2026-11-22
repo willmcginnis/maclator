@@ -62,13 +62,6 @@ fn set_res(cpu: &mut Cpu, r: SysResult) {
     }
 }
 
-fn cstr_at(p: u64) -> String {
-    if p == 0 {
-        return String::new();
-    }
-    unsafe { std::ffi::CStr::from_ptr(p as *const libc::c_char).to_string_lossy().into_owned() }
-}
-
 /// Longest path name read from guest memory, NUL included. Above XNU's MAXPATHLEN (1024), so any
 /// name the kernel would accept fits; a longer one is passed to the host kernel unread.
 const GUEST_NAME_MAX: usize = 8192;
@@ -1430,27 +1423,50 @@ fn bsd_inner(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
             set_res(cpu, r);
         }
         SYS_SYSCTLBYNAME => {
-            let name = cstr_at(args[0]);
-            if name == "hw.machine" {
-                write_sysctl_str(cpu, args[2], args[3], "arm64");
-                return;
+            // The name is read fault-safely; an unreadable one is passed through,
+            // as for path names, and the host kernel answers (EFAULT, or EINVAL for a
+            // length it refuses first).
+            // A name never read (NULL, length 0, or not below MAXPATHLEN) is
+            // traced as that, not as unreadable, and gets no warning: no override is that name.
+            let name = sysctl_name(args[0], args[1], crate::guestmem::read);
+            let not_read = sysctl_name_not_read(args[0], args[1]);
+            if name.is_none() && TRACE.load(Ordering::Relaxed) {
+                let why = if not_read { "not read (NULL, empty or too long)" } else { "unreadable" };
+                eprintln!("[sysctl] #{n} {:#x} len {} {why}: passed through", args[0], args[1]);
             }
-            if let Some(v) = sysctl_override(&name) {
-                write_sysctl_int(cpu, args[2], args[3], v);
+            // One table, every answer as native gives it
+            if let Some(a) = name.as_deref().and_then(sysctl_override) {
+                sysctl_finish(cpu, sysctl_reply(a, args[2], args[3], args[4], args[5]));
                 return;
             }
             let r = hostsys::unix(n, &args);
             set_res(cpu, r);
+            if let Some(w) = unread_sysctl_warning(n, args[0], name.is_none() && !not_read, cpu.cf == 0) {
+                eprintln!("{w}");
+            }
         }
         SYS_SYSCTL => {
-            // hw.machine (CTL_HW=6, HW_MACHINE=1) is what uname() reports.
-            let mib = unsafe { std::slice::from_raw_parts(args[0] as *const i32, (args[1] as usize).min(8)) };
-            if args[1] == 2 && mib == [6, 1] {
-                write_sysctl_str(cpu, args[2], args[3], "arm64");
+            // hw.machine (CTL_HW=6, HW_MACHINE=1) is what uname() reports. The MIB
+            // is read fault-safely; an unreadable one is passed through and the host kernel answers
+            // EFAULT. Any MIB that names an overridden sysctl
+            // (sysctl_mib_answer) answers as that name does, so sysctlnametomib + sysctl and
+            // getpagesize ({CTL_HW, HW_PAGESIZE}, hw.pagesize_compat) agree with sysctlbyname.
+            let (mib, unread) = sysctl_mib(args[0], args[1], crate::guestmem::read);
+            if unread && TRACE.load(Ordering::Relaxed) {
+                eprintln!("[sysctl] #{n} {:#x} mib unreadable: passed through", args[0]);
+            }
+            if let Some(a) = mib.as_deref().and_then(|m| sysctl_mib_answer(m, host_oid2name)) {
+                if TRACE.load(Ordering::Relaxed) {
+                    eprintln!("[sysctl] #{n} mib {:?} overridden: {a:?}", mib.as_deref().unwrap_or_default());
+                }
+                sysctl_finish(cpu, sysctl_reply(a, args[2], args[3], args[4], args[5]));
                 return;
             }
             let r = hostsys::unix(n, &args);
             set_res(cpu, r);
+            if let Some(w) = unread_sysctl_warning(n, args[0], unread, cpu.cf == 0) {
+                eprintln!("{w}");
+            }
         }
         SYS_SHARED_REGION_CHECK_NP => {
             // -1 (DYLD_VM_END_MWL) marks the end of map_with_linking; 0 just
@@ -1600,64 +1616,250 @@ fn mmap_16k(args: &[u64; 8]) -> hostsys::SysResult {
     r
 }
 
-fn write_sysctl_str(cpu: &mut Cpu, oldp: u64, oldlenp: u64, v: &str) {
-    let bytes = [v.as_bytes(), &[0]].concat();
-    unsafe {
-        if oldlenp != 0 {
-            let len = *(oldlenp as *const u64) as usize;
-            if oldp != 0 {
-                if len < bytes.len() {
-                    set_err(cpu, libc::ENOMEM as u64);
-                    return;
-                }
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), oldp as *mut u8, bytes.len());
-            }
-            *(oldlenp as *mut u64) = bytes.len() as u64;
-        }
+/// The name of a sysctlbyname call at guest address `p`, read as XNU reads it:
+/// `namelen` bytes by copyin (no NUL needed), then the string up to its first NUL (name2oid stops
+/// there). `read` is guestmem::read in use: a fault-safe copy, never a dereference. None, and the
+/// call goes to the host as it came, when `p` is NULL, `namelen` is 0 or not below MAXPATHLEN, or
+/// a byte cannot be read. The cap only bounds the read: a name that long matches no override, so
+/// the host would answer for it either way, and decides its own length limit. Then one terminal
+/// dot is dropped, as name2oid drops it (xnu-12377.1.9
+/// bsd/kern/kern_newsysctl.c, name2oid: `if (*p == '.') *p = '\0'` on the last byte before the NUL),
+/// so "hw.machine." is hw.machine. Measured natively on macOS 27.0.1, arm64:
+/// "hw.machine." answers arm64 with namelen 10, 11 or 12; "hw.machine..", ".hw.machine" and
+/// "hw..machine" answer ENOENT. Only the one dot: a second, a leading or a doubled one is left, so it
+/// matches no override and the host answers ENOENT as native does. This is the name looked up in the
+/// overrides only; a call that is passed through goes to the host with the guest's own bytes.
+fn sysctl_name(p: u64, namelen: u64, read: impl FnOnce(u64, &mut [u8]) -> bool) -> Option<String> {
+    if sysctl_name_not_read(p, namelen) {
+        return None;
     }
-    set_ok(cpu, 0, 0);
+    let mut buf = vec![0u8; namelen as usize];
+    if !read(p, &mut buf) {
+        return None;
+    }
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    let name = &buf[..end];
+    let name = name.strip_suffix(b".").unwrap_or(name);
+    Some(String::from_utf8_lossy(name).into_owned())
 }
 
-fn write_sysctl_int(cpu: &mut Cpu, oldp: u64, oldlenp: u64, v: i64) {
-    unsafe {
-        if oldlenp != 0 {
-            let len = *(oldlenp as *const u64);
-            if oldp != 0 {
-                if len >= 8 {
-                    *(oldp as *mut i64) = v;
-                    *(oldlenp as *mut u64) = 8;
-                } else if len >= 4 {
-                    *(oldp as *mut i32) = v as i32;
-                    *(oldlenp as *mut u64) = 4;
-                } else {
-                    set_err(cpu, libc::ENOMEM as u64);
-                    return;
-                }
-            } else {
-                *(oldlenp as *mut u64) = 4;
-            }
-        }
-    }
-    set_ok(cpu, 0, 0);
+/// The sysctlbyname names sysctl_name does not read at all: a NULL pointer, a
+/// length of 0, or a length not below MAXPATHLEN.
+fn sysctl_name_not_read(p: u64, namelen: u64) -> bool {
+    p == 0 || namelen == 0 || namelen >= MAXPATHLEN as u64
 }
 
-/// sysctls whose answer must describe the emulated arm64 machine.
-fn sysctl_override(name: &str) -> Option<i64> {
+/// XNU's limit on a MIB's length (sys/sysctl.h CTL_MAXNAME): a longer one is the host's EINVAL.
+const CTL_MAXNAME: u64 = 12;
+
+/// The MIB of a __sysctl call at `p` of
+/// `namelen` entries, read fault-safely (`read` is guestmem::read in use), and whether it was
+/// unreadable. A length outside 2..=CTL_MAXNAME is not read at all, so XNU's own checks (EINVAL for
+/// fewer than 2 or more than CTL_MAXNAME entries) are the host's; an unreadable MIB is passed through
+/// and the host kernel answers EFAULT. K v1 to v3 read only a two-entry MIB, the only one that could
+/// be {CTL_HW, HW_MACHINE}.
+fn sysctl_mib(p: u64, namelen: u64, read: impl FnOnce(u64, &mut [u8]) -> bool) -> (Option<Vec<i32>>, bool) {
+    if !(2..=CTL_MAXNAME).contains(&namelen) {
+        return (None, false);
+    }
+    let mut b = vec![0u8; 4 * namelen as usize];
+    if !read(p, &mut b) {
+        return (None, true);
+    }
+    (Some(b.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()), false)
+}
+
+/// The override a __sysctl MIB names, so a MIB
+/// answers as its name does by sysctlbyname. {CTL_HW, HW_MACHINE} is hw.machine without asking. Any
+/// other MIB under sysctl (0, past its meta entries 0 to 5: name, next, name2oid, oidfmt, oiddescr),
+/// vm (2) or hw (6) is named by the host kernel itself (`oid2name`, host_oid2name in use: XNU's
+/// {0, 1, mib...}), and that name is looked up in sysctl_override. The MIB numbers are the host
+/// kernel's own (sysctlnametomib asks it, through __sysctl {0, 3}), so the host's name for them is
+/// the one the guest asked about; {CTL_HW, HW_PAGESIZE} is hw.pagesize_compat (measured on macOS 27.0.1, arm64:
+/// oid2name of {6, 7}), which getpagesize asks. A MIB longer than CTL_MAXNAME - 2 has no host name
+/// to ask for and is passed through. What remains (Inferred): a name the host kernel does not
+/// have has no MIB there (on an x86 host, hw.optional.arm64 and the arm FEAT names), so
+/// sysctlnametomib answers ENOENT for it where native gives a MIB.
+/// {CTL_HW, HW_PAGESIZE} is hw.pagesize_compat without asking too, as native arm64 names
+/// it. Published XNU names it so on x86 as well (xnu-12377.1.9
+/// bsd/kern/kern_mib.c: SYSCTL_PROC(_hw, HW_PAGESIZE, pagesize_compat, ...), with hw.pagesize and
+/// hw.pagesize32 as OID_AUTO, none of them under an architecture guard); answering it directly keeps
+/// the host's page size (4096 under Rosetta) out of it. The x86 kernel's own answer is not measured.
+fn sysctl_mib_answer(mib: &[i32], oid2name: impl FnOnce(&[i32]) -> Option<String>) -> Option<SysctlAnswer> {
+    match mib {
+        [6, 1] => sysctl_override("hw.machine"),
+        [6, 7] => sysctl_override("hw.pagesize_compat"),
+        [0, m, ..] if *m <= 5 => None,
+        [0 | 2 | 6, ..] if mib.len() as u64 <= CTL_MAXNAME - 2 => oid2name(mib).as_deref().and_then(sysctl_override),
+        _ => None,
+    }
+}
+
+/// The host kernel's name for MIB `mib` (XNU's oid2name, __sysctl {0, 1, mib...}); None when it
+/// has none. An unknown entry is named by its number ("hw.8"), which matches no override.
+fn host_oid2name(mib: &[i32]) -> Option<String> {
+    let q: Vec<i32> = [0, 1].iter().chain(mib).copied().collect();
+    let mut buf = [0u8; 256];
+    let mut len = buf.len();
+    let r = unsafe { libc::sysctl(q.as_ptr() as *mut i32, q.len() as u32, buf.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0) };
+    if r != 0 {
+        return None;
+    }
+    let end = buf[..len.min(buf.len())].iter().position(|&c| c == 0)?;
+    std::str::from_utf8(&buf[..end]).ok().map(str::to_string)
+}
+
+/// What to say when a sysctl's name or MIB at `p` could not be read and the host call still
+/// succeeded: the kernel read what guestmem::read could not, so no arm64 override was applied
+/// and the guest got the host's own answer. Reaches stderr without --trace, as the path-name warning does.
+fn unread_sysctl_warning(n: u64, p: u64, unread: bool, host_ok: bool) -> Option<String> {
+    (unread && host_ok).then(|| {
+        // __sysctl (202) takes a MIB, not a name
+        let what = if n == 202 { "MIB" } else { "name" };
+        format!("[maclator] warning: #{n} sysctl {what} at {p:#x} could not be read but the host call succeeded: no override applied")
+    })
+}
+
+/// Write `data` at guest address `p` as XNU's copyout does:
+/// fault-safely (`write` is guestmem::write in use, never a dereference), and when the whole cannot
+/// be written, the bytes before the first unwritable one still are. Measured on macOS 27.0.1, arm64: native
+/// sysctlbyname("hw.machine") into a buffer 3 bytes before a PROT_NONE page leaves "arm" there and
+/// answers EFAULT, while a whole guestmem::write of those 6 bytes from inside the translator writes
+/// nothing (probe row N5; from the unit-test binary the same whole write did write the prefix).
+/// False when not every byte was written.
+fn guest_copyout(p: u64, data: &[u8], write: impl Fn(u64, &[u8]) -> bool) -> bool {
+    if write(p, data) {
+        return true;
+    }
+    for (i, b) in data.iter().enumerate() {
+        if !write(p + i as u64, std::slice::from_ref(b)) {
+            break;
+        }
+    }
+    false
+}
+
+/// Hand an override's answer back as XNU's sysctl does,
+/// through guestmem (fault-safe; the old writers dereferenced the guest's `oldp` and `oldlenp`
+/// raw, so a bad pointer killed the translator). `oldlenp` NULL: nothing is read or written, and
+/// the call answers ENOMEM when `oldp` is not NULL. Else `oldlenp` is read (EFAULT when it
+/// cannot be). With `oldp` NULL only the answer's length `query` is written back. Else
+/// `answer(oldlen)` gives the bytes, or None for a short buffer: ENOMEM, nothing written to `oldp`
+/// and 0 written to `oldlenp`. Else the bytes are copied out (EFAULT, with `oldlenp`
+/// untouched, when they cannot all be), then their length is written to `oldlenp` (EFAULT when it
+/// cannot be). Measured on macOS 27.0.1, arm64, natively and the same for a host sysctl (kern.ostype):
+/// an unreadable or unwritable `oldlenp` never returns (3 s at 99% CPU, 78% of it system time, so
+/// the call is presumably restarted), and EFAULT, what sysctl(3) documents, is answered instead
+/// of a hang; `oldp` with a NULL `oldlenp` answers ENOMEM and writes nothing; a short buffer
+/// (oldlen 0, 2 or 3) answers ENOMEM, writes no prefix, and sets oldlen to 0 (probe rows 6 to 8).
+fn sysctl_copyout(oldp: u64, oldlenp: u64, query: u64, answer: impl FnOnce(u64) -> Option<Vec<u8>>) -> Result<(), u64> {
+    let (efault, enomem) = (libc::EFAULT as u64, libc::ENOMEM as u64);
+    if oldlenp == 0 {
+        return if oldp == 0 { Ok(()) } else { Err(enomem) };
+    }
+    let oldlen = crate::guestmem::read_u64(oldlenp).ok_or(efault)?;
+    if oldp == 0 {
+        return crate::guestmem::write_u64(oldlenp, query).then_some(()).ok_or(efault);
+    }
+    let Some(bytes) = answer(oldlen) else {
+        return Err(if crate::guestmem::write_u64(oldlenp, 0) { enomem } else { efault });
+    };
+    if !guest_copyout(oldp, &bytes, crate::guestmem::write) {
+        return Err(efault);
+    }
+    crate::guestmem::write_u64(oldlenp, bytes.len() as u64).then_some(()).ok_or(efault)
+}
+
+fn sysctl_finish(cpu: &mut Cpu, r: Result<(), u64>) {
+    match r {
+        Ok(()) => set_ok(cpu, 0, 0),
+        Err(e) => set_err(cpu, e),
+    }
+}
+
+/// What an overridden sysctl answers,
+/// in the shape native gives it. Measured on macOS 27.0.1, arm64 and arm64e alike, by name and by
+/// MIB alike.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SysctlAnswer {
+    /// A string, its NUL included: the whole string, or ENOMEM and oldlen 0 for a shorter buffer.
+    Str(&'static str),
+    /// A 4-byte integer: 4 bytes and oldlen 4 for any buffer of 4 or more, an 8-byte one included;
+    /// ENOMEM and oldlen 0 below 4; the length query answers 4. K v1 to v3 wrote 8 bytes into a
+    /// buffer of 8 or more.
+    Int(i32),
+    /// An 8-byte integer (hw.pagesize, hw.pagesize32): 8 bytes for a buffer of 8 or more, 4 bytes
+    /// for a buffer of exactly 4, ENOMEM and oldlen 0 otherwise (5 to 7 included); the length
+    /// query answers 8. K v1 to v3 answered 4 to the query and 4 bytes to a buffer of 5 to 7.
+    Quad(i64),
+    /// A name that exists and answers `errno` to every read before touching oldp or oldlenp, oldlen
+    /// left as it was (hw.optional.x86_64 and the SSE and AVX names on arm64: ENOTSUP). A write still
+    /// gets EPERM first.
+    Fails(i32),
+    /// A name that does not exist natively (hw.optional.AdvSIMD on 27.0.1): ENOENT to every call,
+    /// a write included, nothing touched.
+    Absent,
+}
+
+/// Answer an overridden sysctl `a` as XNU
+/// does, for a call with old (`oldp`, `oldlenp`) and new (`newp`, `newlen`) values. Measured on
+/// macOS 27.0.1, arm64: a name that does not exist answers ENOENT before anything else; a write (newp not NULL
+/// and newlen not 0; newp NULL or newlen 0 is a read) to a read-only name, which every overridden
+/// name is, answers EPERM before oldlenp is read, with oldp and oldlen untouched, whatever oldp,
+/// oldlenp and newp point at (an unmapped oldlenp too, where a read never returns); a Fails name
+/// answers its errno with nothing touched. Anything else is sysctl_copyout. K v1 to v3 ignored
+/// newp and newlen and answered a write as a read.
+fn sysctl_reply(a: SysctlAnswer, oldp: u64, oldlenp: u64, newp: u64, newlen: u64) -> Result<(), u64> {
+    if a == SysctlAnswer::Absent {
+        return Err(libc::ENOENT as u64);
+    }
+    if newp != 0 && newlen != 0 {
+        return Err(libc::EPERM as u64);
+    }
+    match a {
+        SysctlAnswer::Str(v) => {
+            let bytes = [v.as_bytes(), &[0]].concat();
+            sysctl_copyout(oldp, oldlenp, bytes.len() as u64, |len| (len >= bytes.len() as u64).then_some(bytes))
+        }
+        SysctlAnswer::Int(v) => sysctl_copyout(oldp, oldlenp, 4, |len| (len >= 4).then(|| v.to_le_bytes().to_vec())),
+        SysctlAnswer::Quad(v) => sysctl_copyout(oldp, oldlenp, 8, |len| match len {
+            l if l >= 8 => Some(v.to_le_bytes().to_vec()),
+            4 => Some((v as i32).to_le_bytes().to_vec()),
+            _ => None,
+        }),
+        SysctlAnswer::Fails(e) => Err(e as u64),
+        SysctlAnswer::Absent => Err(libc::ENOENT as u64),
+    }
+}
+
+/// sysctls whose answer must describe the emulated arm64 machine (an M1), by name. The values are
+/// the translator's choice (the features its JIT gives the guest); the shapes are native's
+/// (SysctlAnswer), measured on macOS 27.0.1, arm64 for every name here.
+fn sysctl_override(name: &str) -> Option<SysctlAnswer> {
+    use SysctlAnswer::{Absent, Int, Quad, Str};
     Some(match name {
-        "sysctl.proc_translated" => 0,
-        "sysctl.proc_native" => 1,
-        "hw.cputype" => 0x0100_000c,
-        "hw.cpusubtype" => 2,
-        "hw.optional.arm64" => 1,
-        "hw.optional.neon" | "hw.optional.AdvSIMD" | "hw.optional.floatingpoint" => 1,
-        "hw.optional.armv8_crc32" | "hw.optional.arm.FEAT_CRC32" => 1,
-        "hw.optional.armv8_1_atomics" | "hw.optional.arm.FEAT_LSE" => 1,
-        // Aligned 128-bit support is narrower than the full LSE2 contract.
-        "hw.optional.arm.FEAT_LSE2" => 0,
-        "hw.optional.arm.FEAT_LRCPC" | "hw.optional.arm.FEAT_LRCPC2" => 1,
+        "hw.machine" => Str("arm64"),
+        "sysctl.proc_translated" => Int(0),
+        "sysctl.proc_native" => Int(1),
+        "hw.cputype" => Int(0x0100_000c),
+        "hw.cpusubtype" => Int(2),
+        "hw.optional.arm64" => Int(1),
+        // hw.optional.AdvSIMD does not exist on 27.0.1 (ENOENT natively); an earlier version answered 1
+        "hw.optional.AdvSIMD" => Absent,
+        "hw.optional.neon" | "hw.optional.floatingpoint" => Int(1),
+        // The arm names the commpage says the translator honours (commpage.rs: kHasAdvSIMD,
+        // kHasAdvSIMD_HPFPCvt, kHasUCNormalMemory, kHasFeatCSV2, kHasFeatCSV3). Every other arm name native
+        // has answers 0 (sysctl_optional_default), hw.optional.neon_fp16 with FEAT_FP16's 0 among them.
+        "hw.optional.arm.AdvSIMD" | "hw.optional.arm.AdvSIMD_HPFPCvt" | "hw.optional.neon_hpfp"
+        | "hw.optional.ucnormal_mem" | "hw.optional.arm.FEAT_CSV2" | "hw.optional.arm.FEAT_CSV3" => Int(1),
+        "hw.optional.armv8_crc32" | "hw.optional.arm.FEAT_CRC32" => Int(1),
+        "hw.optional.armv8_1_atomics" | "hw.optional.arm.FEAT_LSE" => Int(1),
+        // Aligned 128-bit support is narrower than the full LSE2 contract (upstream #7).
+        "hw.optional.arm.FEAT_LSE2" => Int(0),
+        "hw.optional.arm.FEAT_LRCPC" | "hw.optional.arm.FEAT_LRCPC2" => Int(1),
         "hw.optional.arm.FEAT_PAuth" | "hw.optional.arm.FEAT_JSCVT" | "hw.optional.arm.FEAT_FlagM"
         | "hw.optional.arm.FEAT_FlagM2" | "hw.optional.arm.FEAT_DotProd" | "hw.optional.arm.FEAT_FRINTTS"
-        | "hw.optional.arm.FEAT_SB" | "hw.optional.arm.FEAT_DPB" | "hw.optional.arm.FEAT_DPB2" => 1,
+        | "hw.optional.arm.FEAT_SB" | "hw.optional.arm.FEAT_DPB" | "hw.optional.arm.FEAT_DPB2" => Int(1),
         "hw.optional.arm.FEAT_FP16" | "hw.optional.arm.FEAT_FHM" | "hw.optional.arm.FEAT_FCMA"
         | "hw.optional.arm.FEAT_RDM" | "hw.optional.arm.FEAT_SHA3" | "hw.optional.arm.FEAT_SHA512"
         | "hw.optional.arm.FEAT_SME" | "hw.optional.arm.FEAT_SME2" | "hw.optional.arm.FEAT_BF16"
@@ -1665,15 +1867,171 @@ fn sysctl_override(name: &str) -> Option<i64> {
         | "hw.optional.armv8_2_sha3" | "hw.optional.armv8_3_compnum" | "hw.optional.arm.FEAT_SHA256"
         | "hw.optional.arm.FEAT_AES" | "hw.optional.arm.FEAT_PMULL" | "hw.optional.arm.FEAT_SHA1"
         | "hw.optional.arm.FEAT_AFP" | "hw.optional.arm.FEAT_RPRES" | "hw.optional.arm.FEAT_ECV"
-        | "hw.optional.arm.FEAT_WFxT" | "hw.optional.arm.FEAT_CSSC" | "hw.optional.arm.FEAT_HBC" => 0,
-        "hw.pagesize" | "hw.pagesize32" | "vm.pagesize" => 16384,
-        "hw.cpufamily" => crate::commpage::CPUFAMILY as i64,
-        "hw.optional.x86_64" | "hw.optional.sse" | "hw.optional.sse2" | "hw.optional.sse3"
-        | "hw.optional.supplementalsse3" | "hw.optional.sse4_1" | "hw.optional.sse4_2"
-        | "hw.optional.avx1_0" | "hw.optional.avx2_0" => 0,
-        _ => return None,
+        | "hw.optional.arm.FEAT_WFxT" | "hw.optional.arm.FEAT_CSSC" | "hw.optional.arm.FEAT_HBC" => Int(0),
+        "hw.pagesize" | "hw.pagesize32" => Quad(16384),
+        // {CTL_HW, HW_PAGESIZE}'s own name (getpagesize), and vm.pagesize: 4 bytes
+        "hw.pagesize_compat" | "vm.pagesize" => Int(16384),
+        "hw.cpufamily" => Int(crate::commpage::CPUFAMILY as i32),
+        // Any other hw.optional name native has, the x86 names included
+        _ => return sysctl_optional_default(name),
     })
 }
+
+/// An hw.optional name sysctl_override does not
+/// list, answered as native arm64 has it (the measured lists below). Every x86 feature name native
+/// answers ENOTSUP for (29 on 27.0.1: K v4 listed 9, so on an x86 host the other 20 got the host's 1),
+/// answers ENOTSUP. Every other name native has as a 4-byte integer answers 0, a feature the translator
+/// does not promise: on an x86 host its kernel has no such name and would answer ENOENT, and on macOS 27.0.1, arm64 the
+/// host answered M1's own value. A name native has in another shape (hw.optional.arm.caps, 13 bytes) and
+/// any name native does not have are passed through (None).
+fn sysctl_optional_default(name: &str) -> Option<SysctlAnswer> {
+    if NATIVE_OPTIONAL_ENOTSUP.contains(&name) {
+        Some(SysctlAnswer::Fails(libc::ENOTSUP))
+    } else if NATIVE_OPTIONAL_INT.contains(&name) {
+        Some(SysctlAnswer::Int(0))
+    } else {
+        None
+    }
+}
+
+// BEGIN GENERATED from the hw.optional names of macOS 27.0.1, arm64e (
+// every name `sysctl -aN` lists under hw.optional, read natively as arm64e; arm64 identical). Do not edit by hand.
+/// The hw.optional names native arm64 answers ENOTSUP for (the x86 feature names): 29.
+const NATIVE_OPTIONAL_ENOTSUP: [&str; 29] = [
+    "hw.optional.mmx",
+    "hw.optional.sse",
+    "hw.optional.sse2",
+    "hw.optional.sse3",
+    "hw.optional.supplementalsse3",
+    "hw.optional.sse4_1",
+    "hw.optional.sse4_2",
+    "hw.optional.x86_64",
+    "hw.optional.aes",
+    "hw.optional.avx1_0",
+    "hw.optional.rdrand",
+    "hw.optional.f16c",
+    "hw.optional.enfstrg",
+    "hw.optional.fma",
+    "hw.optional.avx2_0",
+    "hw.optional.bmi1",
+    "hw.optional.bmi2",
+    "hw.optional.rtm",
+    "hw.optional.hle",
+    "hw.optional.adx",
+    "hw.optional.mpx",
+    "hw.optional.sgx",
+    "hw.optional.avx512f",
+    "hw.optional.avx512cd",
+    "hw.optional.avx512dq",
+    "hw.optional.avx512bw",
+    "hw.optional.avx512vl",
+    "hw.optional.avx512ifma",
+    "hw.optional.avx512vbmi",
+];
+/// The other hw.optional names native arm64 has, each a 4-byte integer: 95.
+const NATIVE_OPTIONAL_INT: [&str; 95] = [
+    "hw.optional.arm.FEAT_FP8",
+    "hw.optional.arm.FEAT_CRC32",
+    "hw.optional.arm.FEAT_FlagM",
+    "hw.optional.arm.FEAT_FlagM2",
+    "hw.optional.arm.FEAT_FHM",
+    "hw.optional.arm.FEAT_DotProd",
+    "hw.optional.arm.FEAT_SHA3",
+    "hw.optional.arm.FEAT_RDM",
+    "hw.optional.arm.FEAT_LSE",
+    "hw.optional.arm.FEAT_SHA256",
+    "hw.optional.arm.FEAT_SHA512",
+    "hw.optional.arm.FEAT_SHA1",
+    "hw.optional.arm.FEAT_AES",
+    "hw.optional.arm.FEAT_PMULL",
+    "hw.optional.arm.FEAT_SPECRES",
+    "hw.optional.arm.FEAT_SPECRES2",
+    "hw.optional.arm.FEAT_SB",
+    "hw.optional.arm.FEAT_FRINTTS",
+    "hw.optional.arm.FEAT_PACIMP",
+    "hw.optional.arm.FEAT_LRCPC",
+    "hw.optional.arm.FEAT_LRCPC2",
+    "hw.optional.arm.FEAT_FCMA",
+    "hw.optional.arm.FEAT_JSCVT",
+    "hw.optional.arm.FEAT_PAuth",
+    "hw.optional.arm.FEAT_PAuth2",
+    "hw.optional.arm.FEAT_FPAC",
+    "hw.optional.arm.FEAT_FPACCOMBINE",
+    "hw.optional.arm.FEAT_PAuth_LR",
+    "hw.optional.arm.FEAT_DPB",
+    "hw.optional.arm.FEAT_DPB2",
+    "hw.optional.arm.FEAT_BF16",
+    "hw.optional.arm.FEAT_EBF16",
+    "hw.optional.arm.FEAT_I8MM",
+    "hw.optional.arm.FEAT_WFxT",
+    "hw.optional.arm.FEAT_RPRES",
+    "hw.optional.arm.FEAT_CSSC",
+    "hw.optional.arm.FEAT_HBC",
+    "hw.optional.arm.FEAT_LUT",
+    "hw.optional.arm.FEAT_FAMINMAX",
+    "hw.optional.arm.FEAT_CPA",
+    "hw.optional.arm.FEAT_CPA2",
+    "hw.optional.arm.FEAT_ECV",
+    "hw.optional.arm.FEAT_AFP",
+    "hw.optional.arm.FEAT_LSE2",
+    "hw.optional.arm.FEAT_CSV2",
+    "hw.optional.arm.FEAT_CSV3",
+    "hw.optional.arm.FEAT_DIT",
+    "hw.optional.arm.AdvSIMD",
+    "hw.optional.arm.AdvSIMD_HPFPCvt",
+    "hw.optional.arm.FEAT_FP16",
+    "hw.optional.arm.FEAT_SSBS",
+    "hw.optional.arm.FEAT_BTI",
+    "hw.optional.arm.FEAT_SME",
+    "hw.optional.arm.FEAT_SME2",
+    "hw.optional.arm.FEAT_SME2p1",
+    "hw.optional.arm.FEAT_MTE",
+    "hw.optional.arm.FEAT_MTE2",
+    "hw.optional.arm.FEAT_MTE3",
+    "hw.optional.arm.FEAT_MTE4",
+    "hw.optional.arm.FEAT_MTE_ASYNC",
+    "hw.optional.arm.FEAT_MTE_STORE_ONLY",
+    "hw.optional.arm.FEAT_FPMR",
+    "hw.optional.arm.SME_F32F32",
+    "hw.optional.arm.SME_BI32I32",
+    "hw.optional.arm.SME_B16F32",
+    "hw.optional.arm.SME_F16F32",
+    "hw.optional.arm.SME_I8I32",
+    "hw.optional.arm.SME_I16I32",
+    "hw.optional.arm.FEAT_SME_F64F64",
+    "hw.optional.arm.FEAT_SME_I16I64",
+    "hw.optional.arm.FEAT_SME_F16F16",
+    "hw.optional.arm.FEAT_SME_B16B16",
+    "hw.optional.arm.FEAT_SME_LUTv2",
+    "hw.optional.arm.FEAT_SME_F8F16",
+    "hw.optional.arm.FEAT_SME_F8F32",
+    "hw.optional.arm.FP_SyncExceptions",
+    "hw.optional.arm.FEAT_SVE_B16B16",
+    "hw.optional.arm.FEAT_MTE_CANONICAL_TAGS",
+    "hw.optional.arm.FEAT_MTE_NO_ADDRESS_TAGS",
+    "hw.optional.arm.sme_max_svl_b",
+    "hw.optional.floatingpoint",
+    "hw.optional.neon",
+    "hw.optional.neon_hpfp",
+    "hw.optional.neon_fp16",
+    "hw.optional.armv8_crc32",
+    "hw.optional.armv8_gpi",
+    "hw.optional.armv8_1_atomics",
+    "hw.optional.armv8_2_fhm",
+    "hw.optional.armv8_2_sha512",
+    "hw.optional.armv8_2_sha3",
+    "hw.optional.armv8_3_compnum",
+    "hw.optional.watchpoint",
+    "hw.optional.breakpoint",
+    "hw.optional.ucnormal_mem",
+    "hw.optional.arm64",
+];
+/// hw.optional names native arm64 has in another shape (not overridden; passed through): 1.
+#[cfg(test)]
+const NATIVE_OPTIONAL_OTHER: [&str; 1] = [
+    "hw.optional.arm.caps",
+];
+// END GENERATED
 
 fn mach_trap(cpu: &mut Cpu, n: u64) {
     let trace = TRACE.load(Ordering::Relaxed);
@@ -2338,5 +2696,468 @@ mod tests {
         unsafe { *(guard as *mut u8).sub(1) = b'a' };
         assert_eq!(guest_name(at), None);
         unsafe { libc::munmap(m, 3 * pg) };
+    }
+
+    #[test]
+    fn sysctl_names_are_read_fault_safely() {
+        // namelen bytes, no NUL needed, cut at the first NUL; never past the cap
+        let ok = |at: u64, buf: &mut [u8]| crate::guestmem::read(at, buf);
+        let c = b"hw.machine";
+        assert_eq!(sysctl_name(c.as_ptr() as u64, 10, ok).as_deref(), Some("hw.machine"));
+        assert_eq!(sysctl_name(c.as_ptr() as u64, 2, ok).as_deref(), Some("hw"));
+        let z = b"hw.machine\0zz";
+        assert_eq!(sysctl_name(z.as_ptr() as u64, 13, ok).as_deref(), Some("hw.machine"));
+        assert_eq!(sysctl_name(0x1000, 10, ok), None);
+        assert_eq!(sysctl_name(0, 10, |_: u64, _: &mut [u8]| panic!("read a NULL name")), None);
+        assert_eq!(sysctl_name(c.as_ptr() as u64, 0, |_: u64, _: &mut [u8]| panic!("read an empty name")), None);
+        assert_eq!(sysctl_name(c.as_ptr() as u64, MAXPATHLEN as u64, |_: u64, _: &mut [u8]| panic!("read past the cap")), None);
+        // a name ending, with no NUL, just before a PROT_NONE page: XNU copies namelen bytes only
+        let (m, pg, at) = guard_page(b"hw.machine");
+        assert_eq!(sysctl_name(at, 10, ok).as_deref(), Some("hw.machine"));
+        // must-fail control: one byte more runs into the page
+        assert_eq!(sysctl_name(at, 11, ok), None);
+        // A MIB of 2 to CTL_MAXNAME entries is read, fault-safely; any other length is not
+        let mib: [i32; 2] = [6, 1];
+        assert_eq!(sysctl_mib(mib.as_ptr() as u64, 2, ok), (Some(vec![6, 1]), false));
+        let three: [i32; 3] = [6, 103, 109];
+        assert_eq!(sysctl_mib(three.as_ptr() as u64, 3, ok), (Some(vec![6, 103, 109]), false));
+        assert_eq!(sysctl_mib(0x1000, 2, ok), (None, true));
+        assert_eq!(sysctl_mib(0x1000, 3, ok), (None, true));
+        for n in [0, 1, CTL_MAXNAME + 1] {
+            assert_eq!(sysctl_mib(0x1000, n, |_: u64, _: &mut [u8]| panic!("read a MIB of {n} entries")), (None, false));
+        }
+        // the second entry in the PROT_NONE page (probe row U7)
+        let (gm, gpg, gat) = guard_page(&6i32.to_le_bytes());
+        assert_eq!(sysctl_mib(gat, 2, ok), (None, true));
+        assert_eq!(sysctl_mib(gat, 1, ok), (None, false), "must-fail control: a 1-entry MIB is the host's EINVAL, not read");
+        unsafe { libc::munmap(gm, 2 * gpg) };
+        assert_eq!(unread_sysctl_warning(274, 0x1000, true, false), None);
+        assert!(unread_sysctl_warning(274, 0x1000, true, true).is_some());
+        assert_eq!(unread_sysctl_warning(274, 0x1000, false, true), None);
+        unsafe { libc::munmap(m, 2 * pg) };
+    }
+
+    #[test]
+    fn sysctl_names_drop_one_terminal_dot_as_xnu() {
+        // name2oid drops one terminal dot, after the
+        // cut at the first NUL; measured natively on macOS 27.0.1, arm64
+        let ok = |at: u64, buf: &mut [u8]| crate::guestmem::read(at, buf);
+        let name = |b: &[u8], n: u64| sysctl_name(b.as_ptr() as u64, n, ok);
+        assert_eq!(name(b"hw.machine.", 11).as_deref(), Some("hw.machine"));
+        assert_eq!(name(b"hw.machine.", 10).as_deref(), Some("hw.machine"), "namelen not counting the dot");
+        assert_eq!(name(b"hw.machine.\0", 12).as_deref(), Some("hw.machine"), "namelen counting the NUL");
+        assert_eq!(name(b"hw.machine.\0junk", 16).as_deref(), Some("hw.machine"), "the dot is the last byte before the NUL");
+        assert_eq!(name(b"hw.machine\0.", 12).as_deref(), Some("hw.machine"), "a dot after the NUL is not read");
+        assert_eq!(name(b"hw.optional.mmx.", 16).as_deref(), Some("hw.optional.mmx"));
+        assert_eq!(name(b"hw.optional.", 12).as_deref(), Some("hw.optional"));
+        // must-fail controls: only one, and only at the end (native ENOENT for each)
+        assert_eq!(name(b"hw.machine..", 12).as_deref(), Some("hw.machine."));
+        assert_eq!(name(b".hw.machine", 11).as_deref(), Some(".hw.machine"));
+        assert_eq!(name(b"hw..machine", 11).as_deref(), Some("hw..machine"));
+        assert_eq!(name(b".", 1).as_deref(), Some(""));
+        assert_eq!(name(b"hw.machine ", 11).as_deref(), Some("hw.machine "));
+        assert_eq!(sysctl_override("hw.machine."), None, "the table itself is not widened");
+        // real calls through bsd(274): the overrides answer, the doubled dot goes to the host (its ENOENT)
+        let call = |n: u64, args: [u64; 8]| -> Result<u64, u64> {
+            let mut cpu = Cpu::new();
+            bsd(&mut cpu, n, args);
+            if cpu.cf == 0 { Ok(cpu.x[0]) } else { Err(cpu.x[0]) }
+        };
+        let mut out = [0x5au8; 64];
+        let mut len: u64 = 64;
+        let o = out.as_mut_ptr() as u64;
+        let l = &mut len as *mut u64 as u64;
+        let hm = b"hw.machine.";
+        assert!(call(274, [hm.as_ptr() as u64, 11, o, l, 0, 0, 0, 0]).is_ok());
+        assert_eq!((&out[..6], len), (&b"arm64\0"[..], 6));
+        len = 64;
+        let mmx = b"hw.optional.mmx.";
+        assert_eq!(call(274, [mmx.as_ptr() as u64, 16, o, l, 0, 0, 0, 0]), Err(libc::ENOTSUP as u64));
+        len = 64;
+        let pt = b"sysctl.proc_translated.";
+        assert!(call(274, [pt.as_ptr() as u64, 23, o, l, 0, 0, 0, 0]).is_ok());
+        assert_eq!((i32::from_le_bytes(out[..4].try_into().unwrap()), len), (0, 4));
+        len = 64;
+        let mm = b"hw.machine..";
+        assert_eq!(call(274, [mm.as_ptr() as u64, 12, o, l, 0, 0, 0, 0]), Err(libc::ENOENT as u64));
+        // control: a host sysctl with the dot is the host's, and answers
+        len = 64;
+        let ot = b"kern.ostype.";
+        assert!(call(274, [ot.as_ptr() as u64, 12, o, l, 0, 0, 0, 0]).is_ok());
+        assert_eq!(&out[..7], b"Darwin\0");
+    }
+
+    #[test]
+    fn bsd_passes_an_unreadable_sysctl_name_to_the_host_kernel() {
+        // Real calls. Unpatched, each unreadable case crashed the process.
+        let call = |n: u64, args: [u64; 8]| -> Result<u64, u64> {
+            let mut cpu = Cpu::new();
+            bsd(&mut cpu, n, args);
+            if cpu.cf == 0 { Ok(cpu.x[0]) } else { Err(cpu.x[0]) }
+        };
+        let e = |v: i32| -> Result<u64, u64> { Err(v as u64) };
+        let mut out = [0u8; 64];
+        let mut len: u64 = 64;
+        let o = out.as_mut_ptr() as u64;
+        let l = &mut len as *mut u64 as u64;
+        // positive controls: an override, an integer override, and a host sysctl
+        let hm = b"hw.machine";
+        assert!(call(274, [hm.as_ptr() as u64, 10, o, l, 0, 0, 0, 0]).is_ok());
+        assert_eq!(&out[..6], b"arm64\0");
+        len = 64;
+        let pt = b"sysctl.proc_translated";
+        assert!(call(274, [pt.as_ptr() as u64, pt.len() as u64, o, l, 0, 0, 0, 0]).is_ok());
+        assert_eq!(len, 4, "K v4: a 4-byte integer, as native, in a 64-byte buffer");
+        assert_eq!(i32::from_le_bytes(out[..4].try_into().unwrap()), 0);
+        len = 64;
+        let ot = b"kern.ostype";
+        assert!(call(274, [ot.as_ptr() as u64, ot.len() as u64, o, l, 0, 0, 0, 0]).is_ok());
+        assert_eq!(&out[..7], b"Darwin\0");
+        // unreadable names: the host kernel's EFAULT
+        len = 64;
+        assert_eq!(call(274, [0x1000, 10, o, l, 0, 0, 0, 0]), e(libc::EFAULT), "sysctlbyname at 0x1000");
+        let (m, pg, at) = guard_page(b"hw.machine");
+        assert_eq!(call(274, [at, 11, o, l, 0, 0, 0, 0]), e(libc::EFAULT), "into the guard page");
+        // the same name, namelen stopping before the page: the override, as XNU reads it
+        len = 64;
+        assert!(call(274, [at, 10, o, l, 0, 0, 0, 0]).is_ok());
+        assert_eq!(&out[..6], b"arm64\0");
+        // __sysctl
+        let mib: [i32; 2] = [6, 1];
+        len = 64;
+        assert!(call(202, [mib.as_ptr() as u64, 2, o, l, 0, 0, 0, 0]).is_ok());
+        assert_eq!(&out[..6], b"arm64\0");
+        let kost: [i32; 2] = [1, 1];
+        len = 64;
+        assert!(call(202, [kost.as_ptr() as u64, 2, o, l, 0, 0, 0, 0]).is_ok());
+        assert_eq!(&out[..7], b"Darwin\0");
+        assert_eq!(call(202, [0x1000, 2, o, l, 0, 0, 0, 0]), e(libc::EFAULT), "__sysctl MIB at 0x1000");
+        assert_eq!(call(202, [0x1000, 3, o, l, 0, 0, 0, 0]), e(libc::EFAULT), "__sysctl 3-entry MIB at 0x1000");
+        unsafe { libc::munmap(m, 2 * pg) };
+    }
+
+    #[test]
+    fn sysctl_answers_are_written_fault_safely() {
+        // Real calls through bsd(). Under K, each EFAULT case
+        // below dereferenced the guest's oldp or oldlenp raw and crashed the process.
+        let call = |n: u64, args: [u64; 8]| -> Result<u64, u64> {
+            let mut cpu = Cpu::new();
+            bsd(&mut cpu, n, args);
+            if cpu.cf == 0 { Ok(cpu.x[0]) } else { Err(cpu.x[0]) }
+        };
+        let efault: Result<u64, u64> = Err(libc::EFAULT as u64);
+        let enomem: Result<u64, u64> = Err(libc::ENOMEM as u64);
+        let pg = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let m = unsafe { libc::mmap(std::ptr::null_mut(), 3 * pg, libc::PROT_READ | libc::PROT_WRITE,
+                                    libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0) };
+        assert_ne!(m, libc::MAP_FAILED);
+        let (buf, lenp, ro) = (m as u64, m as u64 + pg as u64, m as u64 + 2 * pg as u64);
+        unsafe { *(ro as *mut u64) = 64 };
+        unsafe { *((ro + 8) as *mut u64) = 2 }; // a short oldlen on the read-only page
+        assert_eq!(unsafe { libc::mprotect(ro as *mut libc::c_void, pg, libc::PROT_READ) }, 0);
+        let set_len = |v: u64| unsafe { *(lenp as *mut u64) = v };
+        let len = || unsafe { *(lenp as *const u64) };
+        let hm = b"hw.machine";
+        let pt = b"sysctl.proc_translated";
+        let mib: [i32; 2] = [6, 1];
+        let calls: [(u64, u64, u64, u64); 3] = [
+            (274, hm.as_ptr() as u64, 10, 6),
+            (202, mib.as_ptr() as u64, 2, 6),
+            (274, pt.as_ptr() as u64, pt.len() as u64, 4),
+        ];
+        for (n, name, nl, need) in calls {
+            // positive control: an ordinary buffer gets the override's answer, not the host's (under
+            // Rosetta the host says x86_64 and 1). It comes first: a call that missed the override
+            // would take the bad pointers below to the host kernel, which natively never returns.
+            set_len(64);
+            assert!(call(n, [name, nl, buf, lenp, 0, 0, 0, 0]).is_ok(), "#{n} control");
+            let got = unsafe { std::slice::from_raw_parts(buf as *const u8, 8) };
+            if need == 6 {
+                assert_eq!(&got[..6], b"arm64\0", "#{n} control: the override answered");
+            } else {
+                assert_eq!((len(), i32::from_le_bytes(got[..4].try_into().unwrap())), (4, 0), "#{n} control: the override answered");
+            }
+            // oldlenp unmapped, and read-only
+            assert_eq!(call(n, [name, nl, buf, 0x1000, 0, 0, 0, 0]), efault, "#{n} oldlenp 0x1000");
+            assert_eq!(call(n, [name, nl, buf, ro, 0, 0, 0, 0]), efault, "#{n} read-only oldlenp");
+            assert_eq!(unsafe { *(ro as *const u64) }, 64);
+            // oldp read-only: EFAULT, and oldlen is left as it was
+            set_len(64);
+            assert_eq!(call(n, [name, nl, ro + 64, lenp, 0, 0, 0, 0]), efault, "#{n} read-only oldp");
+            assert_eq!(len(), 64);
+            // oldp NULL: the length query
+            set_len(64);
+            assert!(call(n, [name, nl, 0, lenp, 0, 0, 0, 0]).is_ok(), "#{n} length query");
+            assert_eq!(len(), need);
+            // As measured natively (probe rows 6 to 8). oldp with
+            // oldlenp NULL: ENOMEM, nothing written; both NULL: success
+            let fill = || unsafe { std::ptr::write_bytes(buf as *mut u8, 0x5a, 64) };
+            let untouched = || unsafe { std::slice::from_raw_parts(buf as *const u8, 64) }.iter().all(|&b| b == 0x5a);
+            fill();
+            assert_eq!(call(n, [name, nl, buf, 0, 0, 0, 0, 0]), enomem, "#{n} oldp, oldlenp NULL");
+            assert!(untouched(), "#{n} oldlenp NULL: nothing written");
+            assert!(call(n, [name, nl, 0, 0, 0, 0, 0, 0]).is_ok(), "#{n} oldp NULL, oldlenp NULL");
+            // a short buffer (3, 2 and 0 bytes): ENOMEM, no prefix written, oldlen set to 0
+            for short in [3, 2, 0] {
+                fill();
+                set_len(short);
+                assert_eq!(call(n, [name, nl, buf, lenp, 0, 0, 0, 0]), enomem, "#{n} oldlen {short}");
+                assert!(untouched(), "#{n} oldlen {short}: no prefix written");
+                assert_eq!(len(), 0, "#{n} oldlen {short}: oldlen set to 0");
+            }
+            // must-fail control: a buffer that fits is written, and oldlen is the answer's length
+            fill();
+            set_len(64);
+            assert!(call(n, [name, nl, buf, lenp, 0, 0, 0, 0]).is_ok());
+            assert!(!untouched() && len() == need, "#{n} control: written");
+            // a short oldlen on a read-only page: the 0 cannot be written, EFAULT (natively such a
+            // oldlenp never returns, rows N2, M2, I2)
+            assert_eq!(call(n, [name, nl, buf, ro + 8, 0, 0, 0, 0]), efault, "#{n} short, read-only oldlenp");
+            assert_eq!(unsafe { *((ro + 8) as *const u64) }, 2);
+        }
+        // oldp 3 bytes before a PROT_NONE page: what fits is written, then EFAULT (as native)
+        let (g, gpg, at) = guard_page(b"zzz");
+        set_len(64);
+        assert_eq!(call(274, [hm.as_ptr() as u64, 10, at, lenp, 0, 0, 0, 0]), efault);
+        assert_eq!(unsafe { std::slice::from_raw_parts(at as *const u8, 3) }, b"arm");
+        assert_eq!(len(), 64);
+        // guest_copyout with a memory that refuses, whole, any write reaching past `limit` (what
+        // guestmem::write did from inside the translator, probe row N5): the bytes below the limit
+        // are still written, then false; a write that fits is whole
+        let mem = std::cell::RefCell::new([b'z'; 8]);
+        let limit = 3u64;
+        let fake = |at: u64, d: &[u8]| -> bool {
+            if at + d.len() as u64 > limit {
+                return false;
+            }
+            mem.borrow_mut()[at as usize..at as usize + d.len()].copy_from_slice(d);
+            true
+        };
+        assert!(!guest_copyout(0, b"arm64\0", fake));
+        assert_eq!(&mem.borrow()[..], b"armzzzzz");
+        assert!(guest_copyout(0, b"ab", fake));
+        assert_eq!(&mem.borrow()[..2], b"ab");
+        // A MIB is called a MIB, a name a name; a name never read gets no trace
+        // of "unreadable" (sysctl_name_not_read) and no warning
+        assert!(unread_sysctl_warning(202, 0x1000, true, true).unwrap().contains("sysctl MIB at"));
+        assert!(unread_sysctl_warning(274, 0x1000, true, true).unwrap().contains("sysctl name at"));
+        assert!(sysctl_name_not_read(0, 10) && sysctl_name_not_read(0x1000, 0) && sysctl_name_not_read(0x1000, 1024));
+        assert!(!sysctl_name_not_read(0x1000, 10), "must-fail control: an unreadable name is read");
+        unsafe {
+            libc::munmap(g, 2 * gpg);
+            libc::munmap(m, 3 * pg);
+        }
+    }
+
+    #[test]
+    fn sysctl_optional_names_answer_as_native_without_the_host() {
+        // Every hw.optional name native arm64 has as an integer
+        // (the hw.optional names of macOS 27.0.1 on arm64e) is answered by the table alone, so an x86 host's own
+        // answers (1 for its features, ENOENT for the arm names) never reach the guest. None of these calls
+        // reaches the host: sysctl_override and sysctl_mib_answer are pure, and the MIB route is given a host
+        // namer that panics.
+        use SysctlAnswer::{Absent, Fails, Int};
+        assert_eq!(NATIVE_OPTIONAL_ENOTSUP.len() + NATIVE_OPTIONAL_INT.len() + NATIVE_OPTIONAL_OTHER.len(), 125);
+        for name in NATIVE_OPTIONAL_ENOTSUP {
+            assert_eq!(sysctl_override(name), Some(Fails(libc::ENOTSUP)), "{name}");
+        }
+        // the 20 K v4 did not list (an x86 host answers 1 for several of them)
+        for x in ["mmx", "aes", "rdrand", "f16c", "enfstrg", "fma", "bmi1", "bmi2", "rtm", "hle", "adx", "mpx", "sgx",
+                  "avx512f", "avx512cd", "avx512dq", "avx512bw", "avx512vl", "avx512ifma", "avx512vbmi"] {
+            let name = format!("hw.optional.{x}");
+            assert!(NATIVE_OPTIONAL_ENOTSUP.contains(&name.as_str()), "{name} measured ENOTSUP");
+            assert_eq!(sysctl_override(&name), Some(Fails(libc::ENOTSUP)), "{name}");
+        }
+        for name in NATIVE_OPTIONAL_INT {
+            assert!(matches!(sysctl_override(name), Some(Int(_))), "{name}: a 4-byte integer, as native");
+        }
+        // the commpage's honoured features answer 1; an arm name the translator does not promise answers 0
+        // (natively M1 answers 1 for FEAT_DIT and neon_fp16, 4 for watchpoint: the translator's choice)
+        for name in ["hw.optional.arm.AdvSIMD", "hw.optional.arm.AdvSIMD_HPFPCvt", "hw.optional.neon_hpfp",
+                     "hw.optional.ucnormal_mem", "hw.optional.arm.FEAT_CSV2", "hw.optional.arm.FEAT_CSV3"] {
+            assert!(NATIVE_OPTIONAL_INT.contains(&name), "{name} exists natively");
+            assert_eq!(sysctl_override(name), Some(Int(1)), "{name}");
+        }
+        for name in ["hw.optional.arm.FEAT_DIT", "hw.optional.neon_fp16", "hw.optional.watchpoint",
+                     "hw.optional.breakpoint", "hw.optional.arm.FEAT_BTI", "hw.optional.arm.sme_max_svl_b"] {
+            assert!(NATIVE_OPTIONAL_INT.contains(&name), "{name} exists natively");
+            assert_eq!(sysctl_override(name), Some(Int(0)), "{name}");
+        }
+        // the table's own values stand (precedence over the default)
+        assert_eq!(sysctl_override("hw.optional.arm.FEAT_PAuth"), Some(Int(1)));
+        assert_eq!(sysctl_override("hw.optional.arm64"), Some(Int(1)));
+        assert_eq!(sysctl_override("hw.optional.AdvSIMD"), Some(Absent));
+        // must-fail controls: another shape, a name native lacks, a host sysctl, a prefix are passed through
+        for name in NATIVE_OPTIONAL_OTHER.iter().copied().chain(["hw.optional.nope", "hw.optional", "hw.optional.mmx2",
+                                                                 "kern.ostype", "hw.optional.arm."]) {
+            assert_eq!(sysctl_override(name), None, "{name}");
+        }
+        // by MIB: an x86 name and an arm name answer as by name, whatever number the host gave
+        let never = |m: &[i32]| -> Option<String> { panic!("asked the host to name {m:?}") };
+        let named = |name: &'static str| move |_: &[i32]| Some(name.to_string());
+        assert_eq!(sysctl_mib_answer(&[6, 103, 200], named("hw.optional.avx512vbmi")), Some(Fails(libc::ENOTSUP)));
+        assert_eq!(sysctl_mib_answer(&[6, 103, 201], named("hw.optional.watchpoint")), Some(Int(0)));
+        // {CTL_HW, HW_PAGESIZE} is hw.pagesize_compat (4 bytes) without asking, so an x86 kernel's
+        // name for it (hw.pagesize, 8 bytes) is never what answers
+        assert_eq!(sysctl_mib_answer(&[6, 7], never), Some(Int(16384)));
+        assert_eq!(sysctl_override("hw.pagesize"), Some(SysctlAnswer::Quad(16384)), "the name it must not take");
+    }
+
+    #[test]
+    fn sysctl_writes_widths_and_mibs_answer_as_native() {
+        // Against what macOS 27.0.1 on arm64
+        // answers natively.
+        use SysctlAnswer::{Absent, Fails, Int, Quad, Str};
+        let (eperm, enomem, enoent, enotsup) =
+            (Err(libc::EPERM as u64), Err(libc::ENOMEM as u64), Err(libc::ENOENT as u64), Err(libc::ENOTSUP as u64));
+        let pg = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let m = unsafe { libc::mmap(std::ptr::null_mut(), 2 * pg, libc::PROT_READ | libc::PROT_WRITE,
+                                    libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0) };
+        assert_ne!(m, libc::MAP_FAILED);
+        let (buf, lenp) = (m as u64, m as u64 + pg as u64);
+        let newv: i32 = 0;
+        let newp = &newv as *const i32 as u64;
+        let fill = || unsafe { std::ptr::write_bytes(buf as *mut u8, 0x5a, 64) };
+        let set_len = |v: u64| unsafe { *(lenp as *mut u64) = v };
+        let len = || unsafe { *(lenp as *const u64) };
+        let got = |n: usize| unsafe { std::slice::from_raw_parts(buf as *const u8, n) }.to_vec();
+        let untouched = || got(64).iter().all(|&b| b == 0x5a);
+        // A write to a read-only name is EPERM before anything is read or written: oldp and
+        // oldlen untouched, whatever oldp, oldlenp and newp are (an unmapped oldlenp, an unmapped newp)
+        for a in [Str("arm64"), Int(0), Quad(16384), Fails(libc::ENOTSUP)] {
+            for (op, lp, np, nl) in [(buf, lenp, newp, 4), (0, 0, newp, 4), (buf, 0, newp, 4), (0, lenp, newp, 4),
+                                     (buf, 0x1000, newp, 4), (buf, lenp, 0x1000, 4), (buf, lenp, newp, 1 << 30)] {
+                fill();
+                set_len(64);
+                assert_eq!(sysctl_reply(a, op, lp, np, nl), eperm, "{a:?} write {op:#x} {lp:#x} {np:#x} {nl}");
+                assert!(untouched() && len() == 64, "{a:?} write: nothing touched");
+            }
+            // a short oldlen: still EPERM, oldlen left (native: l2)
+            set_len(2);
+            assert_eq!(sysctl_reply(a, buf, lenp, newp, 4), eperm);
+            assert_eq!(len(), 2);
+        }
+        // must-fail controls: newp with newlen 0, and newlen with newp NULL, are reads (native: ok)
+        for (np, nl) in [(newp, 0), (0, 4)] {
+            fill();
+            set_len(64);
+            assert_eq!(sysctl_reply(Str("arm64"), buf, lenp, np, nl), Ok(()), "newp {np:#x} newlen {nl}: a read");
+            assert_eq!((got(6), len()), (b"arm64\0".to_vec(), 6));
+        }
+        // a name that does not exist: ENOENT first, a write included; a Fails name: its errno to a read,
+        // nothing touched (an unmapped oldlenp is never read: native returns at once there)
+        for (op, lp, np, nl) in [(buf, lenp, 0, 0), (buf, lenp, newp, 4), (buf, 0x1000, 0, 0), (0, 0, 0, 0), (buf, 0, 0, 0)] {
+            fill();
+            set_len(64);
+            assert_eq!(sysctl_reply(Absent, op, lp, np, nl), enoent);
+            if np == 0 {
+                assert_eq!(sysctl_reply(Fails(libc::ENOTSUP), op, lp, np, nl), enotsup);
+            }
+            assert!(untouched() && len() == 64);
+        }
+        // Widths. A 4-byte integer: 4 bytes and oldlen 4 for any buffer of 4 or more, the rest of an
+        // 8-byte buffer untouched; ENOMEM, oldlen 0 below 4; the query answers 4
+        for cap in [4u64, 5, 7, 8, 9, 64] {
+            fill();
+            set_len(cap);
+            assert_eq!(sysctl_reply(Int(0x0100_000c), buf, lenp, 0, 0), Ok(()), "Int cap {cap}");
+            assert_eq!((len(), got(8)), (4, vec![0x0c, 0, 0, 1, 0x5a, 0x5a, 0x5a, 0x5a]), "Int cap {cap}");
+        }
+        for cap in [0u64, 3] {
+            fill();
+            set_len(cap);
+            assert_eq!(sysctl_reply(Int(1), buf, lenp, 0, 0), enomem);
+            assert!(untouched() && len() == 0);
+        }
+        set_len(999);
+        assert_eq!(sysctl_reply(Int(1), 0, lenp, 0, 0), Ok(()));
+        assert_eq!(len(), 4);
+        // an 8-byte integer (hw.pagesize, hw.pagesize32): 8 bytes from 8, 4 bytes at exactly 4, ENOMEM at 5 to 7
+        // and below 4; the query answers 8
+        set_len(999);
+        assert_eq!(sysctl_reply(Quad(16384), 0, lenp, 0, 0), Ok(()));
+        assert_eq!(len(), 8);
+        for cap in [8u64, 9, 64] {
+            fill();
+            set_len(cap);
+            assert_eq!(sysctl_reply(Quad(16384), buf, lenp, 0, 0), Ok(()));
+            assert_eq!((len(), got(8)), (8, 16384i64.to_le_bytes().to_vec()));
+        }
+        fill();
+        set_len(4);
+        assert_eq!(sysctl_reply(Quad(16384), buf, lenp, 0, 0), Ok(()));
+        assert_eq!((len(), got(8)), (4, vec![0, 0x40, 0, 0, 0x5a, 0x5a, 0x5a, 0x5a]));
+        for cap in [0u64, 3, 5, 6, 7] {
+            fill();
+            set_len(cap);
+            assert_eq!(sysctl_reply(Quad(16384), buf, lenp, 0, 0), enomem, "Quad cap {cap}");
+            assert!(untouched() && len() == 0, "Quad cap {cap}");
+        }
+        // the table's shapes, one per kind measured
+        assert_eq!(sysctl_override("hw.cputype"), Some(Int(0x0100_000c)));
+        assert_eq!(sysctl_override("sysctl.proc_translated"), Some(Int(0)));
+        assert_eq!(sysctl_override("vm.pagesize"), Some(Int(16384)));
+        assert_eq!(sysctl_override("hw.pagesize_compat"), Some(Int(16384)));
+        assert_eq!(sysctl_override("hw.pagesize32"), Some(Quad(16384)));
+        assert_eq!(sysctl_override("hw.optional.sse4_2"), Some(Fails(libc::ENOTSUP)));
+        assert_eq!(sysctl_override("hw.optional.AdvSIMD"), Some(Absent));
+        assert_eq!(sysctl_override("kern.ostype"), None, "must-fail control: a host sysctl");
+        // The MIB names the override. {6, 1} without asking the host; the sysctl meta entries, other
+        // top levels and a MIB too long to name are never asked about
+        let never = |m: &[i32]| -> Option<String> { panic!("asked the host to name {m:?}") };
+        assert_eq!(sysctl_mib_answer(&[6, 1], never), Some(Str("arm64")));
+        for mib in [&[0, 3][..], &[0, 1, 6, 1], &[0, 5], &[1, 1], &[7, 1], &[6, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]] {
+            assert_eq!(sysctl_mib_answer(mib, never), None, "{mib:?}");
+        }
+        let named = |name: &'static str| move |_: &[i32]| Some(name.to_string());
+        assert_eq!(sysctl_mib_answer(&[6, 7], named("hw.pagesize_compat")), Some(Int(16384)));
+        assert_eq!(sysctl_mib_answer(&[0, 100], named("sysctl.proc_translated")), Some(Int(0)));
+        assert_eq!(sysctl_mib_answer(&[2, 257], named("vm.pagesize")), Some(Int(16384)));
+        assert_eq!(sysctl_mib_answer(&[6, 103, 109], named("hw.optional.x86_64")), Some(Fails(libc::ENOTSUP)));
+        assert_eq!(sysctl_mib_answer(&[6, 1, 2, 3, 4, 5, 6, 7, 8, 9], named("hw.pagesize")), Some(Quad(16384)), "10 entries: asked");
+        assert_eq!(sysctl_mib_answer(&[6, 2], named("hw.model")), None, "must-fail control: a host name");
+        assert_eq!(sysctl_mib_answer(&[6, 8], |_: &[i32]| None), None);
+        // real calls through bsd(202), with the MIBs the host kernel gives (sysctlnametomib); under Rosetta the
+        // host answers 4096, 1, 4096 and 1 for these four, so a call that missed the override shows
+        let call = |n: u64, args: [u64; 8]| -> Result<u64, u64> {
+            let mut cpu = Cpu::new();
+            bsd(&mut cpu, n, args);
+            if cpu.cf == 0 { Ok(cpu.x[0]) } else { Err(cpu.x[0]) }
+        };
+        let host_mib = |name: &str| -> Vec<i32> {
+            let c = std::ffi::CString::new(name).unwrap();
+            let mut mib = [0i32; 12];
+            let mut n: libc::size_t = 12;
+            assert_eq!(unsafe { libc::sysctlnametomib(c.as_ptr(), mib.as_mut_ptr(), &mut n) }, 0, "{name}");
+            mib[..n].to_vec()
+        };
+        assert_eq!(host_oid2name(&[6, 7]).as_deref(), Some("hw.pagesize_compat"));
+        assert_eq!(host_oid2name(&host_mib("hw.pagesize")).as_deref(), Some("hw.pagesize"));
+        for (name, want_len, want) in [("hw.pagesize", 8u64, 16384i64), ("sysctl.proc_translated", 4, 0),
+                                       ("hw.pagesize_compat", 4, 16384), ("vm.pagesize", 4, 16384)] {
+            let mib = if name == "hw.pagesize_compat" { vec![6, 7] } else { host_mib(name) };
+            fill();
+            set_len(64);
+            assert_eq!(call(202, [mib.as_ptr() as u64, mib.len() as u64, buf, lenp, 0, 0, 0, 0]), Ok(0), "{name} by MIB");
+            let mut v = [0u8; 8];
+            v[..want_len as usize].copy_from_slice(&got(want_len as usize));
+            assert_eq!((len(), i64::from_le_bytes(v)), (want_len, want), "{name} by MIB");
+            set_len(64);
+            assert_eq!(call(202, [mib.as_ptr() as u64, mib.len() as u64, buf, lenp, newp, 4, 0, 0]), Err(libc::EPERM as u64), "{name} written by MIB");
+        }
+        let x = host_mib("hw.optional.x86_64");
+        set_len(64);
+        assert_eq!(call(202, [x.as_ptr() as u64, x.len() as u64, buf, lenp, 0, 0, 0, 0]), Err(libc::ENOTSUP as u64));
+        assert_eq!(len(), 64);
+        // must-fail control: a host MIB is the host's
+        let k: [i32; 2] = [1, 1];
+        set_len(64);
+        assert_eq!(call(202, [k.as_ptr() as u64, 2, buf, lenp, 0, 0, 0, 0]), Ok(0));
+        assert_eq!(got(7), b"Darwin\0".to_vec());
+        // and by name, a write: EPERM through bsd(274) too
+        let hm = b"hw.machine";
+        set_len(64);
+        assert_eq!(call(274, [hm.as_ptr() as u64, 10, buf, lenp, newp, 4, 0, 0]), Err(libc::EPERM as u64));
+        unsafe { libc::munmap(m, 2 * pg) };
     }
 }
