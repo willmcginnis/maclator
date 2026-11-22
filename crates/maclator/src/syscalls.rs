@@ -2992,6 +2992,48 @@ const NATIVE_OPTIONAL_OTHER: [&str; 1] = [
 ];
 // END GENERATED
 
+/// mach_vm_map(target, address, size, mask, flags, prot) with VM_FLAGS_ANYWHERE. arm64 macOS rounds to 16 KiB and the
+/// Intel host to 4 KiB, so a guest that rounds a size itself can deallocate past a short host mapping: into a neighbour,
+/// or into a gap, which raises EXC_GUARD (fatal in a platform binary). As `mmap_16k`, give it what the guest's kernel would.
+fn vm_map_args_16k(mut a: [u64; 8]) -> [u64; 8] {
+    const PAGE: u64 = 0x4000;
+    const VM_FLAGS_ANYWHERE: u64 = 1;
+    if a[4] & VM_FLAGS_ANYWHERE != 0 {
+        if let Some(s) = a[2].checked_add(PAGE - 1) {
+            a[2] = s & !(PAGE - 1);
+            a[3] |= PAGE - 1;
+        }
+    }
+    a
+}
+
+#[cfg(test)]
+mod vm_map_16k_tests {
+    use super::vm_map_args_16k;
+
+    fn map(size: u64, mask: u64, flags: u64) -> (u64, u64) {
+        let a = vm_map_args_16k([0x203, 0x1000, size, mask, flags, 3, 0, 0]);
+        (a[2], a[3])
+    }
+
+    #[test]
+    fn anywhere_gets_a_guest_page() {
+        assert_eq!(map(0x1000, 0xfff, 1), (0x4000, 0x3fff));
+        assert_eq!(map(0x4000, 0, 1), (0x4000, 0x3fff));
+        assert_eq!(map(0x4001, 0xffff, 1), (0x8000, 0xffff));
+    }
+
+    #[test]
+    fn fixed_is_left_alone() {
+        assert_eq!(map(0x1000, 0xfff, 0), (0x1000, 0xfff));
+    }
+
+    #[test]
+    fn an_impossible_size_is_left_for_the_kernel() {
+        assert_eq!(map(u64::MAX, 0xfff, 1), (u64::MAX, 0xfff));
+    }
+}
+
 fn mach_trap(cpu: &mut Cpu, n: u64) {
     let trace = TRACE.load(Ordering::Relaxed);
     match n {
@@ -3006,6 +3048,7 @@ fn mach_trap(cpu: &mut Cpu, n: u64) {
         _ => {}
     }
     let args = [cpu.x[0], cpu.x[1], cpu.x[2], cpu.x[3], cpu.x[4], cpu.x[5], cpu.x[6], cpu.x[7]];
+    let args = if n == 15 { vm_map_args_16k(args) } else { args };
     if n == 10 && args[3] & 1 != 0 && args[1] != 0 && args[2] != 0 {
         // mach_vm_allocate(VM_FLAGS_ANYWHERE): place it from a deterministic arena so that
         // dyld-loaded libraries land at the same addresses every run (persistent AOT cache).
