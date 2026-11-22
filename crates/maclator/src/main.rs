@@ -75,6 +75,7 @@ fn main() {
     let mut gpu_flag = false;
     let mut print_plan = false;
     let mut dry_run = false;
+    let mut guest_cwd: Option<String> = None;
     while let Some(a) = args.first().cloned() {
         match a.as_str() {
             "--trace-file" => {
@@ -137,6 +138,15 @@ fn main() {
                 }
                 gpu_scope = Some(args.remove(0));
                 gpu_flag = true;
+            }
+            "--guest-cwd" => {
+                // Set by a translated parent's exec (spawn.rs); taken after the sysroot is.
+                // The guest path of the parent's working directory; the child keeps its prefix.
+                args.remove(0);
+                if args.is_empty() {
+                    usage();
+                }
+                guest_cwd = Some(args.remove(0));
             }
             "--interp" => {
                 jit::JIT_ENABLED.store(false, Ordering::Relaxed);
@@ -215,6 +225,12 @@ fn main() {
     }
     if std::env::var_os("MACLATOR_TRACE").is_some() {
         syscalls::TRACE.store(true, Ordering::Relaxed);
+    }
+    if let Some(c) = guest_cwd {
+        let taken = syscalls::cwd_adopt(&c);
+        if syscalls::TRACE.load(Ordering::Relaxed) {
+            eprintln!("[path] --guest-cwd {c}: {}", if taken { "taken" } else { "refused" });
+        }
     }
     let target = match resolve_target(&args[0]) {
         Ok(target) => target,

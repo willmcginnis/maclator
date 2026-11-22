@@ -29,7 +29,37 @@ const CACHE_PREFIXES: &[&str] = &[
 ];
 
 pub fn set_cache_dir(d: &str) {
-    *CACHE_DIR.lock().unwrap() = Some(canonical_dir(d));
+    let c = canonical_dir(d);
+    note_cache_dir_id(&c);
+    *CACHE_DIR.lock().unwrap() = Some(c);
+}
+
+/// The sysroot's (device, inode), taken when the sysroot is set,
+/// at startup, while its path can still be searched. A working directory inside the sysroot is held by the host
+/// whatever happens to the sysroot's ancestors later (a chmod 0 of one makes stat of the sysroot's path fail while
+/// relative names from the held directory still walk), so the escape check compares against this, not against a
+/// stat of the path at the time of the call. Atomics, not a lock: no fork-safety registration needed.
+static CACHE_DEV: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CACHE_INO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CACHE_ID_SET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn note_cache_dir_id(c: &str) {
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::atomic::Ordering::SeqCst;
+    match std::fs::metadata(c) {
+        Ok(m) if m.is_dir() => {
+            CACHE_DEV.store(m.dev(), SeqCst);
+            CACHE_INO.store(m.ino(), SeqCst);
+            CACHE_ID_SET.store(true, SeqCst);
+        }
+        _ => CACHE_ID_SET.store(false, SeqCst),
+    }
+}
+
+/// The sysroot's (device, inode) as taken when it was set; None when it could not be read then.
+pub fn cache_dir_id() -> Option<(u64, u64)> {
+    use std::sync::atomic::Ordering::SeqCst;
+    CACHE_ID_SET.load(SeqCst).then(|| (CACHE_DEV.load(SeqCst), CACHE_INO.load(SeqCst)))
 }
 
 /// Directory `d` (--sysroot, or one discover_sysroot found) by its canonical path,
@@ -113,6 +143,16 @@ pub fn redirect(path: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// The cache prefix guest path `g` is under, as the physical spelling XNU keeps a working directory
+/// by: the one spelled through the /System/Cryptexes/OS link (to ../../System/Volumes/Preboot/Cryptexes/OS, measured
+/// on macOS 27.0.1, arm64: /bin/pwd -P there prints the Preboot path) is the Preboot one it names. /System/Library/dyld keeps
+/// its own spelling: natively it is another directory, which the redirect merges with the cryptex one. None when `g`
+/// is under no cache prefix.
+pub fn physical_prefix(g: &str) -> Option<&'static str> {
+    let p = CACHE_PREFIXES.iter().find(|p| g.strip_prefix(**p).is_some_and(|r| r.is_empty() || r.starts_with('/')))?;
+    Some(if *p == CACHE_PREFIXES[1] { CACHE_PREFIXES[0] } else { p })
 }
 
 pub fn cache_dir() -> Option<String> {

@@ -257,6 +257,621 @@ fn descriptor_record(guest: &str, in_sysroot: bool, host: impl FnOnce() -> Optio
     }
 }
 
+/// A working directory the guest reached through a cache prefix. The
+/// host stands in the sysroot's own directory (chdir and __pthread_chdir are redirected like open), so every
+/// relative name that stays inside the sysroot is walked by the host kernel from the right directory, with XNU's
+/// own credential, length and permission checks, whether Maclator rewrites that call or not. What the host
+/// cannot know is the guest's parent of the sysroot's root: that is the prefix's own parent, not the sysroot's
+/// host parent. So a record keeps the prefix (its physical spelling, paths::physical_prefix) and the directory's
+/// physical path below the sysroot, and is used only where a `..` climbs out of the sysroot (escape_at) or a
+/// child is re-launched (cwd_forward). `key` is the directory's (device, inode) when recorded.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CwdRec {
+    key: (u64, u64),
+    prefix: &'static str,
+    rel: String,
+}
+
+impl CwdRec {
+    /// The guest path of the directory.
+    fn guest(&self) -> String {
+        format!("{}{}", self.prefix, self.rel)
+    }
+}
+
+/// The process working directory's record (None: the host's own path is the guest's). H v8.1 kept up
+/// to 16 records keyed by directory, shared by every thread; the oldest was pushed out by sixteen other
+/// directories and a record for one spelling answered for a thread standing there under another.
+/// XNU keeps one process working directory and one per thread, so this does too.
+pub(crate) static CWD_VPATHS: crate::forksync::FMutex<Option<CwdRec>> = crate::forksync::FMutex::new(None);
+
+thread_local! {
+    /// This thread's own working directory (__pthread_chdir, __pthread_fchdir): None when it has none
+    /// and uses the process one; Some(None) when it has one the redirect did not take. Guest threads are host
+    /// threads (threads::bsdthread_create), so this lives exactly as long as the host's per-thread directory.
+    static THREAD_CWD: std::cell::RefCell<Option<Option<CwdRec>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Whether this thread has its own working directory.
+fn thread_has_cwd() -> bool {
+    THREAD_CWD.with(|t| t.borrow().is_some())
+}
+
+/// The record lookups from this thread use: its own, else the process one.
+fn cwd_slot() -> Option<CwdRec> {
+    THREAD_CWD.with(|t| t.borrow().clone()).unwrap_or_else(|| CWD_VPATHS.lock().unwrap().clone())
+}
+
+/// Record `r` for the process working directory, or for this thread's own (`per_thread`).
+fn cwd_set(per_thread: bool, r: Option<CwdRec>) {
+    if per_thread {
+        THREAD_CWD.with(|t| *t.borrow_mut() = Some(r));
+    } else {
+        *CWD_VPATHS.lock().unwrap() = r;
+    }
+}
+
+/// In a forked child. XNU gives the child, as its process working directory, the forking thread's own
+/// one if it has one (measured on macOS 27.0.1, arm64: fork, posix_spawn and execve from a thread after __pthread_chdir
+/// all start in that directory), and the child's one thread has none of its own.
+pub(crate) fn cwd_after_fork_child() {
+    let r = cwd_slot();
+    THREAD_CWD.with(|t| *t.borrow_mut() = None);
+    *CWD_VPATHS.lock().unwrap() = r;
+}
+
+/// The sysroot's path as getattrlist FULLPATH and F_GETPATH spell it, which is
+/// what rec_at strips: realpath (paths::set_cache_dir) can keep another spelling of the same directory (measured by
+/// /System/Volumes/Data/private/var against /private/var). The cache dir itself if that cannot be read.
+fn sysroot_spelling() -> Option<String> {
+    let d = crate::paths::cache_dir()?;
+    std::ffi::CString::new(d.as_str()).ok().and_then(|c| full_path_of(&c)).or(Some(d))
+}
+
+/// The record for the directory at `key` whose host path, read now, is `host`: its path below the sysroot
+/// with the prefix `prefix`. None when the directory is not inside the sysroot (then the host's path is the
+/// guest's: a directory reached through a link out of the sysroot) or its path cannot be read.
+fn rec_at(key: (u64, u64), prefix: &'static str, host: Option<String>, sysroot: Option<&str>) -> Option<CwdRec> {
+    let h = host?;
+    let rel = h.strip_prefix(sysroot?)?;
+    (rel.is_empty() || rel.starts_with('/')).then(|| CwdRec { key, prefix, rel: rel.to_string() })
+}
+
+/// What a record `r` for this thread's working directory is now, "." being at `here`. A record for
+/// another directory is no record (something Maclator did not see moved the working directory; the host's own
+/// path answers, as before H v8). A record whose guest path no longer leads here (the directory or one above it
+/// was renamed) is recomputed from where the host's working directory is now (`host`): its prefix
+/// stays, its path below the sysroot is read again; if it is no longer inside the sysroot there is no record.
+/// Never a guess at the parent: the prefix is the one the guest came in by, and the rest is the kernel's.
+/// The physical path, read now, always decides the place below the
+/// sysroot when it can be read: a link left where the directory used to be (S/a renamed to S/x/y, then S/a -> x/y)
+/// still leads the old spelling to the same inode, which kept H v9's stale `rel`. Only when "." cannot be read
+/// (deeper than MAXPATHLEN) does the record stand on its guest path still leading here; nothing depends on its
+/// `rel` for a climb any more (cwd_depth counts the `..` physically).
+/// A place the spelling test cannot put inside the sysroot (the sysroot's FULLPATH
+/// spelling unreadable while an ancestor is unsearchable, so `sysroot` is the realpath spelling, which can differ) keeps
+/// the record when "." is inside the sysroot by identity (`inside_id`: cwd_depth reaches the root).
+fn cwd_check(r: CwdRec, here: (u64, u64), at: impl FnOnce(&str) -> Option<(u64, u64)>, host: impl FnOnce() -> Option<String>,
+             sysroot: Option<&str>, inside_id: impl FnOnce() -> bool) -> Option<CwdRec> {
+    if r.key != here {
+        return None;
+    }
+    match host() {
+        Some(h) => rec_at(here, r.prefix, Some(h), sysroot).or_else(|| inside_id().then_some(r)),
+        None => (at(&r.guest()) == Some(here) || inside_id()).then_some(r),
+    }
+}
+
+/// The sysroot's root (device, inode): the one taken when the sysroot
+/// was set (paths::cache_dir_id), else a stat of its path now. H v9 only stat'ed the path, and a failed stat (an
+/// ancestor made unsearchable after the guest chdir'd in, while relative names from the held directory still walk)
+/// was read as "no `..` climbs out". None now means unknown, and the callers refuse (escape_closed).
+/// When both are known they must agree. A sysroot replaced since startup (a new
+/// directory renamed over the old path) has a new identity at its path; the guest's chdir by that path lands in it,
+/// and a check against the startup identity alone would miss its root. Disagreeing is unknown (refused).
+fn sysroot_root() -> Option<(u64, u64)> {
+    root_decision(crate::paths::cache_dir_id(), crate::paths::cache_dir().and_then(|s| path_dev_ino(&s)))
+}
+
+/// The sysroot's root from the identity taken at startup and a stat of its path now: either when only one
+/// is known, the one when both agree, None (unknown) when they disagree or neither is known.
+fn root_decision(startup: Option<(u64, u64)>, now: Option<(u64, u64)>) -> Option<(u64, u64)> {
+    match (startup, now) {
+        (Some(a), Some(b)) => (a == b).then_some(a),
+        (a, b) => a.or(b),
+    }
+}
+
+/// Whether relative name `name` has a `..` component (one that could climb out).
+fn has_dotdot(name: &str) -> bool {
+    !name.starts_with('/') && name.split('/').any(|c| c == "..")
+}
+
+/// escape_at against the sysroot's root `root`, closed when that is unknown: Err(()) for a name
+/// with a `..` then (the callers refuse it with a warning), never "nothing climbs out".
+fn escape_closed(name: &str, root: Option<(u64, u64)>, at: impl Fn(&str) -> Option<(u64, u64)>) -> Result<Option<usize>, ()> {
+    if !has_dotdot(name) {
+        return Ok(None);
+    }
+    root.map(|k| escape_at(name, k, at)).ok_or(())
+}
+
+/// How many `..` from the working directory reach the sysroot's root (`root`), by (device,
+/// inode): the depth the host really stands at, whatever spelling a record keeps. `at` stats a relative name. None when
+/// a stat fails or the root is not reached within MAXPATHLEN / 3 levels.
+fn cwd_depth(root: (u64, u64), at: impl Fn(&str) -> Option<(u64, u64)>) -> Option<usize> {
+    let mut p = String::from(".");
+    for k in 0..=MAXPATHLEN / 3 {
+        if at(&p)? == root {
+            return Some(k);
+        }
+        p = if k == 0 { "..".to_string() } else { format!("{p}/..") };
+    }
+    None
+}
+
+/// The name the host walks to check the leading part `name[..off]` that an escaped name drops:
+/// that part, then "./" padding of the same length as what follows it, so a symlink in it is expanded against the
+/// same remaining length XNU's lookup sees (its ENAMETOOLONG test is the link's length plus the rest of the name).
+fn lead_probe(name: &str, off: usize) -> String {
+    let l = name.len() - off;
+    let mut s = name[..off].to_string();
+    s.push_str(&"./".repeat(l / 2));
+    if l % 2 == 1 {
+        s.push('.');
+    }
+    s
+}
+
+/// The host's walk of the dropped leading part (lead_probe), with the call's credentials
+/// (`ids`): faccessat(F_OK) from the working directory, so a directory in it the call may not search (EACCES with
+/// the real ids for access), a link too long for the rest of the name (ENAMETOOLONG) or a loop (ELOOP) fails as
+/// XNU's walk of the whole name does. Ok when there is no leading part. Not carried: the symlink count, which
+/// starts again for the escaped form.
+fn lead_walk(name: &str, off: usize, ids: Ids) -> Result<(), u64> {
+    if off == 0 {
+        return Ok(());
+    }
+    let Ok(c) = std::ffi::CString::new(lead_probe(name, off)) else { return Err(libc::EINVAL as u64) };
+    let flag = if ids == Ids::Real { 0 } else { libc::AT_EACCESS };
+    if unsafe { libc::faccessat(libc::AT_FDCWD, c.as_ptr(), libc::F_OK, flag) } == 0 {
+        return Ok(());
+    }
+    Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EACCES) as u64)
+}
+
+/// This thread's working-directory record, checked (cwd_check) and, if recomputed, stored back where it
+/// came from (unless that slot changed meanwhile). One stat of ".", one of the record's redirect.
+fn cwd_now() -> Option<CwdRec> {
+    let r = cwd_slot()?;
+    let here = path_dev_ino(".")?;
+    let checked = cwd_check(r.clone(), here, redirected_dev_ino, || full_path_of(c"."), sysroot_spelling().as_deref(), || here_depth().is_some());
+    if checked.as_ref() != Some(&r) {
+        let own = thread_has_cwd();
+        if own {
+            THREAD_CWD.with(|t| {
+                let mut t = t.borrow_mut();
+                if t.as_ref() == Some(&Some(r.clone())) {
+                    *t = Some(checked.clone());
+                }
+            });
+        } else {
+            let mut p = CWD_VPATHS.lock().unwrap();
+            if p.as_ref() == Some(&r) {
+                *p = checked.clone();
+            }
+        }
+    }
+    checked
+}
+
+/// The (device, inode) guest path `g` names through the redirect; None when the redirect does
+/// not take it or the stat fails.
+fn redirected_dev_ino(g: &str) -> Option<(u64, u64)> {
+    crate::paths::redirect(g).and_then(|h| path_dev_ino(&h))
+}
+
+/// The byte offset in relative name `name` of the first `..` the host
+/// would take AT the sysroot's root (`root`, its device and inode), where it climbs to the sysroot's host parent
+/// while the guest climbs to the cache prefix's own parent. `at(lead)` is where the name's leading part `lead` lands
+/// from the working directory, links followed ("." for none). Every `..` before that one is taken inside the
+/// sysroot and is the host's to walk. None when no `..` climbs out, or when a leading part does not land (the
+/// host's walk stops there too, for the reason it gives). One stat per `..`.
+fn escape_at(name: &str, root: (u64, u64), at: impl Fn(&str) -> Option<(u64, u64)>) -> Option<usize> {
+    let mut off = 0;
+    for c in name.split('/') {
+        if c == ".." {
+            let lead = &name[..off];
+            match at(if lead.is_empty() { "." } else { lead }) {
+                Some(k) if k == root => return Some(off),
+                Some(_) => {}
+                None => return None,
+            }
+        }
+        off += c.len() + 1;
+    }
+    None
+}
+
+/// Whether relative leading part `lead` (what escaped_path drops) crosses a symlink,
+/// which a NOFOLLOW_ANY call refuses with ELOOP natively: an lstat of each of its components from the working directory
+/// (every one is walked, since a `..` follows). A first try asked faccessat(AT_SYMLINK_NOFOLLOW_ANY) about `lead`
+/// itself, which does not refuse a link that is the last component (row N2 still opened, measured on macOS 27.0.1, arm64).
+fn lead_has_link(lead: &str) -> bool {
+    let mut p = String::new();
+    for c in lead.split('/').filter(|c| !c.is_empty()) {
+        if !p.is_empty() {
+            p.push('/');
+        }
+        p.push_str(c);
+        if c != "." && c != ".." && std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_symlink()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// A name that climbed out of the sysroot at `off` (escape_at), as the guest path it names: the prefix the
+/// working directory was reached by, then the name from that `..` on. What comes before it is inside the sysroot
+/// and ends at its root, which is the prefix.
+fn escaped_path(r: &CwdRec, name: &str, off: usize) -> String {
+    format!("{}/{}", r.prefix, &name[off..])
+}
+
+/// For host path `h` inside the sysroot, the same place as a name relative to a working directory `depth`
+/// levels below the sysroot's root ("../" `depth` times, then `h`'s path below the sysroot); None when `h` is not inside
+/// the sysroot. `depth` is counted physically (cwd_depth), not from a record's spelling.
+fn reentry_relative(h: &str, depth: usize, sysroot: &str) -> Option<String> {
+    let below = h.strip_prefix(sysroot)?;
+    if !(below.is_empty() || below.starts_with('/')) {
+        return None;
+    }
+    // The sysroot's root itself would become "." or "..", which rmdir and rename
+    // refuse with EINVAL where the guest's name does not: it keeps its absolute form.
+    if below.trim_matches('/').is_empty() {
+        return None;
+    }
+    // Measured on macOS 27.0.1, arm64: a target still holding `.` or `..` (an unresolved walk) is not a place
+    // below the sysroot; made relative, its `..` climbed out again from the working directory.
+    if below.split('/').any(|c| c == "." || c == "..") {
+        return None;
+    }
+    let mut parts: Vec<&str> = vec![".."; depth];
+    parts.extend(below.split('/').filter(|c| !c.is_empty()));
+    let mut s = parts.join("/");
+    if s.is_empty() {
+        s.push('.');
+    } else if below.ends_with('/') {
+        s.push('/');
+    }
+    Some(s)
+}
+
+/// Where a relative name through descriptor `fd` starts when the descriptor
+/// has no guest path (fd_guest_path: opened outside /System, or inherited, with no overlay): the host's own
+/// path for it, read now (F_GETPATH), unless that is inside the sysroot, whose host path is not the guest's.
+/// None leaves the name unrewritten, as before H v8. One fcntl per such relative name.
+fn unrecorded_fd_base(fd: i32, getpath: impl FnOnce(i32) -> Option<String>, sysroot: Option<&str>) -> Option<String> {
+    let h = getpath(fd)?;
+    (!inside_sysroot(&h, sysroot)).then_some(h)
+}
+
+/// Where a relative name in a plain call or through AT_FDCWD starts when the working directory has no
+/// record: the host's own working directory (getattrlist FULLPATH of ".", no descriptor), mapped back through the
+/// overlay; None when no sysroot or overlay is set (nothing could be redirected) or it is inside the sysroot
+/// (reached by its host path: the host's walk is the guest's).
+fn cwd_host_base(host: impl FnOnce() -> Option<String>, sysroot: Option<&str>, overlay: bool) -> Option<String> {
+    if sysroot.is_none() && !overlay {
+        return None;
+    }
+    let h = host()?;
+    if inside_sysroot(&h, sysroot) {
+        return None;
+    }
+    Some(crate::paths::guest_path(&h).unwrap_or(h))
+}
+
+/// A kernel probe name for a name joined to the working directory's host path `base`, made
+/// relative again, so the host looks it up from the working directory it holds, with the call's credentials, as
+/// XNU does, not from / through ancestors those credentials may not search. `p` itself when it is not below `base`.
+fn probe_from_cwd<'a>(p: &'a str, base: Option<&str>) -> &'a str {
+    base.and_then(|b| p.strip_prefix(b)).and_then(|r| r.strip_prefix('/')).filter(|r| !r.is_empty()).unwrap_or(p)
+}
+
+/// Whether a relative name joined to its base may be rewritten. A descriptor's recorded guest path
+/// keeps H v7's rule (always); a new base (the working directory, an unrecorded descriptor) only below MAXPATHLEN,
+/// so the host otherwise answers for the relative name as before H v8.
+fn joined_rewritable(recorded: bool, orig: &str, full: &str) -> bool {
+    recorded || orig.starts_with('/') || full.len() < MAXPATHLEN
+}
+
+/// Which base a relative name starts from: the working directory for a plain call or AT_FDCWD.
+fn cwd_is_base(at: bool, fd: i32) -> bool {
+    !at || fd == libc::AT_FDCWD
+}
+
+/// The prefix a chdir-like call's new working directory was reached by, if any: the guest path H computed
+/// for it when that is under a cache prefix (an absolute name, or one that climbed out of the sysroot), else the
+/// current record's when the name was left to the host from inside the sysroot. None: the host's path is the guest's.
+fn chdir_prefix(guest: Option<&str>, left_from: Option<&CwdRec>) -> Option<&'static str> {
+    guest.and_then(crate::paths::physical_prefix).or_else(|| left_from.map(|r| r.prefix))
+}
+
+/// What an arm64 child re-launched through Maclator is told about its working directory: the guest path
+/// of this thread's record, if it has a live one. The child keeps only its prefix (cwd_adopt).
+pub(crate) fn cwd_forward() -> Option<String> {
+    cwd_now().map(|r| r.guest())
+}
+
+/// The record --guest-cwd `arg` gives a child standing at `here` whose host path is `host`: the prefix
+/// `arg` names, if any, with the child's own path below the sysroot. A posix_spawn chdir file action relative to a
+/// working directory inside the sysroot keeps the child under the same prefix (row J5); one that left the sysroot
+/// gives no record (`host` outside it).
+fn adopt_arg(arg: &str, here: Option<(u64, u64)>, host: impl FnOnce() -> Option<String>, sysroot: Option<&str>) -> Option<CwdRec> {
+    let prefix = crate::paths::physical_prefix(arg)?;
+    rec_at(here?, prefix, host(), sysroot)
+}
+
+/// Take the prefix a parent forwarded (main.rs, --guest-cwd). Returns whether a record was taken.
+pub(crate) fn cwd_adopt(arg: &str) -> bool {
+    let r = adopt_arg(arg, path_dev_ino("."), || full_path_of(c"."), sysroot_spelling().as_deref());
+    let taken = r.is_some();
+    if taken {
+        cwd_set(false, r);
+    }
+    taken
+}
+
+/// The name arguments of the path-taking calls bsd_read does not otherwise rewrite, as (name
+/// index, descriptor index for an *at call): every call in the 27.0.1 SDK's syscall.h that takes a path XNU looks up
+/// (bsd/kern/syscalls.master), less those path_arg lists. symlink's and symlinkat's first argument is the link's
+/// text, not a lookup. access_extended (284) takes an array of names: escape_accessx. posix_spawn (244) is not here:
+/// XNU looks its program up after the file actions run. Not covered: AF_UNIX socket paths
+/// (bind, connect, connectx: a sockaddr, not a name), graftdmg and ungraftdmg (549, 555), fs_snapshot's names (518).
+fn escape_slots(n: u64) -> &'static [(usize, Option<usize>)] {
+    match n {
+        10 | 14 | 15 | 16 | 34 | 51 | 56 | 59 | 61 | 132 | 136 | 137 | 138 | 157 | 159 | 161 | 165 | 191 | 200 | 205 | 216
+        | 221 | 225 | 226 | 234 | 236 | 238 | 240 | 242 | 277 | 279 | 280 | 282 | 291 | 292 | 341 | 342 | 345 | 364 | 380
+        | 382 | 383 | 384 | 385 | 441 | 484 => &[(0, None)],
+        9 | 128 | 223 | 227 | 537 => &[(0, None), (1, None)],
+        57 | 167 | 424 => &[(1, None)],
+        214 | 218 | 249 | 467 | 468 | 472 | 475 | 524 | 553 | 554 => &[(1, Some(0))],
+        462 | 465 | 471 | 488 => &[(1, Some(0)), (3, Some(2))],
+        474 | 517 => &[(2, Some(1))],
+        _ => &[],
+    }
+}
+
+/// A relative name from a working directory with NO record that climbs out of the
+/// sysroot (escape_at, by device and inode, so whatever the spelling): the guest's parent there is unknown (it came in
+/// through something Maclator did not see: an inherited descriptor, a path too deep to read), and the host's is the
+/// sysroot's host parent, which is never the guest's. Refused, with a warning, rather than sent there. A guest that
+/// entered the sysroot by its own host path is refused too.
+/// With the sysroot's root unknown, any `..` from inside it is refused (closed, not open).
+fn unrecorded_climb(name: &str) -> bool {
+    if !has_dotdot(name) {
+        return false;
+    }
+    // only from inside the sysroot: "." below it, or "." whose path cannot be read (deeper than MAXPATHLEN)
+    // (or by identity, when the spellings differ)
+    let inside = match full_path_of(c".") {
+        Some(h) => sysroot_spelling().is_some_and(|s| inside_sysroot(&h, Some(&s))) || here_depth().is_some(),
+        None => true,
+    };
+    inside && escape_closed(name, sysroot_root(), path_dev_ino).map_or(true, |o| o.is_some())
+}
+
+/// Where a name that climbed out of the sysroot goes, for a call bsd_read does not otherwise rewrite:
+/// its guest path (escaped_path) with the `..` taken in the guest's view as for any absolute name (resolve_dotdot,
+/// the call's effective ids), through the redirect when it lands under a prefix again, as the host path itself when
+/// it does not. When it lands inside the sysroot, the same place relative to the working directory
+/// (fit_target). Err(ENAMETOOLONG) when nothing fits: refused, with a warning, never sent on to walk from the
+/// sysroot's host parent.
+/// With the call's credentials `ids`.
+fn escape_target(full: &str, ids: Ids) -> Result<String, u64> {
+    let dotdot = resolve_dotdot(full, true, ids, |p| guest_node_as(p, ids), kernel_lookup, |m| crate::paths::redirect(m).is_some());
+    let target = match dotdot {
+        Dotdot::Keep => crate::paths::redirect(full).unwrap_or_else(|| full.to_string()),
+        Dotdot::Path(p) => crate::paths::redirect(&p).unwrap_or(p),
+        Dotdot::Host(k) => k,
+    };
+    fit_target(target, crate::paths::cache_dir().as_deref(), here_depth)
+}
+
+/// This thread's working directory's depth below the sysroot's root (cwd_depth), if known.
+fn here_depth() -> Option<usize> {
+    sysroot_root().and_then(|k| cwd_depth(k, path_dev_ino))
+}
+
+/// What an escaped name is sent as. A `target` inside the
+/// sysroot `sysroot` goes relative to the working directory (reentry_relative, `depth` levels down, counted
+/// physically) whenever that fits: the host then walks only the sysroot's own directories from the one it holds, as
+/// XNU walks the guest's name from the guest's, never the sysroot's ancestors (which the guest's walk never searches,
+/// and which may have been made unsearchable since). Else `target` as it is, below MAXPATHLEN; else ENAMETOOLONG.
+fn fit_target(target: String, sysroot: Option<&str>, depth: impl FnOnce() -> Option<usize>) -> Result<String, u64> {
+    if inside_sysroot(&target, sysroot) {
+        if let Some(rel) = depth().and_then(|d| reentry_relative(&target, d, sysroot?)).filter(|r| r.len() < MAXPATHLEN) {
+            return Ok(rel);
+        }
+    }
+    if target.len() < MAXPATHLEN {
+        return Ok(target);
+    }
+    Err(libc::ENAMETOOLONG as u64)
+}
+
+/// Rewrite each relative name of call `n` (escape_slots) that climbs out of the sysroot from
+/// a working directory reached through a prefix. Names that stay inside, absolute names and names through a real
+/// descriptor are left as they came. The new names are pushed onto `keep`, which must outlive the call. Err: refuse
+/// the call with that errno (escape_target).
+fn escape_unhandled(n: u64, args: &mut [u64; 8], keep: &mut Vec<std::ffi::CString>) -> Result<(), u64> {
+    let slots = escape_slots(n);
+    if slots.is_empty() || crate::paths::cache_dir().is_none() {
+        return Ok(());
+    }
+    let mut rec: Option<Option<CwdRec>> = None;
+    for &(i, fdi) in slots {
+        if fdi.is_some_and(|f| args[f] as i32 != libc::AT_FDCWD) || args[i] == 0 {
+            continue;
+        }
+        let Some(name) = guest_name(args[i]).filter(|o| rewritable(o)) else { continue };
+        if let Some(t) = escape_name(n, &name, &mut rec, Ids::Effective, beneath(n, args))? {
+            let Ok(c) = std::ffi::CString::new(t) else { continue };
+            args[i] = c.as_ptr() as u64;
+            keep.push(c);
+        }
+    }
+    Ok(())
+}
+
+/// What relative name `name` of call `n` (one bsd_read does not otherwise rewrite) is sent as: None to
+/// leave it as it came (absolute, no `..`, no record and no climb, or a `..` that stays inside the sysroot); Some(the
+/// escaped target) when a `..` climbs out of the sysroot from a recorded working directory. Err refuses the call,
+/// with a warning: a climb from a directory with no record (ENOENT), the sysroot's root unknown (ENOENT),
+/// the dropped leading part failing the host's walk with the call's credentials `ids` (its errno),
+/// or a target too long (ENAMETOOLONG). `rec` caches this call's record.
+/// `bound`, the call's RESOLVE_BENEATH flag (beneath): a climb out is refused
+/// ENOTCAPABLE, never rewritten into a name that stays beneath.
+fn escape_name(n: u64, name: &str, rec: &mut Option<Option<CwdRec>>, ids: Ids, bound: bool) -> Result<Option<String>, u64> {
+    if !has_dotdot(name) {
+        return Ok(None);
+    }
+    let Some(r) = rec.get_or_insert_with(cwd_now).clone() else {
+        if unrecorded_climb(name) {
+            eprintln!("[maclator] warning: #{n} {name} climbs out of the sysroot from a working directory with no record: refused (ENOENT)");
+            return Err(libc::ENOENT as u64);
+        }
+        return Ok(None);
+    };
+    let Ok(esc) = escape_closed(name, sysroot_root(), path_dev_ino) else {
+        eprintln!("[maclator] warning: #{n} {name}: the sysroot's root cannot be identified, so a climb out of it cannot be ruled out: refused (ENOENT)");
+        return Err(libc::ENOENT as u64);
+    };
+    let Some(off) = esc else { return Ok(None) };
+    lead_walk(name, off, ids)?;
+    if bound {
+        return Err(libc::ENOTCAPABLE as u64);
+    }
+    let full = escaped_path(&r, name, off);
+    let target = match escape_target(&full, ids) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[maclator] warning: #{n} {name} climbs out of the sysroot to {full}, too long to send: refused (ENAMETOOLONG)");
+            return Err(e);
+        }
+    };
+    if still_climbs(&target) {
+        eprintln!("[maclator] warning: #{n} {name} climbs out of the sysroot to {full}, which could not be resolved: refused (ENOENT)");
+        return Err(libc::ENOENT as u64);
+    }
+    if TRACE.load(Ordering::Relaxed) {
+        eprintln!("[path] #{n} {name}: climbs out of the sysroot at byte {off} -> {full} -> {target}");
+    }
+    Ok(Some(target))
+}
+
+/// Whether a name an escaped one was rewritten to is relative and would itself still take a `..` at the
+/// sysroot's root (or the root is unknown): it must never be sent, since the host would climb to the sysroot's host
+/// parent; nor an absolute one inside the sysroot with a `..` below it (the same climb, spelled from /). A last guard
+/// after the rewrite.
+fn still_climbs(target: &str) -> bool {
+    let sys = crate::paths::cache_dir();
+    if inside_sysroot(target, sys.as_deref()) && sys.as_deref().and_then(|d| target.strip_prefix(d)).is_some_and(|b| b.split('/').any(|c| c == "..")) {
+        return true;
+    }
+    has_dotdot(target) && escape_closed(target, sysroot_root(), path_dev_ino).map_or(true, |o| o.is_some())
+}
+
+/// accessx_descriptor's size (sys/unistd.h) and the most XNU takes (ACCESSX_MAX_TABLESIZE).
+const ACCESSX_DESC: usize = 16;
+const ACCESSX_MAX_TABLESIZE: usize = 16 * 1024;
+
+/// access_extended (284)'s table `tbl` with each name `f` maps to Some
+/// replaced. The table is read as XNU's access_extended reads it: descriptors of
+/// 16 bytes, a u32 name offset first; the descriptors end at the lowest name offset (rounded down to a descriptor), so
+/// the names may be in any order; an offset of 0 repeats the previous name (not for the first); an offset must be past
+/// its own descriptor and below the table's size; the table's last byte must be NUL. Anything else XNU refuses
+/// (EINVAL), so the table is left as it came (Ok(None)) for the host to refuse. A changed table is laid out again: the
+/// descriptors, then each named descriptor's name (replaced or as it came), NUL-terminated, in order, the offsets
+/// moved to match, which keeps every rule above. (A first draft appended the new name and pointed the first descriptor
+/// at it, which moved the table's end: EINVAL on macOS 27.0.1, arm64, row AX1.) Err from `f`, or E2BIG past 16 KiB.
+fn accessx_rewrite(tbl: &[u8], mut f: impl FnMut(&str) -> Result<Option<String>, u64>) -> Result<Option<Vec<u8>>, u64> {
+    let size = tbl.len();
+    if size < ACCESSX_DESC + 2 || tbl[size - 1] != 0 {
+        return Ok(None);
+    }
+    let off_at = |i: usize| u32::from_ne_bytes([tbl[i * ACCESSX_DESC], tbl[i * ACCESSX_DESC + 1], tbl[i * ACCESSX_DESC + 2], tbl[i * ACCESSX_DESC + 3]]) as usize;
+    let desc_max = (size - 2) / ACCESSX_DESC;
+    let mut count = desc_max;
+    let mut i = 0;
+    while i < count {
+        let o = off_at(i);
+        let j = o / ACCESSX_DESC;
+        if j > desc_max || (j != 0 && j <= i) || o >= size || (j == 0 && i == 0) {
+            return Ok(None);
+        }
+        if j != 0 && j < count {
+            count = j;
+        }
+        i += 1;
+    }
+    let mut names: Vec<(usize, Vec<u8>)> = Vec::new();
+    let mut changed = false;
+    for i in 0..count {
+        let o = off_at(i);
+        if o / ACCESSX_DESC == 0 {
+            continue;
+        }
+        let rest = &tbl[o..];
+        let raw = &rest[..rest.iter().position(|&b| b == 0).unwrap_or(rest.len())];
+        let new = match std::str::from_utf8(raw) {
+            Ok(name) => f(name)?,
+            Err(_) => None,
+        };
+        changed |= new.is_some();
+        names.push((i, new.map_or_else(|| raw.to_vec(), String::into_bytes)));
+    }
+    if !changed {
+        return Ok(None);
+    }
+    let mut v = tbl[..count * ACCESSX_DESC].to_vec();
+    for (i, name) in names {
+        let at = v.len();
+        v.extend_from_slice(&name);
+        v.push(0);
+        v[i * ACCESSX_DESC..i * ACCESSX_DESC + 4].copy_from_slice(&(at as u32).to_ne_bytes());
+    }
+    if v.len() > ACCESSX_MAX_TABLESIZE {
+        return Err(libc::E2BIG as u64);
+    }
+    Ok(Some(v))
+}
+
+/// access_extended's names, each handled as escape_name handles a relative name (H v9 read
+/// none of them), with the real ids, as lookup_ids says the call uses. The table is read from guest memory (args[0],
+/// args[1] bytes, at most 16 KiB); a rewritten copy goes in `keep`, which must outlive the call, and args point at it.
+fn escape_accessx(args: &mut [u64; 8], keep: &mut Vec<u8>) -> Result<(), u64> {
+    let len = args[1] as usize;
+    if crate::paths::cache_dir().is_none() || args[0] == 0 || len == 0 || len > ACCESSX_MAX_TABLESIZE {
+        return Ok(());
+    }
+    let mut tbl = vec![0u8; len];
+    if !crate::guestmem::read(args[0], &mut tbl) {
+        return Ok(());
+    }
+    let mut rec: Option<Option<CwdRec>> = None;
+    let r = accessx_rewrite(&tbl, |name| escape_name(284, name, &mut rec, Ids::Real, false));
+    if r == Err(libc::E2BIG as u64) {
+        eprintln!("[maclator] warning: #284: the rewritten access table would pass 16 KiB: refused (E2BIG)");
+    }
+    if let Some(v) = r? {
+        *keep = v;
+        args[0] = keep.as_ptr() as u64;
+        args[1] = keep.len() as u64;
+    }
+    Ok(())
+}
+
 fn rewrite_fd_path(cpu: &mut Cpu, args: &[u64; 8]) {
     let mut path = [0u8; 1024];
     if !crate::guestmem::read(args[2], &mut path) {
@@ -325,20 +940,23 @@ fn rewrite_fullpath_attribute(cpu: &mut Cpu, n: u64, args: &[u64; 8]) {
 fn path_arg(n: u64) -> (Option<usize>, bool) {
     match n {
         5 | 398 => (Some(0), false),
-        33 | 58 | 188 | 190 | 220 | 338 | 340 => (Some(0), false),
+        // chdir and __pthread_chdir too, so a working directory under a cache prefix is the
+        // sysroot's directory, as it is the guest's.
+        12 | 33 | 58 | 188 | 190 | 220 | 338 | 340 | 348 => (Some(0), false),
         463 | 464 | 466 | 469 | 470 | 473 | 476 => (Some(1), true),
         _ => (None, false),
     }
 }
 
-/// The guest path a syscall's name refers to: itself if absolute, else (in an *at call) the
-/// name joined to its descriptor's guest path. `dir` is asked only for a relative, non-empty name
-/// in an *at call. There is no virtual working directory: a relative name outside an *at call, or
-/// through a descriptor with no guest path (AT_FDCWD included), gives None and is not rewritten.
-fn guest_full_path(name: &str, at: bool, dir: impl FnOnce() -> Option<String>) -> Option<String> {
+/// The guest path a syscall's name refers to: itself if absolute, else the name joined to `dir`,
+/// the guest path it starts from: its descriptor's in an *at call, the working directory's
+/// (cwd_host_base, or a record's) in a plain call or through AT_FDCWD.
+/// `dir` is asked only for a relative, non-empty name; None from it leaves the name
+/// unrewritten, as before.
+fn guest_full_path(name: &str, _at: bool, dir: impl FnOnce() -> Option<String>) -> Option<String> {
     if name.starts_with('/') {
         Some(name.to_string())
-    } else if at && !name.is_empty() {
+    } else if !name.is_empty() {
         // An empty name is not the directory itself: XNU answers ENOENT for
         // openat(dirfd, "") and so does the host, so leave it unrewritten. macOS 27's
         // dyld relies on that: for each name in {arm64e_x1, arm64e} it skips building
@@ -616,7 +1234,14 @@ fn guest_node_as(p: &str, ids: Ids) -> Node {
     let host = crate::paths::redirect(p);
     if crate::paths::is_cache_root(p) {
         let followed = host.as_deref().and_then(|h| std::fs::metadata(h).ok());
-        return if followed.is_some_and(|m| m.is_dir()) { Node::Dir } else { Node::Other };
+        // Measured on macOS 27.0.1, arm64: a sysroot whose path cannot be searched now (an ancestor made
+        // mode 0 after the guest went in) is still the directory whose identity was taken at startup
+        // (paths::cache_dir_id); as Other, a `..` after the prefix stopped the walk and the name went out unresolved.
+        let dir = match followed {
+            Some(m) => m.is_dir(),
+            None => crate::paths::cache_dir_id().is_some(),
+        };
+        return if dir { Node::Dir } else { Node::Other };
     }
     host_node_as(&host.unwrap_or_else(|| p.to_string()), ids)
 }
@@ -1160,6 +1785,32 @@ fn descriptor_bound(n: u64, args: &[u64; 8]) -> bool {
     bits != 0
 }
 
+/// Whether call `n` carries
+/// a RESOLVE_BENEATH flag (its lookup may not climb above where it starts), for the calls H rewrites (open's and
+/// openat's O_RESOLVE_BENEATH, faccessat's, fstatat's and fstatat64's AT_RESOLVE_BENEATH, getattrlist's and
+/// getattrlistat's FSOPT_RESOLVE_BENEATH) and the ones escape_name rewrites (fchmodat, fchownat, linkat, unlinkat:
+/// AT_RESOLVE_BENEATH; renameatx_np: RENAME_RESOLVE_BENEATH; clonefileat: CLONE_RESOLVE_BENEATH; setattrlistat:
+/// FSOPT_RESOLVE_BENEATH; getxattr, setxattr, removexattr, listxattr: XATTR_RESOLVE_BENEATH; values from the 27.0 SDK).
+/// Not AT_FDONLY (descriptor_bound's other flag): such a name is never read (name_unread).
+fn beneath(n: u64, args: &[u64; 8]) -> bool {
+    let bits = match n {
+        5 | 398 => args[1] & O_RESOLVE_BENEATH,
+        463 | 464 => args[2] & O_RESOLVE_BENEATH,
+        466 | 469 | 470 | 467 => args[3] & AT_RESOLVE_BENEATH,
+        468 | 471 => args[4] & AT_RESOLVE_BENEATH,
+        472 => args[2] & AT_RESOLVE_BENEATH,
+        220 => args[4] & FSOPT_RESOLVE_BENEATH,
+        476 | 524 => args[5] & FSOPT_RESOLVE_BENEATH,
+        488 => args[4] & 0x20,
+        462 => args[4] & 0x10,
+        234 | 236 => args[5] & 0x80,
+        238 => args[2] & 0x80,
+        240 => args[3] & 0x80,
+        _ => 0,
+    };
+    bits != 0
+}
+
 // The NOFOLLOW_ANY flags (same source): no symlink may be crossed. XNU checks only the components
 // it actually traverses from its starting point, so through a descriptor they depend on it too.
 // AT_SYMLINK_NOFOLLOW_ANY and FSOPT_NOFOLLOW_ANY share 0x0800 (O_EXCL in openat's oflag).
@@ -1335,6 +1986,24 @@ fn bsd_read(cpu: &mut Cpu, n: u64, mut args: [u64; 8], read: impl FnOnce(u64) ->
     let mut in_sysroot = false;
     let mut unread: Option<u64> = None;
     let mut canon: Option<Kept> = None;
+    // The record of a working directory inside the sysroot that a relative name was left to the host
+    // from (the name stays inside), for what the call records afterwards; and the names escape_unhandled rewrote.
+    let mut left_from: Option<CwdRec> = None;
+    // The name the host was given, for a chdir's record (bsd_read's chdir branch).
+    let mut sent: Option<String> = None;
+    let mut esc_keep: Vec<std::ffi::CString> = Vec::new();
+    let mut ax_keep: Vec<u8> = Vec::new();
+    // The prefix of the record in force before a chdir-like call, kept for a new
+    // directory inside the sysroot that names none (getcwd answers the sysroot's host path, so a guest
+    // that saves and restores its working directory by path comes back by that path).
+    let prev_prefix = if matches!(n, 12 | 13 | 348 | 349) { cwd_slot().map(|r| r.prefix) } else { None };
+    if pidx.is_none() {
+        let r = if n == 284 { escape_accessx(&mut args, &mut ax_keep) } else { escape_unhandled(n, &mut args, &mut esc_keep) };
+        if let Err(e) = r {
+            set_err(cpu, e);
+            return None;
+        }
+    }
     if let Some(i) = pidx {
         let name = call_name(n, &args, i, |p| {
             let name = read(p);
@@ -1344,9 +2013,89 @@ fn bsd_read(cpu: &mut Cpu, n: u64, mut args: [u64; 8], read: impl FnOnce(u64) ->
             name
         });
         if let Some(orig) = name.filter(|o| rewritable(o)) {
-            let full = guest_full_path(&orig, at, || fd_guest_path(args[0] as i32));
+            // The base of a relative name. `recorded` says it is a descriptor's guest path
+            // (fd_guest_path), the only base before H v8; the new bases are the working directory's and an
+            // unrecorded descriptor's host path. A name joined to a new base that reaches MAXPATHLEN is not
+            // rewritten: the host answers for the relative name, as it did before H v8.
+            // From a working directory with a record (inside the sysroot,
+            // reached through a prefix) the name goes to the host as it came, which walks it from the right
+            // directory with XNU's own checks, unless a `..` in it climbs out of the sysroot (escape_at): then its
+            // guest path (escaped_path) goes through H as an absolute name would. With no record, a new base's
+            // result is used only when it lands under the redirect (`new_base`).
+            let mut recorded = false;
+            let mut new_base = false;
+            let mut escaped: Option<CwdRec> = None;
+            let mut probe_base: Option<String> = None;
+            let fd = args[0] as i32;
+            sent = Some(orig.clone());
+            let rec = if !orig.starts_with('/') && !orig.is_empty() && cwd_is_base(at, fd) { cwd_now() } else { None };
+            if rec.is_none() && cwd_is_base(at, fd) && !orig.starts_with('/') && crate::paths::cache_dir().is_some() && unrecorded_climb(&orig) {
+                eprintln!("[maclator] warning: #{n} {orig} climbs out of the sysroot from a working directory with no record: refused (ENOENT)");
+                set_err(cpu, libc::ENOENT as u64);
+                return None;
+            }
+            // Moved up from below, so an escaped name can be refused before it is rewritten.
+            let bound = beneath(n, &args);
+            let full = if let Some(r) = rec {
+                // The root taken at startup; unknown is refused, never "no climb".
+                let Ok(esc) = escape_closed(&orig, sysroot_root(), path_dev_ino) else {
+                    eprintln!("[maclator] warning: #{n} {orig}: the sysroot's root cannot be identified, so a climb out of it cannot be ruled out: refused (ENOENT)");
+                    set_err(cpu, libc::ENOENT as u64);
+                    return None;
+                };
+                match esc {
+                    Some(off) if !follows_symlinks(n, &args) && lead_has_link(&orig[..off]) => {
+                        // The leading part is dropped from the escaped name, and with it XNU's
+                        // NOFOLLOW_ANY refusal of a link on it.
+                        set_err(cpu, libc::ELOOP as u64);
+                        return None;
+                    }
+                    Some(off) => {
+                        // The dropped part, walked by the host with the call's credentials and
+                        // the name's remaining length.
+                        if let Err(e) = lead_walk(&orig, off, lookup_ids(n, &args)) {
+                            set_err(cpu, e);
+                            return None;
+                        }
+                        // A RESOLVE_BENEATH call whose name climbs out of the sysroot climbs above
+                        // its working directory, which XNU refuses: never rewritten into a name that stays beneath.
+                        if bound {
+                            set_err(cpu, libc::ENOTCAPABLE as u64);
+                            return None;
+                        }
+                        let f = escaped_path(&r, &orig, off);
+                        escaped = Some(r);
+                        Some(f)
+                    }
+                    None => {
+                        guest_path = Some(vpath_join(&r.guest(), &orig));
+                        in_sysroot = true;
+                        left_from = Some(r);
+                        None
+                    }
+                }
+            } else {
+                guest_full_path(&orig, at, || {
+                    if cwd_is_base(at, fd) {
+                        new_base = true;
+                        probe_base = cwd_host_base(|| full_path_of(c"."), crate::paths::cache_dir().as_deref(), crate::paths::overlay_root().is_some());
+                        probe_base.clone()
+                    } else if let Some(g) = fd_guest_path(fd) {
+                        recorded = true;
+                        Some(g)
+                    } else {
+                        new_base = true;
+                        unrecorded_fd_base(fd, fd_host_getpath, crate::paths::cache_dir().as_deref())
+                    }
+                })
+            };
+            let full = full.filter(|f| joined_rewritable(recorded || escaped.is_some(), &orig, f));
             if TRACE.load(Ordering::Relaxed) {
-                eprintln!("[path] #{n} {orig} -> {full:?}");
+                if left_from.is_some() {
+                    eprintln!("[path] #{n} {orig}: inside the sysroot from the working directory, left to the host");
+                } else {
+                    eprintln!("[path] #{n} {orig} -> {full:?}{}", if escaped.is_some() { " (climbed out of the sysroot)" } else { "" });
+                }
             }
             if let Some(full) = full {
                 // Resolve a `..` in the guest's view before the redirect sees the path.
@@ -1354,7 +2103,10 @@ fn bsd_read(cpu: &mut Cpu, n: u64, mut args: [u64; 8], read: impl FnOnce(u64) ->
                 let ids = lookup_ids(n, &args);
                 // A symlink before a `.` or `..` is the kernel's to look up (resolve_dotdot); a name
                 // it sends to the host goes as it is, never through the redirect.
-                let dotdot = resolve_dotdot(&before, follows_symlinks(n, &args), ids, |p| guest_node_as(p, ids), kernel_lookup,
+                // A probe for a name joined to the working directory's host path looks it up from
+                // the working directory, as the call itself does.
+                let dotdot = resolve_dotdot(&before, follows_symlinks(n, &args), ids, |p| guest_node_as(p, ids),
+                                            |p, ids| kernel_lookup(probe_from_cwd(p, probe_base.as_deref()), ids),
                                             |m| crate::paths::redirect(m).is_some());
                 let (full, host_as_is) = match dotdot {
                     Dotdot::Keep => (before.clone(), false),
@@ -1404,15 +2156,46 @@ fn bsd_read(cpu: &mut Cpu, n: u64, mut args: [u64; 8], read: impl FnOnce(u64) ->
                         }
                         None => None,
                     }
+                } else if host_as_is && new_base {
+                    // The host's own lookup of the name as it came, from the base it holds.
+                    None
                 } else if host_as_is {
                     Some(full.clone())
                 } else {
                     crate::paths::redirect(&full).or_else(|| {
-                        (at && !orig.starts_with('/') && crate::paths::overlay_root().is_some()).then(|| full.clone())
+                        // For a recorded descriptor's base only, as before H v8.
+                        (at && recorded && !orig.starts_with('/') && crate::paths::overlay_root().is_some()).then(|| full.clone())
                     }).or_else(|| left_the_prefix(&before, &full, crate::paths::redirect))
                 };
+                // An escaped name whose host path reaches MAXPATHLEN goes relative to the
+                // working directory when it lands inside the sysroot again; else the call is refused, loudly.
+                // An escaped name is never sent as it came (the host would climb to the sysroot's host parent): with
+                // no replacement from above it goes as its guest path, unless the call is bound to its descriptor
+                // (RESOLVE_BENEATH: the host refuses the climb itself, as XNU does).
+                let replacement = match (replacement, escaped.as_ref()) {
+                    (None, Some(_)) if !bound => Some(full.clone()),
+                    (x, _) => x,
+                };
+                let replacement = match (replacement, escaped.as_ref()) {
+                    (Some(new), Some(_)) => match fit_target(new, crate::paths::cache_dir().as_deref(), here_depth) {
+                        Ok(t) if still_climbs(&t) => {
+                            eprintln!("[maclator] warning: #{n} {orig} climbs out of the sysroot to {before}, which could not be resolved: refused (ENOENT)");
+                            set_err(cpu, libc::ENOENT as u64);
+                            return None;
+                        }
+                        Ok(t) => Some(t),
+                        Err(e) => {
+                            eprintln!("[maclator] warning: #{n} {orig} climbs out of the sysroot to {before}, too long to send: refused (ENAMETOOLONG)");
+                            set_err(cpu, e);
+                            return None;
+                        }
+                    },
+                    (x, _) => x,
+                };
                 if let Some(new) = replacement {
-                    let ins = inside_sysroot(spelled.as_deref().unwrap_or(&new), crate::paths::cache_dir().as_deref());
+                    let ins = inside_sysroot(spelled.as_deref().unwrap_or(&new), crate::paths::cache_dir().as_deref())
+                        || (escaped.is_some() && !new.starts_with('/'));
+                    sent = Some(new.clone());
                     if let Ok(c) = std::ffi::CString::new(new) {
                         args[i] = c.as_ptr() as u64;
                         if at {
@@ -1430,6 +2213,8 @@ fn bsd_read(cpu: &mut Cpu, n: u64, mut args: [u64; 8], read: impl FnOnce(u64) ->
     }
     bsd_inner(cpu, n, args);
     drop(keep);
+    drop(esc_keep);
+    drop(ax_keep);
     let warning = unread.and_then(|p| unread_name_warning(n, p, cpu.cf == 0));
     if cpu.cf == 0 && crate::paths::overlay_root().is_some() {
         if matches!(n, 92 | 406) && matches!(args[1], 50 | 102) {
@@ -1447,7 +2232,18 @@ fn bsd_read(cpu: &mut Cpu, n: u64, mut args: [u64; 8], read: impl FnOnce(u64) ->
         if let Some(g) = guest_path {
             // Record where the host really is, unless it is inside
             // the sysroot (descriptor_record). The FD_VPATHS entry was removed just above.
-            let g = descriptor_record(&g, in_sysroot, || host_fd_path(cpu.x[0] as i32));
+            let g = match left_from.as_ref() {
+                // A name left to the host from inside the sysroot: the prefix, then where the host opened it.
+                Some(r) => {
+                    let h = fd_host_getpath(cpu.x[0] as i32);
+                    let sys = sysroot_spelling();
+                    match h.as_deref().and_then(|h| rec_at((0, 0), r.prefix, Some(h.to_string()), sys.as_deref())) {
+                        Some(x) => Some(x.guest()),
+                        None => h.map(|h| recorded_path(&crate::paths::guest_path(&h).unwrap_or(h))),
+                    }
+                }
+                None => descriptor_record(&g, in_sysroot, || host_fd_path(cpu.x[0] as i32)),
+            };
             if let Some(g) = g.filter(|g| g == "/" || g.starts_with("/System") || crate::paths::overlay_root().is_some()) {
                 FD_VPATHS.lock().unwrap().get_or_insert_with(Default::default).insert(cpu.x[0] as i32, g);
             }
@@ -1461,6 +2257,37 @@ fn bsd_read(cpu: &mut Cpu, n: u64, mut args: [u64; 8], read: impl FnOnce(u64) ->
             paths.insert(target, path);
         } else {
             paths.remove(&target);
+        }
+    } else if matches!(n, 12 | 13 | 348 | 349) && cpu.cf == 0 {
+        // The new working directory's record (CwdRec): the prefix it was reached by (chdir_prefix: the
+        // guest path H computed for chdir and __pthread_chdir, the descriptor's guest path for fchdir and
+        // __pthread_fchdir) with its physical path below the sysroot, read from the host now; the process's for
+        // chdir and fchdir, the thread's own for the per-thread forms, as XNU keeps them. __pthread_fchdir(-1)
+        // gives the thread back the process's.
+        let per_thread = matches!(n, 348 | 349);
+        if n == 349 && args[0] as i32 == -1 {
+            THREAD_CWD.with(|t| *t.borrow_mut() = None);
+        } else {
+            let sys = sysroot_spelling();
+            let (prefix, at) = if matches!(n, 12 | 348) {
+                (chdir_prefix(guest_path.as_deref(), left_from.as_ref()), None)
+            } else {
+                let fd = args[0] as i32;
+                (fd_guest_path(fd).as_deref().and_then(crate::paths::physical_prefix), Some(fd))
+            };
+            // "." is the new directory unless a process chdir came from a thread with its own (then its fd or path)
+            let r = prefix.or(prev_prefix).and_then(|p| {
+                if let Some(fd) = at {
+                    rec_at(fd_dev_ino(fd)?, p, fd_host_getpath(fd), sys.as_deref())
+                } else if per_thread || !thread_has_cwd() {
+                    rec_at(path_dev_ino(".")?, p, full_path_of(c"."), sys.as_deref())
+                } else {
+                    let h = sent.as_deref()?;
+                    let c = std::ffi::CString::new(h).ok()?;
+                    rec_at(path_dev_ino(h)?, p, full_path_of(&c), sys.as_deref())
+                }
+            });
+            cwd_set(per_thread, r);
         }
     } else if matches!(n, 6 | 399) && cpu.cf == 0 {
         if let Some(m) = FD_VPATHS.lock().unwrap().as_mut() {
@@ -1484,6 +2311,8 @@ fn bsd_inner(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
             if pid < 0 {
                 set_err(cpu, unsafe { *libc::__error() } as u64);
             } else if pid == 0 {
+                // The child's working directory is the forking thread's (cwd_after_fork_child).
+                cwd_after_fork_child();
                 // Child: XNU returns the parent's pid with the "is child" flag in x1.
                 set_ok(cpu, unsafe { libc::getppid() } as u64, 1);
             } else {
@@ -2370,7 +3199,7 @@ mod tests {
         for n in [463, 464, 466, 469, 470, 473, 476] {
             assert_eq!(path_arg(n), (Some(1), true), "*at call {n}");
         }
-        for n in [5, 398, 33, 58, 188, 190, 220, 338, 340] {
+        for n in [5, 398, 12, 33, 58, 188, 190, 220, 338, 340, 348] {
             assert_eq!(path_arg(n), (Some(0), false), "plain call {n}");
         }
         // the two-path calls pass through untouched: renameat, linkat, symlinkat, rename, link, symlink
@@ -2397,9 +3226,283 @@ mod tests {
         assert_eq!(guest_full_path("x", true, || Some("/".into())).as_deref(), Some("/x"));
         assert_eq!(guest_full_path("/etc/hosts", true, || None).as_deref(), Some("/etc/hosts"));
         assert_eq!(guest_full_path("/etc/hosts", false, || None).as_deref(), Some("/etc/hosts"));
-        // no virtual cwd: a relative name outside an *at call, or through AT_FDCWD (no guest path)
-        assert_eq!(guest_full_path("x", false, || Some("/System".into())), None);
+        // A relative name in a plain call is joined to the base it is given (the working
+        // directory's); no base, no join
+        assert_eq!(guest_full_path("x", false, || Some("/System".into())).as_deref(), Some("/System/x"));
         assert_eq!(guest_full_path("x", true, || None), None);
+        assert_eq!(guest_full_path("x", false, || None), None);
+    }
+
+    #[test]
+    fn hv9_a_record_is_kept_while_its_guest_path_leads_here_else_recomputed_from_the_host() {
+        let pre = "/System/Library/dyld";
+        let r = CwdRec { key: (1, 2), prefix: pre, rel: "/sub".into() };
+        let sys = Some("/sysroot");
+        // The physical path decides when it can be read, even while the guest path still leads here
+        assert_eq!(cwd_check(r.clone(), (1, 2), |_| panic!("asked the guest path"), || Some("/sysroot/sub".into()), sys, || false), Some(r.clone()));
+        let aliased = CwdRec { key: (1, 2), prefix: pre, rel: "/x/y".into() };
+        assert_eq!(cwd_check(r.clone(), (1, 2), |_| Some((1, 2)), || Some("/sysroot/x/y".into()), sys, || false), Some(aliased), "an alias left at the old spelling");
+        // unreadable "." (deeper than MAXPATHLEN): the record stands while its guest path leads here
+        assert_eq!(cwd_check(r.clone(), (1, 2), |_| Some((1, 2)), || None, sys, || false), Some(r.clone()));
+        // a record for another directory is no record (must-fail control for the key test)
+        assert_eq!(cwd_check(r.clone(), (1, 3), |_| Some((1, 3)), || panic!("asked the host"), sys, || false), None);
+        // renamed: the prefix stays, the place below the sysroot is read again
+        let moved = CwdRec { key: (1, 2), prefix: pre, rel: "/sub3".into() };
+        assert_eq!(cwd_check(r.clone(), (1, 2), |_| None, || Some("/sysroot/sub3".into()), sys, || false), Some(moved));
+        // moved out of the sysroot, or its path unreadable: no record (the host's path is the guest's)
+        assert_eq!(cwd_check(r.clone(), (1, 2), |_| None, || Some("/private/tmp/x".into()), sys, || false), None);
+        assert_eq!(cwd_check(r.clone(), (1, 2), |_| None, || None, sys, || false), None);
+        assert_eq!(cwd_check(r.clone(), (1, 2), |_| None, || Some("/sysroot2/sub".into()), sys, || false), None, "a sibling with the sysroot's name as prefix");
+        // A spelling the strip misses, inside by identity: kept
+        assert_eq!(cwd_check(r.clone(), (1, 2), |_| None, || Some("/System/Volumes/Data/sysroot/sub".into()), sys, || true), Some(r.clone()));
+        assert_eq!(cwd_check(r, (1, 2), |_| None, || None, sys, || true).is_some(), true);
+    }
+
+    #[test]
+    fn hv9_rec_at_takes_only_a_place_inside_the_sysroot() {
+        let sys = Some("/sysroot");
+        assert_eq!(rec_at((1, 2), "/p", Some("/sysroot".into()), sys).map(|r| r.guest()).as_deref(), Some("/p"));
+        assert_eq!(rec_at((1, 2), "/p", Some("/sysroot/a/b".into()), sys).map(|r| r.guest()).as_deref(), Some("/p/a/b"));
+        assert_eq!(rec_at((1, 2), "/p", Some("/private/tmp/out/d".into()), sys), None, "a link out of the sysroot");
+        assert_eq!(rec_at((1, 2), "/p", Some("/sysrootx".into()), sys), None);
+        assert_eq!(rec_at((1, 2), "/p", None, sys), None);
+        assert_eq!(rec_at((1, 2), "/p", Some("/sysroot".into()), None), None);
+    }
+
+    #[test]
+    fn hv9_escape_at_is_the_first_dotdot_taken_at_the_sysroots_root() {
+        let root = (9, 9);
+        // the working directory is the root: "." lands there
+        let at_root = |p: &str| match p { "." | "./" | "a/.." | "a/../" => Some(root), "a" | "a/" => Some((9, 1)), _ => None };
+        assert_eq!(escape_at("../victim", root, at_root), Some(0));
+        assert_eq!(escape_at("./../x", root, at_root), Some(2));
+        assert_eq!(escape_at("a/../../x", root, at_root), Some(5));
+        assert_eq!(escape_at("a/../b", root, at_root), None, "a `..` taken below the root stays inside");
+        assert_eq!(escape_at("a/b", root, at_root), None);
+        assert_eq!(escape_at("..", root, at_root), Some(0));
+        // 500 "./" then "../victim"; the stat sees the same root for every "./" prefix
+        let long = format!("{}../victim", "./".repeat(500));
+        assert_eq!(escape_at(&long, root, |_| Some(root)), Some(1000));
+        // one level down: the first `..` stays, the second climbs out
+        let down = |p: &str| match p { "." => Some((9, 1)), "../" => Some(root), _ => None };
+        assert_eq!(escape_at("../../x", root, down), Some(3));
+        assert_eq!(escape_at("../x", root, down), None);
+        // a leading part that does not land: the host's walk stops there too
+        assert_eq!(escape_at("nope/../../x", root, |p| if p == "." { Some((9, 1)) } else { None }), None);
+        // must-fail control: a root that never matches finds nothing
+        assert_eq!(escape_at("../victim", (0, 0), at_root), None);
+    }
+
+    #[test]
+    fn hv9_escaped_path_and_the_relative_reentry() {
+        let r = CwdRec { key: (1, 2), prefix: "/System/Library/dyld", rel: "/a/b".into() };
+        assert_eq!(escaped_path(&r, "x/../../../victim", 8), "/System/Library/dyld/../victim");
+        assert_eq!(reentry_relative("/sysroot/f", 2, "/sysroot").as_deref(), Some("../../f"));
+        assert_eq!(reentry_relative("/sysroot/f", 0, "/sysroot").as_deref(), Some("f"));
+        assert_eq!(reentry_relative("/sysroot/d/", 1, "/sysroot").as_deref(), Some("../d/"));
+        assert_eq!(reentry_relative("/elsewhere/f", 0, "/sysroot"), None);
+        assert_eq!(reentry_relative("/sysrootx/f", 0, "/sysroot"), None);
+    }
+
+    #[test]
+    fn hv8_an_unrecorded_descriptor_starts_from_its_host_path_outside_the_sysroot() {
+        let sys = Some("/sysroot");
+        assert_eq!(unrecorded_fd_base(3, |_| Some("/private/tmp/ec".into()), sys).as_deref(), Some("/private/tmp/ec"));
+        assert_eq!(unrecorded_fd_base(3, |_| Some("/sysroot/sub".into()), sys), None);
+        assert_eq!(unrecorded_fd_base(3, |_| Some("/sysroot".into()), sys), None);
+        assert_eq!(unrecorded_fd_base(3, |_| None, sys), None);
+        assert_eq!(unrecorded_fd_base(3, |_| Some("/sysroot".into()), None).as_deref(), Some("/sysroot"));
+    }
+
+    #[test]
+    fn hv9_the_pure_parts_of_the_bsd_read_branches() {
+        // cwd_host_base: nothing to redirect, nothing joined; inside the sysroot by its host path, nothing joined
+        assert_eq!(cwd_host_base(|| panic!("asked the host"), None, false), None);
+        assert_eq!(cwd_host_base(|| Some("/private/tmp/fa".into()), Some("/sysroot"), false).as_deref(), Some("/private/tmp/fa"));
+        assert_eq!(cwd_host_base(|| Some("/sysroot/sub".into()), Some("/sysroot"), false), None);
+        assert_eq!(cwd_host_base(|| Some("/private/tmp/fa".into()), None, true).as_deref(), Some("/private/tmp/fa"));
+        // probe_from_cwd: relative again below the base, else as it came
+        assert_eq!(probe_from_cwd("/private/tmp/secret/d/l/../f", Some("/private/tmp/secret/d")), "l/../f");
+        assert_eq!(probe_from_cwd("/private/tmp/secret/d", Some("/private/tmp/secret/d")), "/private/tmp/secret/d");
+        assert_eq!(probe_from_cwd("/private/tmp/secret/dx/f", Some("/private/tmp/secret/d")), "/private/tmp/secret/dx/f");
+        assert_eq!(probe_from_cwd("/a/b", None), "/a/b");
+        // joined_rewritable: H v7's rule for a recorded base; the limit for a new one
+        let long = "/".to_string() + &"a".repeat(MAXPATHLEN);
+        assert!(joined_rewritable(true, "x", &long));
+        assert!(!joined_rewritable(false, "x", &long));
+        assert!(!joined_rewritable(false, "x", &long[..MAXPATHLEN]), "exactly MAXPATHLEN is too long");
+        assert!(joined_rewritable(false, "x", &long[..MAXPATHLEN - 1]));
+        // cwd_is_base: plain calls and AT_FDCWD; a real descriptor is not
+        assert!(cwd_is_base(false, 3) && cwd_is_base(true, libc::AT_FDCWD) && !cwd_is_base(true, 3));
+        // chdir_prefix: the guest path's physical prefix, else the record the name was left from
+        let r = CwdRec { key: (1, 2), prefix: "/System/Library/dyld", rel: String::new() };
+        let pre = "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld";
+        assert_eq!(chdir_prefix(Some("/System/Cryptexes/OS/System/Library/dyld/sub"), None), Some(pre));
+        assert_eq!(chdir_prefix(Some("/System/Library/dyld"), Some(&r)), Some("/System/Library/dyld"));
+        assert_eq!(chdir_prefix(Some("/System/Library"), None), None, "climbed out of the prefix: no record");
+        assert_eq!(chdir_prefix(None, Some(&r)), Some("/System/Library/dyld"));
+        assert_eq!(chdir_prefix(None, None), None);
+        // physical_prefix
+        assert_eq!(crate::paths::physical_prefix(pre), Some(pre));
+        assert_eq!(crate::paths::physical_prefix("/System/Library/dyld/x"), Some("/System/Library/dyld"));
+        assert_eq!(crate::paths::physical_prefix("/System/Library/dyldx"), None);
+        assert_eq!(crate::paths::physical_prefix("/tmp/a"), None);
+    }
+
+    #[test]
+    fn hv9_a_forwarded_prefix_is_taken_with_the_childs_own_place() {
+        let sys = Some("/sysroot");
+        let pre = "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld";
+        // the parent's prefix, the child's own place below the sysroot (a spawn chdir file action inside it, row J5)
+        let got = adopt_arg("/System/Cryptexes/OS/System/Library/dyld", Some((7, 9)), || Some("/sysroot/child-subdir".into()), sys);
+        assert_eq!(got.map(|r| r.guest()).as_deref(), Some(&*format!("{pre}/child-subdir")));
+        // a child that a file action took out of the sysroot, or a forward with no prefix, takes nothing
+        assert_eq!(adopt_arg("/System/Library/dyld", Some((7, 9)), || Some("/private/tmp/x".into()), sys), None);
+        assert_eq!(adopt_arg("/private/tmp/x", Some((7, 9)), || panic!("asked the host"), sys), None);
+        assert_eq!(adopt_arg("relative", Some((7, 9)), || panic!("asked the host"), sys), None);
+        assert_eq!(adopt_arg("/System/Library/dyld", None, || Some("/sysroot".into()), sys), None);
+    }
+
+    #[test]
+    fn hv9_every_path_slot_is_a_call_bsd_read_does_not_already_take() {
+        for n in 0..600u64 {
+            let slots = escape_slots(n);
+            if !slots.is_empty() {
+                assert_eq!(path_arg(n), (None, false), "call {n} is in both tables");
+                for &(i, f) in slots {
+                    assert!(i < 8 && f.is_none_or(|f| f < 8 && f != i), "call {n}");
+                }
+            }
+        }
+        assert_eq!(escape_slots(10), &[(0, None)]);
+        assert_eq!(escape_slots(128), &[(0, None), (1, None)]);
+        assert_eq!(escape_slots(57), &[(1, None)], "symlink's first argument is the link's text");
+        assert_eq!(escape_slots(474), &[(2, Some(1))]);
+        assert_eq!(escape_slots(472), &[(1, Some(0))]);
+        assert_eq!(escape_slots(465), &[(1, Some(0)), (3, Some(2))]);
+        assert!(escape_slots(5).is_empty() && escape_slots(12).is_empty() && escape_slots(3).is_empty());
+    }
+
+    #[test]
+    fn hv10_an_unknown_sysroot_root_refuses_a_climb_and_never_reads_as_none() {
+        let root = (9, 9);
+        let at = |p: &str| if p == "." { Some(root) } else { None };
+        assert_eq!(escape_closed("../x", Some(root), at), Ok(Some(0)));
+        assert_eq!(escape_closed("../x", None, at), Err(()), "unknown is closed");
+        assert_eq!(escape_closed("x", None, |_| panic!("stat")), Ok(None), "no `..`: nothing to rule out");
+        assert_eq!(escape_closed("/abs/../x", None, |_| panic!("stat")), Ok(None));
+        assert!(has_dotdot("a/../b") && has_dotdot("..") && !has_dotdot("a/..b") && !has_dotdot("/a/.."));
+    }
+
+    #[test]
+    fn hv10_the_root_is_known_only_when_its_two_readings_agree() {
+        assert_eq!(root_decision(Some((1, 1)), Some((1, 1))), Some((1, 1)));
+        assert_eq!(root_decision(Some((1, 1)), None), Some((1, 1)), "a path made unsearchable: the startup identity");
+        assert_eq!(root_decision(None, Some((1, 2))), Some((1, 2)));
+        assert_eq!(root_decision(Some((1, 1)), Some((1, 2))), None, "replaced");
+        assert_eq!(root_decision(None, None), None);
+        // beneath: RESOLVE_BENEATH only, never AT_FDONLY
+        let mut a = [0u64; 8];
+        a[3] = AT_FDONLY;
+        assert!(!beneath(469, &a));
+        a[3] = AT_RESOLVE_BENEATH;
+        assert!(beneath(469, &a) && beneath(467, &a) && !beneath(472, &a));
+        a[2] = AT_RESOLVE_BENEATH;
+        assert!(beneath(472, &a));
+        a[1] = O_RESOLVE_BENEATH;
+        assert!(beneath(5, &a));
+        // the sysroot's root itself keeps its absolute form
+        assert_eq!(reentry_relative("/sysroot", 2, "/sysroot"), None);
+        assert_eq!(reentry_relative("/sysroot/", 0, "/sysroot"), None);
+        // an unresolved walk is not a place below the sysroot (measured, row LK1)
+        assert_eq!(reentry_relative("/sysroot/../dyld/x", 0, "/sysroot"), None);
+        assert_eq!(reentry_relative("/sysroot/a/./b", 0, "/sysroot"), None);
+    }
+
+    #[test]
+    fn hv10_cwd_depth_counts_the_physical_climb_to_the_root() {
+        let root = (9, 9);
+        assert_eq!(cwd_depth(root, |p| if p == "." { Some(root) } else { None }), Some(0));
+        assert_eq!(cwd_depth(root, |p| match p { "." => Some((1, 1)), ".." => Some((1, 2)), "../.." => Some(root), _ => None }), Some(2));
+        assert_eq!(cwd_depth(root, |p| if p == "." { Some((1, 1)) } else { None }), None, "a failed stat");
+        assert_eq!(cwd_depth(root, |_| Some((1, 1))), None, "never reached");
+    }
+
+    #[test]
+    fn hv10_fit_target_goes_relative_inside_the_sysroot() {
+        let sys = Some("/sysroot");
+        assert_eq!(fit_target("/sysroot/f".into(), sys, || Some(2)).as_deref(), Ok("../../f"));
+        assert_eq!(fit_target("/sysroot/f".into(), sys, || None).as_deref(), Ok("/sysroot/f"), "depth unknown: absolute");
+        assert_eq!(fit_target("/System/Library/x".into(), sys, || panic!("depth")).as_deref(), Ok("/System/Library/x"));
+        let long = format!("/sysroot/{}", "a".repeat(MAXPATHLEN));
+        assert_eq!(fit_target(long.clone(), sys, || Some(0)), Err(libc::ENAMETOOLONG as u64));
+        let long_out = format!("/elsewhere/{}", "a".repeat(MAXPATHLEN));
+        assert_eq!(fit_target(long_out, sys, || Some(0)), Err(libc::ENAMETOOLONG as u64));
+        let near = format!("/sysroot/{}", "b".repeat(MAXPATHLEN - 20));
+        assert_eq!(fit_target(near, sys, || Some(1)).map(|r| r.starts_with("../b")), Ok(true), "too long absolute, fits relative");
+    }
+
+    #[test]
+    fn hv10_lead_probe_keeps_the_names_length() {
+        for (name, off) in [("l/../dyld/f", 2), ("a/b/../../../x", 10), ("../x", 0), ("q/..", 2), ("q/../y", 2)] {
+            let p = lead_probe(name, off);
+            assert_eq!(p.len(), name.len(), "{name}");
+            assert!(p.starts_with(&name[..off]) && !p[off..].contains(".."), "{name} -> {p}");
+        }
+        assert_eq!(lead_probe("l/../d", 2), "l/././");
+        assert_eq!(lead_probe("l/../dy", 2), "l/././.");
+        assert_eq!(lead_probe("l/..", 2), "l/./");
+        assert_eq!(lead_walk("../x", 0, Ids::Effective), Ok(()), "no leading part: nothing to walk");
+    }
+
+    #[test]
+    fn hv10_accessx_names_are_read_and_rewritten_in_a_copy() {
+        // two descriptors (the first offset, 32, ends the table), names at 32 and 42
+        let mut t = vec![0u8; 48];
+        t[0..4].copy_from_slice(&32u32.to_ne_bytes());
+        t[16..20].copy_from_slice(&42u32.to_ne_bytes());
+        t.truncate(32);
+        t.extend_from_slice(b"../dyld/a\0");
+        t.extend_from_slice(b"b\0");
+        let seen = std::cell::RefCell::new(Vec::new());
+        let got = accessx_rewrite(&t, |n| { seen.borrow_mut().push(n.to_string()); Ok((n == "../dyld/a").then(|| "a".to_string())) }).unwrap().unwrap();
+        assert_eq!(*seen.borrow(), vec!["../dyld/a".to_string(), "b".to_string()]);
+        // laid out again: the table still ends at 32 (the first offset), then "a", then "b"
+        assert_eq!(&got[0..4], &32u32.to_ne_bytes(), "the first offset is the table's end and must not move");
+        assert_eq!(&got[4..16], &t[4..16]);
+        assert_eq!(&got[16..20], &34u32.to_ne_bytes());
+        assert_eq!(&got[32..], b"a\0b\0");
+        // an offset of 0 (repeat the previous name) stays 0
+        let mut t3 = vec![0u8; 48];
+        t3[0..4].copy_from_slice(&48u32.to_ne_bytes());
+        t3.extend_from_slice(b"../x\0");
+        let got3 = accessx_rewrite(&t3, |_| Ok(Some("y".into()))).unwrap().unwrap();
+        assert_eq!(&got3[0..4], &48u32.to_ne_bytes());
+        assert_eq!(&got3[16..20], &0u32.to_ne_bytes());
+        assert_eq!(&got3[32..36], &0u32.to_ne_bytes());
+        assert_eq!(&got3[48..], b"y\0");
+        // nothing to rewrite: no copy; a refusal is passed on
+        assert_eq!(accessx_rewrite(&t, |_| Ok(None)), Ok(None));
+        assert_eq!(accessx_rewrite(&t, |_| Err(2)), Err(2));
+        // not a table XNU would read: left alone
+        assert_eq!(accessx_rewrite(&[0u8; 8], |_| panic!("read")), Ok(None));
+        assert_eq!(accessx_rewrite(&[0u8; 20], |_| panic!("read")), Ok(None), "the first offset 0");
+        assert_eq!(accessx_rewrite(&{ let mut b = t.clone(); b.push(b'x'); b }, |_| panic!("read")), Ok(None), "no NUL at the end");
+        assert_eq!(accessx_rewrite(&{ let mut b = t.clone(); b[16..20].copy_from_slice(&16u32.to_ne_bytes()); b }, |_| panic!("read")), Ok(None), "an offset into its own descriptor");
+        // Names out of order and an unaligned first offset are read as XNU reads them
+        let mut t2 = vec![0u8; 32];
+        t2[0..4].copy_from_slice(&34u32.to_ne_bytes());
+        t2[16..20].copy_from_slice(&32u32.to_ne_bytes());
+        t2.extend_from_slice(b"x\0../dyld/m\0");
+        let seen2 = std::cell::RefCell::new(Vec::new());
+        let got2 = accessx_rewrite(&t2, |n| { seen2.borrow_mut().push(n.to_string()); Ok((n == "../dyld/m").then(|| "m".to_string())) }).unwrap().unwrap();
+        assert_eq!(*seen2.borrow(), vec!["../dyld/m".to_string(), "x".to_string()]);
+        assert_eq!(&got2[32..], b"m\0x\0");
+        assert_eq!(&got2[0..4], &32u32.to_ne_bytes());
+        assert_eq!(&got2[16..20], &34u32.to_ne_bytes());
+        // growing past 16 KiB is refused
+        let big = "x".repeat(ACCESSX_MAX_TABLESIZE);
+        assert_eq!(accessx_rewrite(&t, |_| Ok(Some(big.clone()))), Err(libc::E2BIG as u64));
     }
 
     fn a(i: usize, v: u64) -> [u64; 8] {

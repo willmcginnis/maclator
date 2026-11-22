@@ -85,12 +85,23 @@ pub fn exec_like(n: u64, args: &[u64; 8]) -> SysResult {
     let _env = scrub_shim(n, &mut args);
     let args = &args;
     if !arm64_only(&path) {
+        // A native (x86-64 or universal) program starts where the
+        // calling thread stands: for a guest working directory under a cache prefix, the sysroot's directory, so its
+        // relative names inside reach the sysroot's files, as the guest's do. H v9 moved the thread to the guest path
+        // on the host first (native_cwd), which gave the right parent for `..` but the host cache's files (or none)
+        // for every relative name inside; no one host directory gives both.
         return hostsys::unix(n, args);
     }
     let Ok(me) = std::env::current_exe() else { return hostsys::unix(n, args) };
     let argv = unsafe { read_argv(args[aidx]) };
     let mut new_argv: Vec<String> = vec![me.to_string_lossy().into_owned()];
     new_argv.extend(FORWARD.lock().unwrap().iter().cloned());
+    // The working directory survives exec, its record does not; the child checks it.
+    // Only the prefix is passed; the child reads its own place below the sysroot (syscalls::cwd_adopt).
+    if let Some(c) = crate::syscalls::cwd_forward() {
+        new_argv.push("--guest-cwd".into());
+        new_argv.push(c);
+    }
     new_argv.push(path);
     new_argv.extend(argv.into_iter().skip(1));
     let cstrs: Vec<CString> = new_argv.iter().filter_map(|s| CString::new(s.as_str()).ok()).collect();

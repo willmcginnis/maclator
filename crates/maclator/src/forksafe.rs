@@ -93,6 +93,7 @@ pub(crate) fn hold_all() -> Held {
     take(&mut v, &crate::workq::ANON_START);
     take(&mut v, &crate::workq::WL_MON_START);
     take(&mut v, &crate::syscalls::FD_VPATHS);
+    take(&mut v, &crate::syscalls::CWD_VPATHS);
     take(&mut v, &crate::paths::CACHE_DIR);
     take(&mut v, &crate::paths::OVERLAY_ROOT);
     take(&mut v, &crate::signals::ACTIONS);
@@ -202,6 +203,7 @@ mod tests {
             ("workq::ANON_START", || crate::workq::ANON_START.try_lock().is_ok()),
             ("workq::WL_MON_START", || crate::workq::WL_MON_START.try_lock().is_ok()),
             ("syscalls::FD_VPATHS", || crate::syscalls::FD_VPATHS.try_lock().is_ok()),
+            ("syscalls::CWD_VPATHS", || crate::syscalls::CWD_VPATHS.try_lock().is_ok()),
             ("paths::CACHE_DIR", || crate::paths::CACHE_DIR.try_lock().is_ok()),
             ("paths::OVERLAY_ROOT", || crate::paths::OVERLAY_ROOT.try_lock().is_ok()),
             ("signals::ACTIONS", || crate::signals::ACTIONS.try_lock().is_ok()),
@@ -216,7 +218,7 @@ mod tests {
     const HOLD_ORDER: &[&str] = &[
         "jit::TRANSLATE", "jit::INDEX", "aot::IMAGES", "aot::SEEN", "jit::BLOCKS", "symbols::CACHE_IMAGES_LOADED",
         "cache::CACHE", "symbols::IMAGES", "workq::WL", "workq::MANAGER", "workq::IDLE", "workq::ANON_QOS",
-        "workq::WLOG", "workq::ANON_START", "workq::WL_MON_START", "syscalls::FD_VPATHS", "paths::CACHE_DIR",
+        "workq::WLOG", "workq::ANON_START", "workq::WL_MON_START", "syscalls::FD_VPATHS", "syscalls::CWD_VPATHS", "paths::CACHE_DIR",
         "paths::OVERLAY_ROOT", "signals::ACTIONS", "iokit::FAKE_PORTS", "spawn::FORWARD", "jit::HIST",
         "engine::CPUS", "forksync::LAZY_GATE",
     ];
