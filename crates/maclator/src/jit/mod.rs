@@ -112,7 +112,7 @@ pub struct CodeCache {
     slot_ptr: AtomicU64,
 }
 
-static CODE: FOnceLock<CodeCache> = FOnceLock::new();
+static CODE: FOnceLock<Option<CodeCache>> = FOnceLock::new();
 /// guest pc -> host code
 pub(crate) static BLOCKS: FRwLock<Option<FastMap<u64, u64>>> = FRwLock::new(None);
 pub(crate) static TRANSLATE: FMutex<()> = FMutex::new(());
@@ -164,16 +164,57 @@ thread_local! {
     static MY_EPOCH: Cell<u64> = const { Cell::new(0) };
 }
 
+/// True for an errno that means the kernel REFUSED a MAP_JIT mapping, rather than ran out of room
+/// for it. macOS's Seatbelt operation `dynamic-code-generation` is what denies one, and 27's own
+/// profile for sandboxd denies it: measured on 27.0.1, every anonymous MAP_JIT mmap under
+/// `(deny dynamic-code-generation)` fails with EINVAL -- the same errno Rosetta 2 prints as
+/// "unable to mmap ExecutableHeap: 22" before it aborts. EPERM and EACCES are here because the
+/// refusal is a policy decision and the kernel may report it either way; EACCES is also what an
+/// RWX anonymous mapping without MAP_JIT returns.
+///
+/// A process denied dynamic code generation can still run. It must not translate.
+///
+/// EINVAL is the widest of the three, and it is the cost of this design: mmap also returns EINVAL
+/// for a malformed request. So a future bug in THIS call -- a bad length, a bad flag combination --
+/// would show up as the one refusal line and a slow interpreted run, not as an abort. That is the
+/// trade taken deliberately, because EINVAL is the errno the real policy was measured to produce;
+/// if the refusal line ever appears on a host with no such profile, suspect the arguments here
+/// before suspecting the sandbox.
+fn is_refusal(errno: i32) -> bool {
+    errno == libc::EPERM || errno == libc::EACCES || errno == libc::EINVAL
+}
+
+/// Map `len` bytes of RWX anonymous MAP_JIT space for translated code. None ONLY when the kernel
+/// refused the mapping, and then one line says so. Any other mmap failure aborts with the message
+/// this code has always used: a refusal is a configuration the process can live with (in the
+/// interpreter: see `cache_ready`), and an allocation failure is not, so an operator should see it.
+///
+/// It reads and writes no global, so a test can drive both outcomes directly, in process.
+fn map_code_cache(len: u64) -> Option<CodeCache> {
+    // MAP_JIT: macOS 27's x86 kernel refuses an anonymous mapping that asks for write and
+    // execute at creation (EACCES) unless it is a JIT mapping. On x86 the region stays RWX.
+    let p = unsafe {
+        libc::mmap(std::ptr::null_mut(), len as usize, libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+            libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_JIT, -1, 0)
+    };
+    if p == libc::MAP_FAILED {
+        let e = std::io::Error::last_os_error();
+        let errno = e.raw_os_error().unwrap_or(0);
+        assert!(is_refusal(errno), "cannot allocate the JIT code cache: {e}");
+        eprintln!("[maclator] the JIT code cache was refused: mmap MAP_JIT {len:#x} failed with {e} (errno {errno}); running in the interpreter");
+        return None;
+    }
+    let base = p as u64;
+    Some(CodeCache { base, end: base + len, code_ptr: AtomicU64::new(base), slot_ptr: AtomicU64::new(base + len) })
+}
+
+/// The JIT code cache, mapped once, or None when the kernel refused it.
+pub fn try_code_cache() -> Option<&'static CodeCache> {
+    CODE.get_or_init(|| map_code_cache(CODE_CACHE_SIZE)).as_ref()
+}
+
 pub fn code_cache() -> &'static CodeCache {
-    CODE.get_or_init(|| unsafe {
-        // MAP_JIT: macOS 27's x86 kernel refuses an anonymous mapping that asks for write and
-        // execute at creation (EACCES) unless it is a JIT mapping. On x86 the region stays RWX.
-        let p = libc::mmap(std::ptr::null_mut(), CODE_CACHE_SIZE as usize, libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-            libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_JIT, -1, 0);
-        assert!(p != libc::MAP_FAILED, "cannot allocate the JIT code cache: {}", std::io::Error::last_os_error());
-        let base = p as u64;
-        CodeCache { base, end: base + CODE_CACHE_SIZE, code_ptr: AtomicU64::new(base), slot_ptr: AtomicU64::new(base + CODE_CACHE_SIZE) }
-    })
+    try_code_cache().expect("the JIT code cache was refused, so the interpreter should be running")
 }
 
 impl CodeCache {
@@ -201,7 +242,7 @@ impl CodeCache {
 
 /// Bytes of the JIT code cache in use; 0 before it exists.
 pub fn code_committed() -> u64 {
-    CODE.get().map_or(0, CodeCache::committed)
+    CODE.get().and_then(Option::as_ref).map_or(0, CodeCache::committed)
 }
 
 pub fn lookup(pc: u64) -> Option<u64> {
@@ -653,8 +694,28 @@ fn interp_block(cpu: &mut Cpu) -> bool {
     true
 }
 
+/// Whether the JIT may be used, given the cache (or the absence of one). False only when the kernel
+/// refused the mapping; then the JIT and the AOT cache -- whose blocks are copied into that same
+/// mapping (aot.rs) -- are turned off for the life of this process, so every guest thread takes the
+/// interpreter and nothing reaches `code_cache()`. Takes the cache as an argument so a test can
+/// drive the refusal arm without a refused mapping.
+fn cache_ready(cache: Option<&CodeCache>) -> bool {
+    if cache.is_some() {
+        return true;
+    }
+    JIT_ENABLED.store(false, Ordering::Relaxed);
+    crate::aot::set_enabled(false);
+    false
+}
+
+/// Map the code cache before anything needs it, and say whether the JIT may be used. It must run
+/// before `aot::ensure_loaded()` below, which is the first thing that would reach the cache.
+fn jit_cache_ready() -> bool {
+    cache_ready(try_code_cache())
+}
+
 pub fn run(cpu: &mut Cpu) {
-    if !JIT_ENABLED.load(Ordering::Relaxed) {
+    if !JIT_ENABLED.load(Ordering::Relaxed) || !jit_cache_ready() {
         crate::engine::interp_loop(cpu);
         return;
     }
@@ -777,5 +838,99 @@ mod committed_tests {
         let mut st = 0;
         assert_eq!(unsafe { libc::waitpid(pid, &mut st, 0) }, pid);
         assert!(libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0, "child status {st:#x}");
+    }
+}
+
+#[cfg(test)]
+mod jit_refusal_tests {
+    use super::*;
+
+    /// Three arm64 instructions: `movz x0, #5` / `movz x1, #37` / `add x0, x0, x1`, so x0 ends at
+    /// 42. Encodings taken from clang (`otool -t`), not computed by hand.
+    const BLOCK: [u32; 3] = [0xd280_00a0, 0xd280_04a1, 0x8b01_0000];
+
+    /// NOTHING HERE FORKS. An earlier version drove the refusal in a forked child so that it could
+    /// set a test-only cache length; forking a multi-threaded test binary can inherit a held lock
+    /// and hang, and that version also had to skip itself when another test had already mapped the
+    /// cache -- a skip that printed "ok". Splitting `map_code_cache(len)` out, with no global in it,
+    /// removed the need for the fork, the test-only length and the skip together.
+    ///
+    /// A refused mapping is reported, not fatal. The errno comes from the real kernel: measured on
+    /// 27.0.1 a zero length gives EINVAL, which is the errno
+    /// `(deny dynamic-code-generation)` gives for the real 4 GiB request, and the one Rosetta 2
+    /// reports as "unable to mmap ExecutableHeap: 22". So this proves the MECHANISM; that the
+    /// sandbox produces this errno is a separate measurement, and that a translated daemon survives
+    /// under 27's real profile is the guest boot.
+    #[test]
+    fn a_refused_mapping_is_reported_not_fatal() {
+        assert!(map_code_cache(0).is_none(), "a refused mapping must be reported, not fatal");
+    }
+
+    /// The positive control for the same function: a mapping the kernel accepts comes back usable.
+    /// 64 KiB, not the real 4 GiB -- mapping that much executable space in the test binary makes
+    /// every later fork in it slow (see `committed_tests::code_committed_reads_the_cache`), and
+    /// `CodeCache` has no unmap.
+    #[test]
+    fn an_accepted_mapping_is_a_usable_cache() {
+        let cc = map_code_cache(0x10000).expect("the kernel refused a 64 KiB MAP_JIT mapping");
+        assert_eq!(cc.end - cc.base, 0x10000);
+        let a = cc.alloc(64);
+        assert!(a >= cc.base && a < cc.end, "alloc {a:#x} outside [{:#x}, {:#x})", cc.base, cc.end);
+        assert!(cc.contains(a));
+        assert_eq!(cc.committed(), 64);
+    }
+
+    /// With no cache, the JIT and the AOT cache are both turned off; with one, neither is touched.
+    /// Both flags are process-wide, so they are put back immediately; no test here runs `jit::run`,
+    /// which is the only reader of JIT_ENABLED.
+    #[test]
+    fn no_cache_turns_the_jit_and_the_aot_cache_off() {
+        let (jit0, aot0) = (JIT_ENABLED.load(Ordering::Relaxed), crate::aot::enabled());
+        let refused = cache_ready(None);
+        let (jit1, aot1) = (JIT_ENABLED.load(Ordering::Relaxed), crate::aot::enabled());
+        JIT_ENABLED.store(jit0, Ordering::Relaxed);
+        crate::aot::set_enabled(aot0);
+        assert!(!refused, "cache_ready(None) must report the JIT unusable");
+        assert!(!jit1, "the JIT was left on after a refusal");
+        assert!(!aot1, "the AOT cache was left on after a refusal; its blocks go in the same mapping");
+
+        let cc = map_code_cache(0x10000).expect("the kernel refused a 64 KiB MAP_JIT mapping");
+        assert!(cache_ready(Some(&cc)), "cache_ready must accept a mapped cache");
+        assert_eq!(JIT_ENABLED.load(Ordering::Relaxed), jit0, "a usable cache must not touch the flag");
+        assert_eq!(crate::aot::enabled(), aot0, "a usable cache must not touch the AOT cache");
+    }
+
+    /// The interpreter -- the path a refused process takes -- computes the right answer. Guest
+    /// addresses are host addresses, so a plain anonymous page is a guest page, as
+    /// `jit::selftest` already does.
+    #[test]
+    fn the_interpreter_computes_the_right_answer() {
+        let page = unsafe {
+            libc::mmap(std::ptr::null_mut(), 0x1000, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0)
+        };
+        assert!(page != libc::MAP_FAILED, "no guest page");
+        let page = page as u64;
+        for (i, w) in BLOCK.iter().enumerate() {
+            unsafe { std::ptr::write((page as *mut u32).add(i), *w) };
+        }
+        let mut cpu = Cpu::default();
+        cpu.pc = page;
+        for _ in 0..BLOCK.len() {
+            let insn = unsafe { std::ptr::read(cpu.pc as *const u32) };
+            interp::exec(&mut cpu, insn).expect("the interpreter refused an instruction");
+        }
+        assert_eq!(cpu.x[0], 42, "the interpreter did not compute 42");
+    }
+
+    /// EINVAL, EPERM and EACCES are refusals the process survives; ENOMEM is not. ENOMEM is what a
+    /// too-large length really returns (measured on 27.0.1), so this is the line between the
+    /// fallback and the assert that `map_code_cache` keeps.
+    #[test]
+    fn only_a_policy_errno_is_a_refusal() {
+        assert!(is_refusal(libc::EINVAL));
+        assert!(is_refusal(libc::EPERM));
+        assert!(is_refusal(libc::EACCES));
+        assert!(!is_refusal(libc::ENOMEM));
+        assert!(!is_refusal(libc::EBADF));
     }
 }

@@ -48,6 +48,11 @@ pub fn set_enabled(on: bool) {
     ENABLED.store(on, Ordering::SeqCst);
 }
 
+/// Whether the AOT cache is in use. It is turned off when the JIT code cache is refused.
+pub fn enabled() -> bool {
+    ENABLED.load(Ordering::SeqCst)
+}
+
 pub(crate) fn cache_dir() -> std::path::PathBuf {
     if let Ok(d) = std::env::var("MACLATOR_CACHE") {
         return d.into();
