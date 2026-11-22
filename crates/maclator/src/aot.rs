@@ -48,12 +48,28 @@ pub fn set_enabled(on: bool) {
     ENABLED.store(on, Ordering::SeqCst);
 }
 
-fn cache_dir() -> std::path::PathBuf {
+pub(crate) fn cache_dir() -> std::path::PathBuf {
     if let Ok(d) = std::env::var("MACLATOR_CACHE") {
         return d.into();
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    std::path::Path::new(&home).join("Library/Caches/Maclator/aot")
+    match std::env::var("HOME") {
+        Ok(home) => std::path::Path::new(&home).join("Library/Caches/Maclator/aot"),
+        // No home (a daemon): a directory of our own uid, not a shared one under /tmp that anyone could make first.
+        Err(_) => format!("/tmp/maclator-{}", unsafe { libc::geteuid() }).into(),
+    }
+}
+
+/// Owned by `uid` and writable by no group or other: what the cache trusts.
+pub(crate) fn owned(md: &std::fs::Metadata, uid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    md.uid() == uid && md.mode() & 0o022 == 0
+}
+
+/// `dir`, made first if missing (mode 0700), is a real directory (not a symlink) that is `owned` by `uid`.
+pub(crate) fn owned_dir(dir: &std::path::Path, uid: u32) -> bool {
+    use std::os::unix::fs::DirBuilderExt;
+    let _ = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir);
+    std::fs::symlink_metadata(dir).is_ok_and(|md| md.is_dir() && owned(&md, uid))
 }
 
 fn hex(b: &[u8]) -> String {
