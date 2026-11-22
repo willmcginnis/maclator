@@ -40,6 +40,8 @@ pub struct MachO {
     pub cputype: u32,
     pub cpusubtype: u32,
     pub filetype: u32,
+    /// mach_header_64.flags. MH_PIE here is what says the image may be loaded at a slid address.
+    pub flags: u32,
     pub segments: Vec<Segment>,
     /// LC_MAIN entry offset (from __TEXT start) if present.
     pub main_entryoff: Option<u64>,
@@ -132,12 +134,14 @@ impl MachO {
         let cpusubtype = rd32(all, 8);
         let filetype = rd32(all, 12);
         let ncmds = rd32(all, 16);
+        let flags = rd32(all, 24);
         let mut m = MachO {
             slice_offset: 0,
             slice_size: 0,
             cputype,
             cpusubtype,
             filetype,
+            flags,
             segments: vec![],
             main_entryoff: None,
             thread_pc: None,
@@ -209,6 +213,19 @@ impl MachO {
     }
 
     /// Lowest and highest (exclusive) vm address of all segments except __PAGEZERO.
+    /// MH_PIE: the image is position-independent and may be loaded at a slid address.
+    pub fn is_pie(&self) -> bool {
+        const MH_PIE: u32 = 0x0020_0000;
+        self.flags & MH_PIE != 0
+    }
+
+    /// May this image be loaded away from its preferred base? XNU's loader slides an image that is MH_PIE or is
+    /// dyld (`if ((header->flags & MH_PIE) || is_dyld)` in bsd/kern/mach_loader.c; MH_DYLINKER sets is_dyld). dyld
+    /// does not carry MH_PIE: it is position-independent by construction, so the flag alone is the wrong test for it.
+    pub fn may_slide(&self) -> bool {
+        self.is_pie() || self.filetype == MH_DYLINKER
+    }
+
     pub fn vm_range(&self) -> (u64, u64) {
         let mut lo = u64::MAX;
         let mut hi = 0;

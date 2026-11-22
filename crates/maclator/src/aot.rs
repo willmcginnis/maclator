@@ -90,6 +90,14 @@ fn fnv(parts: &[&[u8]]) -> String {
     format!("{h:016x}")
 }
 
+/// The AOT and profile identity of the main executable or dyld: its UUID, its path and the base it is actually
+/// loaded at. Translated code embeds guest addresses (the block index's PCs, branch targets, ADR/ADRP results),
+/// so a translation is valid only at the base it was made for; a library is keyed the same way
+/// (`register_image_at`). An image that slid off its preferred base therefore gets a cache of its own.
+fn image_key(kind: &str, uuid: &[u8; 16], path: &str, start: u64) -> String {
+    format!("{kind}-{}-{}-{start:x}", hex(uuid), fnv(&[path.as_bytes()]))
+}
+
 fn flags_word() -> u32 {
     crate::jit::commpage_checks() as u32 | ((crate::jit::emit::native_fma() as u32) << 1)
         | ((crate::jit::emit::direct_operands() as u32) << 2)
@@ -103,19 +111,25 @@ fn flags_word() -> u32 {
 
 /// Register the main executable (mapped at a fixed address).
 pub fn register_main(path: &str, uuid: [u8; 16], start: u64, end: u64, entries: Vec<u64>) {
-    let key = format!("main-{}-{}", hex(&uuid), fnv(&[path.as_bytes()]));
+    let key = image_key("main", &uuid, path, start);
     add_image(Image { name: path.rsplit('/').next().unwrap_or(path).to_string(), key, start, end, entries, loaded: false, cached: false });
 }
 
 /// Register dyld (also mapped at a fixed address).
 pub fn register_dyld(path: &str, uuid: [u8; 16], start: u64, end: u64) {
-    let key = format!("dyld-{}-{}", hex(&uuid), fnv(&[path.as_bytes()]));
+    let key = image_key("dyld", &uuid, path, start);
     add_image(Image { name: "dyld".into(), key, start, end, entries: vec![], loaded: false, cached: false });
+}
+
+/// The AOT and profile identity of the shared cache: its UUID and the base it is mapped at. Like an image's
+/// (`image_key`), a translation of cache code is valid only at the base it was made for, and the cache slides.
+fn cache_key(uuid: &[u8; 16], start: u64) -> String {
+    format!("dsc-{}-{start:x}", hex(uuid))
 }
 
 /// Register the shared cache once dyld has had us map it.
 pub fn register_cache(uuid: [u8; 16], start: u64, end: u64) {
-    let key = format!("dsc-{}", hex(&uuid));
+    let key = cache_key(&uuid, start);
     add_image(Image { name: "dyld_shared_cache".into(), key, start, end, entries: vec![], loaded: false, cached: false });
     ensure_loaded();
 }
@@ -562,7 +576,7 @@ pub fn build_standalone(path: &str) -> std::io::Result<usize> {
     let entries = function_starts(path, &m, slide);
     let img_start = lo.wrapping_add(slide);
     let img_end = hi.wrapping_add(slide);
-    let key = format!("main-{}-{}", hex(&m.uuid), fnv(&[path.as_bytes()]));
+    let key = image_key("main", &m.uuid, path, img_start);
     let img = Image { name: path.to_string(), key, start: img_start, end: img_end, entries, loaded: false, cached: false };
     if !owned_dir(&cache_dir(), unsafe { libc::geteuid() }) {
         return Err(std::io::Error::other("the cache directory is not ours alone"));
@@ -703,5 +717,28 @@ mod owner_tests {
         let _ = std::fs::remove_file(&link);
         std::os::unix::fs::symlink(&d, &link).unwrap();
         assert_eq!(load_file(&link.join("t.aot"), 0x7d00_0000_0000, 0x7d00_0000_1000).unwrap(), 0, "a directory reached through a symlink");
+    }
+}
+
+#[cfg(test)]
+mod image_key_tests {
+    use super::*;
+
+    /// A slid image must not share a cache with the same image at another base.
+    #[test]
+    fn the_key_names_the_base() {
+        let u = [7u8; 16];
+        let a = image_key("main", &u, "/bin/x", 0x5_0000_0000);
+        let b = image_key("main", &u, "/bin/x", 0x5_0000_4000);
+        assert_ne!(a, b, "two bases, one key: a slid image would run another base's translation");
+        assert_eq!(a, image_key("main", &u, "/bin/x", 0x5_0000_0000), "one base, one key");
+    }
+
+    /// A slid shared cache must not share a cache with the same cache at another base.
+    #[test]
+    fn the_cache_key_names_the_base() {
+        let u = [9u8; 16];
+        assert_ne!(cache_key(&u, 0x6_0000_0000), cache_key(&u, 0x6_0000_4000), "two bases, one cache key");
+        assert_eq!(cache_key(&u, 0x6_0000_0000), cache_key(&u, 0x6_0000_0000), "one base, one cache key");
     }
 }

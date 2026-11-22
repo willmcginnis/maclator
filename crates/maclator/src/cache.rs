@@ -56,19 +56,76 @@ fn pread_all(fd: i32, buf: &mut [u8], off: u64) -> bool {
     true
 }
 
-/// MAP_FIXED over unmapped space raises EXC_GUARD (kGUARD_EXC_DEALLOC_GAP) on current Darwin: one logged exception per
-/// mapping in an ordinary process, fatal in a platform binary. So reserve first, by hint, as `loader::map_image` does.
-/// A range something already occupies stays as it is, and the MAP_FIXED that follows replaces it as before.
-unsafe fn reserve_if_unmapped(addr: u64, size: usize) {
-    let p = libc::mmap(addr as *mut _, size, libc::PROT_NONE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0);
-    if p != libc::MAP_FAILED && p as u64 != addr {
-        libc::munmap(p, size);
+/// arm64 macOS pages are 16 KiB; the host's are 4 KiB.
+const PAGE16: u64 = 0x4000;
+
+/// Reserve `size` bytes, PROT_NONE, for the whole cache and return where. `hint` is only a hint: the kernel places the
+/// reservation, as it places the shared region itself, and the cache slides to wherever that is. The base is rounded
+/// up to 16 KiB by over-reserving one page and trimming, so the slide keeps the guest's page alignment. Every region is
+/// then mapped MAP_FIXED inside this reservation, never over unmapped space: that raises EXC_GUARD
+/// (kGUARD_EXC_DEALLOC_GAP) on current Darwin, fatal in a platform binary, whose mmap hints the kernel does not honour.
+unsafe fn reserve_cache(hint: u64, size: u64) -> std::io::Result<u64> {
+    let Some(over) = size.checked_add(PAGE16) else { return Err(std::io::Error::from_raw_os_error(libc::ENOMEM)) };
+    let p = libc::mmap(hint as *mut _, over as usize, libc::PROT_NONE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0);
+    if p == libc::MAP_FAILED {
+        return Err(std::io::Error::last_os_error());
     }
+    let q = p as u64;
+    let base = (q + PAGE16 - 1) & !(PAGE16 - 1);
+    // A trim that fails leaves the reservation half-made: keep its errno, release what is still reserved (only that:
+    // unmapping a gap is what raises EXC_GUARD), and fail.
+    if base > q {
+        if let Err(e) = trim(q, base - q) {
+            libc::munmap(q as *mut _, over as usize);
+            return Err(e);
+        }
+    }
+    let tail = q + over - (base + size);
+    if tail > 0 {
+        if let Err(e) = trim(base + size, tail) {
+            libc::munmap(base as *mut _, (q + over - base) as usize);
+            return Err(e);
+        }
+    }
+    Ok(base)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// (trims so far, the trim that fails; 0 = none): a test makes the nth trim on its own thread fail with EINVAL.
+    static TRIM_FAIL: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Unmap one end of the cache's over-reservation.
+unsafe fn trim(addr: u64, len: u64) -> std::io::Result<()> {
+    #[cfg(test)]
+    {
+        let (n, at) = TRIM_FAIL.with(|c| c.get());
+        TRIM_FAIL.with(|c| c.set((n + 1, at)));
+        if at != 0 && n + 1 == at {
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+        }
+    }
+    if libc::munmap(addr as *mut _, len as usize) == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// The errno a failed cache reservation reports to dyld: the kernel's own, or ENOMEM when there is none.
+fn reservation_errno(e: &std::io::Error) -> i64 {
+    e.raw_os_error().unwrap_or(libc::ENOMEM) as i64
 }
 
 /// Handle `shared_region_map_and_slide_2_np(files_count, files, mappings_count, mappings)`.
 /// Returns 0 or an errno.
 pub fn map_and_slide_2(files_count: u32, files: u64, mappings_count: u32, mappings: u64) -> i64 {
+    map_and_slide_at(CACHE_BASE, files_count, files, mappings_count, mappings)
+}
+
+/// `map_and_slide_2` with the preferred base as a parameter, so a test can use an address of its own.
+fn map_and_slide_at(hint: u64, files_count: u32, files: u64, mappings_count: u32, mappings: u64) -> i64 {
     let files: &[SharedFileNp] = unsafe { std::slice::from_raw_parts(files as *const SharedFileNp, files_count as usize) };
     let maps: &[MappingSlideNp] = unsafe { std::slice::from_raw_parts(mappings as *const MappingSlideNp, mappings_count as usize) };
     if maps.is_empty() {
@@ -79,7 +136,27 @@ pub fn map_and_slide_2(files_count: u32, files: u64, mappings_count: u32, mappin
         return libc::EEXIST as i64;
     }
     let unslid_base = maps[0].address;
-    let slide = CACHE_BASE.wrapping_sub(unslid_base);
+    let ends: Option<Vec<u64>> = maps.iter().map(|m| m.address.checked_add(m.size)).collect();
+    let unslid_end = ends.and_then(|e| e.into_iter().max()).unwrap_or(unslid_base);
+    let span = unslid_end.wrapping_sub(unslid_base).checked_add(PAGE16 - 1).map(|s| s & !(PAGE16 - 1));
+    let span = match span {
+        Some(s) if s > 0 && unslid_end > unslid_base && !maps.iter().any(|m| m.address < unslid_base) => s,
+        _ => {
+            eprintln!("maclator: shared cache mappings do not fit one span from the first mapping, {unslid_base:#x}");
+            return libc::EINVAL as i64;
+        }
+    };
+    let base = match unsafe { reserve_cache(hint, span) } {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("maclator: reserving {span:#x} bytes for the shared cache failed: {e}");
+            return reservation_errno(&e);
+        }
+    };
+    if base != hint {
+        eprintln!("[maclator] shared cache base {hint:#x} unavailable, mapping it at {base:#x} instead");
+    }
+    let slide = base.wrapping_sub(unslid_base);
     let mut ranges = Vec::new();
     let mut fds = Vec::new();
     let mut mi = 0usize;
@@ -91,7 +168,6 @@ pub fn map_and_slide_2(files_count: u32, files: u64, mappings_count: u32, mappin
             let size = m.size as usize;
             let prot = (m.init_prot & 3) as i32; // never map guest code executable on the host
             unsafe {
-                reserve_if_unmapped(addr, size);
                 let p = if f.fd < 0 {
                     // Dynamic config data lives in the caller's memory.
                     let p = libc::mmap(addr as *mut _, size, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_FIXED, -1, 0);
@@ -107,6 +183,7 @@ pub fn map_and_slide_2(files_count: u32, files: u64, mappings_count: u32, mappin
                 };
                 if p == libc::MAP_FAILED || p as u64 != addr {
                     eprintln!("maclator: failed to map shared cache region {:#x}+{:#x}: {}", addr, size, std::io::Error::last_os_error());
+                    libc::munmap(base as *mut _, span as usize);
                     return libc::ENOMEM as i64;
                 }
                 if m.slide_size == 0 {
@@ -131,20 +208,21 @@ pub fn map_and_slide_2(files_count: u32, files: u64, mappings_count: u32, mappin
         }
         if let Err(e) = unsafe { apply_slide_info(info, addr, m.size, slide, unslid_base) } {
             eprintln!("maclator: slide info: {e}");
+            unsafe { libc::munmap(base as *mut _, span as usize) };
             return libc::EINVAL as i64;
         }
         let prot = (m.init_prot & 3) as i32;
         unsafe { libc::mprotect(addr as *mut _, m.size as usize, if prot == 0 { libc::PROT_NONE } else { prot }) };
     }
     if std::env::var_os("MACLATOR_TRACE").is_some() {
-        eprintln!("[maclator] mapped arm64 shared cache at {:#x} (slide {:#x}), {} regions", CACHE_BASE, slide, ranges.len());
+        eprintln!("[maclator] mapped arm64 shared cache at {:#x} (slide {:#x}), {} regions", base, slide, ranges.len());
     }
-    let end = ranges.iter().map(|(a, s)| a + s).max().unwrap_or(CACHE_BASE);
-    *guard = Some(MappedCache { base: CACHE_BASE, slide, ranges });
+    let end = ranges.iter().map(|(a, s)| a + s).max().unwrap_or(base);
+    *guard = Some(MappedCache { base, slide, ranges });
     drop(guard);
     let mut uuid = [0u8; 16];
-    unsafe { std::ptr::copy_nonoverlapping((CACHE_BASE + 88) as *const u8, uuid.as_mut_ptr(), 16) };
-    crate::aot::register_cache(uuid, CACHE_BASE, end);
+    unsafe { std::ptr::copy_nonoverlapping((base + 88) as *const u8, uuid.as_mut_ptr(), 16) };
+    crate::aot::register_cache(uuid, base, end);
     0
 }
 
@@ -1376,42 +1454,110 @@ fn _unused() {
 mod tests {
     use super::*;
 
-    const LEN: usize = 0x8000;
-    // Far above where unhinted mappings land, and one address per test: cargo runs these beside other tests' mappings.
+    const LEN: u64 = 0x8000;
+    const UNSLID: u64 = 0x1_8000_0000;
+    // Far above where unhinted mappings land, and one address per case: cargo runs this beside other tests' mappings.
     const FREE_AT: u64 = 0x2000_0000_0000;
     const OCCUPIED_AT: u64 = 0x2100_0000_0000;
 
-    // A hint lands at a free address and moves off an occupied one, so a second hint says whether the range is mapped.
-    fn is_mapped(addr: u64) -> bool {
+    /// A one-region cache: one file with fd -1, whose bytes are copied from `src`, `len` bytes at UNSLID.
+    fn map_test_cache(hint: u64, src: &[u8], len: u64) -> (i64, Option<MappedCache>) {
+        let files = [SharedFileNp { fd: -1, mappings_count: 1, slide: 0 }];
+        let maps = [MappingSlideNp { address: UNSLID, size: len, file_offset: src.as_ptr() as u64, slide_size: 0, slide_start: 0, max_prot: 3, init_prot: 3 }];
+        *CACHE.lock().unwrap() = None;
+        let rc = map_and_slide_at(hint, 1, files.as_ptr() as u64, 1, maps.as_ptr() as u64);
+        (rc, CACHE.lock().unwrap().take())
+    }
+
+    // One test, three cases in turn: CACHE is process-wide, and a static lock to take turns would be one more
+    // std lock in a static, which the fork-safety scan rightly refuses.
+    #[test]
+    fn the_cache_reservation() {
+        let src: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
         unsafe {
-            let p = libc::mmap(addr as *mut _, LEN, libc::PROT_NONE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0);
-            assert!(p != libc::MAP_FAILED);
-            libc::munmap(p, LEN);
-            p as u64 != addr
+            // The negative control: with its base free, the cache lands exactly there and does not slide.
+            let (rc, got) = map_test_cache(FREE_AT, &src, LEN);
+            assert_eq!(rc, 0, "free base: the cache maps");
+            let c = got.expect("free base: the cache is registered");
+            assert_eq!(c.base, FREE_AT, "free base: it was not used");
+            assert_eq!(c.slide, FREE_AT.wrapping_sub(UNSLID));
+            assert_eq!(std::slice::from_raw_parts(c.base as *const u8, LEN as usize), &src[..]);
+            libc::munmap(c.base as *mut _, LEN as usize);
+
+            // Its base occupied: the cache slides to where the kernel put the reservation, 16 KiB-aligned, and
+            // what held the base is left alone.
+            // 4 KiB, so the kernel's next free address is not 16 KiB-aligned and the round-up is exercised.
+            let occ = libc::mmap(OCCUPIED_AT as *mut _, 0x1000, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0);
+            assert_eq!(occ as u64, OCCUPIED_AT, "control: the occupied base starts free");
+            *(occ as *mut u8) = 0x5a;
+            let (rc, got) = map_test_cache(OCCUPIED_AT, &src, LEN);
+            assert_eq!(rc, 0, "occupied base: the cache maps");
+            let c = got.expect("occupied base: the cache is registered");
+            assert_ne!(c.base, OCCUPIED_AT, "occupied base: the cache was mapped over what holds it");
+            assert_eq!(c.base % PAGE16, 0, "occupied base: a slid cache keeps 16 KiB alignment");
+            assert_eq!(c.slide, c.base.wrapping_sub(UNSLID), "occupied base: slide = base - unslid base");
+            assert_eq!(*(occ as *const u8), 0x5a, "occupied base: what held it was overwritten");
+            assert_eq!(std::slice::from_raw_parts(c.base as *const u8, LEN as usize), &src[..]);
+            libc::munmap(c.base as *mut _, LEN as usize);
+            libc::munmap(occ, 0x1000);
+
+            // reserve_cache itself: the range it returns is still mapped (a reservation given back, as the old
+            // per-region hint did, would leave every MAP_FIXED that follows over unmapped space), and a base it
+            // had to round up is 16 KiB-aligned. A hint lands on a free address and moves off a mapped one, so a
+            // probe at each end says whether the range is still held (mincore cannot tell: it measured 0 either way).
+            let occ = libc::mmap(OCCUPIED_AT as *mut _, 0x1000, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0);
+            assert_eq!(occ as u64, OCCUPIED_AT, "control: the occupied base starts free again");
+            let b = reserve_cache(OCCUPIED_AT, LEN).expect("reserve_cache");
+            assert_ne!(b, OCCUPIED_AT);
+            assert_eq!(b % PAGE16, 0, "reserve_cache: a rounded-up base is not 16 KiB-aligned");
+            for at in [b, b + LEN - 0x1000] {
+                let q = libc::mmap(at as *mut _, 0x1000, libc::PROT_NONE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0);
+                assert!(q != libc::MAP_FAILED);
+                libc::munmap(q, 0x1000);
+                assert_ne!(q as u64, at, "reserve_cache: the range it returned is not mapped at {at:#x}");
+            }
+            libc::munmap(b as *mut _, LEN as usize);
+            libc::munmap(occ, 0x1000);
+
+            // A reservation the kernel cannot make fails the call with ENOMEM and registers nothing.
+            let (rc, got) = map_test_cache(FREE_AT, &src, 1 << 60);
+            assert_eq!(rc, libc::ENOMEM as i64, "failed reservation: the call did not fail");
+            assert!(got.is_none(), "failed reservation: a cache was registered without one");
+        }
+    }
+
+    // A reservation that fails for a reason other than ENOMEM reports that reason, not ENOMEM (the kernel's mmap
+    // gave ENOMEM for every oversized request measured on macOS 27.0.1, arm64, so the errno is set directly here).
+    // A trim that fails, at the head (an unaligned hint, so the kernel's address needs rounding up) or at the tail:
+    // reserve_cache returns that errno and nothing it reserved stays mapped. The probe is a second hint at the same
+    // address, which lands there only if the whole over-reservation was released.
+    #[test]
+    fn a_failed_trim_releases_the_reservation_and_keeps_its_errno() {
+        const TRIM_AT: u64 = 0x2700_0000_0000;
+        let hint = TRIM_AT + 0x1000;
+        unsafe {
+            for (which, nth) in [("head", 1u32), ("tail", 2)] {
+                let probe = libc::mmap(hint as *mut _, (LEN + PAGE16) as usize, libc::PROT_NONE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0);
+                assert_eq!(probe as u64, hint, "control: the {which} range starts free");
+                libc::munmap(probe, (LEN + PAGE16) as usize);
+                TRIM_FAIL.with(|c| c.set((0, nth)));
+                let r = reserve_cache(hint, LEN);
+                let tried = TRIM_FAIL.with(|c| c.get()).0;
+                TRIM_FAIL.with(|c| c.set((0, 0)));
+                let e = r.expect_err(&format!("a failed {which} trim was ignored"));
+                assert_eq!(e.raw_os_error(), Some(libc::EINVAL), "a failed {which} trim lost its errno");
+                assert_eq!(tried, nth, "the {which} trim was never attempted, or trimming went on after it failed");
+                let again = libc::mmap(hint as *mut _, (LEN + PAGE16) as usize, libc::PROT_NONE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0);
+                libc::munmap(again, (LEN + PAGE16) as usize);
+                assert_eq!(again as u64, hint, "after a failed {which} trim the reservation was not released");
+            }
         }
     }
 
     #[test]
-    fn reserve_maps_a_free_range() {
-        assert!(!is_mapped(FREE_AT), "control: the range starts free");
-        unsafe { reserve_if_unmapped(FREE_AT, LEN) };
-        assert!(is_mapped(FREE_AT));
-        unsafe { libc::munmap(FREE_AT as *mut _, LEN) };
-    }
-
-    #[test]
-    fn reserve_leaves_an_occupied_range_alone() {
-        let next = OCCUPIED_AT + LEN as u64;
-        unsafe {
-            let p = libc::mmap(OCCUPIED_AT as *mut _, LEN, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0);
-            assert_eq!(p as u64, OCCUPIED_AT, "control: the range starts free");
-            assert!(!is_mapped(next), "control: the range after it starts free");
-            *(p as *mut u8) = 0x5a;
-            reserve_if_unmapped(OCCUPIED_AT, LEN);
-            assert_eq!(*(p as *const u8), 0x5a);
-            // The hint moved to the next free space, and was given back.
-            assert!(!is_mapped(next));
-            libc::munmap(p, LEN);
-        }
+    fn a_reservation_failure_keeps_its_errno() {
+        assert_eq!(reservation_errno(&std::io::Error::from_raw_os_error(libc::EINVAL)), libc::EINVAL as i64);
+        assert_eq!(reservation_errno(&std::io::Error::from_raw_os_error(libc::EACCES)), libc::EACCES as i64);
+        assert_eq!(reservation_errno(&std::io::Error::other("no errno")), libc::ENOMEM as i64);
     }
 }
