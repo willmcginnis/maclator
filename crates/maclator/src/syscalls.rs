@@ -225,14 +225,65 @@ fn rewrite_fullpath_attribute(cpu: &mut Cpu, n: u64, args: &[u64; 8]) {
     }
 }
 
-fn bsd(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
-    // Path-taking syscalls: (path arg index, dirfd arg index for *at variants).
-    let (pidx, at) = match n {
+/// Path-taking syscalls: (index of the path argument, whether it is an *at call). Every *at call
+/// here takes ONE path, relative to its descriptor in args[0]. The two-path *at calls (renameat
+/// 465, linkat 471, symlinkat 474) are deliberately absent: they pass through unrewritten, each
+/// path against its own descriptor.
+fn path_arg(n: u64) -> (Option<usize>, bool) {
+    match n {
         5 | 398 => (Some(0), false),
         33 | 58 | 188 | 190 | 220 | 338 | 340 => (Some(0), false),
         463 | 464 | 466 | 469 | 470 | 473 | 476 => (Some(1), true),
         _ => (None, false),
+    }
+}
+
+/// The guest path a syscall's name refers to: itself if absolute, else (in an *at call) the
+/// name joined to its descriptor's guest path. `dir` is asked only for a relative, non-empty name
+/// in an *at call. There is no virtual working directory: a relative name outside an *at call, or
+/// through a descriptor with no guest path (AT_FDCWD included), gives None and is not rewritten.
+fn guest_full_path(name: &str, at: bool, dir: impl FnOnce() -> Option<String>) -> Option<String> {
+    if name.starts_with('/') {
+        Some(name.to_string())
+    } else if at && !name.is_empty() {
+        // An empty name is not the directory itself: XNU answers ENOENT for
+        // openat(dirfd, "") and so does the host, so leave it unrewritten. macOS 27's
+        // dyld relies on that: for each name in {arm64e_x1, arm64e} it skips building
+        // the x1 file name unless its own slice is arm64e.x1, calls openat(dirfd, "")
+        // anyway, and moves on only on failure. Joined to the directory's path, the
+        // empty name opened the cache directory and dyld stopped with "shared cache
+        // file pread() failed".
+        dir().map(|b| vpath_join(&b, name))
+    } else {
+        None
+    }
+}
+
+// Flags that make an *at call's descriptor itself load-bearing (values from the macOS SDK's
+// sys/fcntl.h and sys/attr.h).
+const O_RESOLVE_BENEATH: u64 = 0x1000;
+const AT_FDONLY: u64 = 0x0400;
+const AT_RESOLVE_BENEATH: u64 = 0x2000;
+const FSOPT_RESOLVE_BENEATH: u64 = 0x1000;
+
+/// Whether *at call `n`'s flags make its descriptor load-bearing, so that it must not be replaced
+/// by AT_FDCWD and an absolute path: fstatat's AT_FDONLY uses only the descriptor and ignores the
+/// name, and the RESOLVE_BENEATH flags keep the lookup beneath the descriptor. Rewritten, those
+/// calls answered EBADF and ENOTCAPABLE where XNU succeeds; left alone, the host kernel answers
+/// as XNU does, through the host descriptor (for a redirected directory, the sysroot's).
+fn descriptor_bound(n: u64, args: &[u64; 8]) -> bool {
+    let bits = match n {
+        463 | 464 => args[2] & O_RESOLVE_BENEATH,
+        466 => args[3] & AT_RESOLVE_BENEATH,
+        469 | 470 => args[3] & (AT_FDONLY | AT_RESOLVE_BENEATH),
+        476 => args[5] & FSOPT_RESOLVE_BENEATH,
+        _ => 0,
     };
+    bits != 0
+}
+
+fn bsd(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
+    let (pidx, at) = path_arg(n);
     let mut keep: Option<std::ffi::CString> = None;
     let mut guest_path: Option<String> = None;
     if let Some(i) = pidx {
@@ -241,21 +292,7 @@ fn bsd(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
         // instead of the translator faulting on the guest's pointer.
         let name = if args[i] != 0 { guest_cstr(args[i], GUEST_NAME_MAX, crate::guestmem::read) } else { None };
         if let Some(orig) = name {
-            let full = if orig.starts_with('/') {
-                Some(orig.clone())
-            } else if at && !orig.is_empty() {
-                // An empty name is not the directory itself: XNU answers ENOENT for
-                // openat(dirfd, "") and so does the host, so leave it unrewritten. macOS 27's
-                // dyld relies on that: for each name in {arm64e_x1, arm64e} it skips building
-                // the x1 file name unless its own slice is arm64e.x1, calls openat(dirfd, "")
-                // anyway, and moves on only on failure. Joined to the directory's path, the
-                // empty name opened the cache directory and dyld stopped with "shared cache
-                // file pread() failed".
-                let dfd = args[0] as i32;
-                fd_guest_path(dfd).map(|b| vpath_join(&b, &orig))
-            } else {
-                None
-            };
+            let full = guest_full_path(&orig, at, || fd_guest_path(args[0] as i32));
             if TRACE.load(Ordering::Relaxed) {
                 eprintln!("[path] #{n} {orig} -> {full:?}");
             }
@@ -263,9 +300,14 @@ fn bsd(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
                 // A relative path beneath an overlaid directory may be absent
                 // from the payload. In that case fall back to the real guest
                 // absolute path, rather than looking only inside the overlay.
-                let replacement = crate::paths::redirect(&full).or_else(|| {
-                    (at && !orig.starts_with('/') && crate::paths::overlay_root().is_some()).then(|| full.clone())
-                });
+                // Never when the flags bind the call to its descriptor (descriptor_bound).
+                let replacement = if at && descriptor_bound(n, &args) {
+                    None
+                } else {
+                    crate::paths::redirect(&full).or_else(|| {
+                        (at && !orig.starts_with('/') && crate::paths::overlay_root().is_some()).then(|| full.clone())
+                    })
+                };
                 if let Some(new) = replacement {
                     if let Ok(c) = std::ffi::CString::new(new) {
                         args[i] = c.as_ptr() as u64;
@@ -843,5 +885,77 @@ mod tests {
         assert_eq!(guest_cstr(p, GUEST_NAME_MAX, reader(base, &mem, base + 8192)).map(|s| s.len()), Some(2000));
         assert_eq!(guest_cstr(p, 2000, reader(base, &mem, base + 8192)), None);
         assert_eq!(guest_cstr(p, 2001, reader(base, &mem, base + 8192)).map(|s| s.len()), Some(2000));
+    }
+
+    #[test]
+    fn path_arg_covers_only_one_path_calls() {
+        // every *at call's path is args[1], so its descriptor is args[0]
+        for n in [463, 464, 466, 469, 470, 473, 476] {
+            assert_eq!(path_arg(n), (Some(1), true), "*at call {n}");
+        }
+        for n in [5, 398, 33, 58, 188, 190, 220, 338, 340] {
+            assert_eq!(path_arg(n), (Some(0), false), "plain call {n}");
+        }
+        // the two-path calls pass through untouched: renameat, linkat, symlinkat, rename, link, symlink
+        for n in [465, 471, 474, 128, 9, 57] {
+            assert_eq!(path_arg(n), (None, false), "two-path call {n}");
+        }
+    }
+
+    #[test]
+    fn guest_full_path_leaves_an_empty_name_alone() {
+        // An empty name is never joined, and the descriptor's path is not even asked for
+        let asked = std::cell::Cell::new(false);
+        let dir = || { asked.set(true); Some("/System/Library/dyld".to_string()) };
+        assert_eq!(guest_full_path("", true, dir), None);
+        assert!(!asked.get(), "the empty name asked for the descriptor's path");
+        assert_eq!(guest_full_path("", false, || Some("/x".into())), None);
+    }
+
+    #[test]
+    fn guest_full_path_joins_only_relative_names_in_at_calls() {
+        let d = || Some("/System/Library/dyld".to_string());
+        assert_eq!(guest_full_path("dyld_shared_cache_arm64e", true, d).as_deref(),
+                   Some("/System/Library/dyld/dyld_shared_cache_arm64e"));
+        assert_eq!(guest_full_path("x", true, || Some("/".into())).as_deref(), Some("/x"));
+        assert_eq!(guest_full_path("/etc/hosts", true, || None).as_deref(), Some("/etc/hosts"));
+        assert_eq!(guest_full_path("/etc/hosts", false, || None).as_deref(), Some("/etc/hosts"));
+        // no virtual cwd: a relative name outside an *at call, or through AT_FDCWD (no guest path)
+        assert_eq!(guest_full_path("x", false, || Some("/System".into())), None);
+        assert_eq!(guest_full_path("x", true, || None), None);
+    }
+
+    fn a(i: usize, v: u64) -> [u64; 8] {
+        let mut x = [0u64; 8];
+        x[i] = v;
+        x
+    }
+
+    #[test]
+    fn descriptor_bound_flags() {
+        // fstatat, fstatat64: AT_FDONLY and AT_RESOLVE_BENEATH bind; AT_SYMLINK_NOFOLLOW does not
+        for n in [469, 470] {
+            assert!(descriptor_bound(n, &a(3, AT_FDONLY)));
+            assert!(descriptor_bound(n, &a(3, AT_RESOLVE_BENEATH)));
+            assert!(descriptor_bound(n, &a(3, AT_FDONLY | 0x20)));
+            assert!(!descriptor_bound(n, &a(3, 0x20)));
+            assert!(!descriptor_bound(n, &a(3, 0)));
+        }
+        for n in [463, 464] {
+            assert!(descriptor_bound(n, &a(2, O_RESOLVE_BENEATH)));
+            assert!(!descriptor_bound(n, &a(2, 0x0201))); // O_WRONLY | O_CREAT
+            // must-fail control: AT_FDONLY's value in openat's oflag is O_TRUNC, not a binding
+            assert!(!descriptor_bound(n, &a(2, AT_FDONLY)));
+            // a flag in the wrong argument slot does not count
+            assert!(!descriptor_bound(n, &a(3, O_RESOLVE_BENEATH)));
+        }
+        assert!(descriptor_bound(466, &a(3, AT_RESOLVE_BENEATH)));
+        assert!(!descriptor_bound(466, &a(3, 0x10))); // AT_EACCESS
+        assert!(!descriptor_bound(466, &a(3, AT_FDONLY))); // fd-only means nothing to faccessat
+        assert!(descriptor_bound(476, &a(5, FSOPT_RESOLVE_BENEATH)));
+        assert!(!descriptor_bound(476, &a(5, 0x1))); // FSOPT_NOFOLLOW
+        assert!(!descriptor_bound(476, &a(3, FSOPT_RESOLVE_BENEATH)));
+        assert!(!descriptor_bound(473, &[u64::MAX; 8])); // readlinkat has no flags
+        assert!(!descriptor_bound(5, &[u64::MAX; 8])); // not an *at call
     }
 }
