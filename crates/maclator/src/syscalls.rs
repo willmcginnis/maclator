@@ -243,7 +243,14 @@ fn bsd(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
         if let Some(orig) = name {
             let full = if orig.starts_with('/') {
                 Some(orig.clone())
-            } else if at {
+            } else if at && !orig.is_empty() {
+                // An empty name is not the directory itself: XNU answers ENOENT for
+                // openat(dirfd, "") and so does the host, so leave it unrewritten. macOS 27's
+                // dyld relies on that: for each name in {arm64e_x1, arm64e} it skips building
+                // the x1 file name unless its own slice is arm64e.x1, calls openat(dirfd, "")
+                // anyway, and moves on only on failure. Joined to the directory's path, the
+                // empty name opened the cache directory and dyld stopped with "shared cache
+                // file pread() failed".
                 let dfd = args[0] as i32;
                 fd_guest_path(dfd).map(|b| vpath_join(&b, &orig))
             } else {
