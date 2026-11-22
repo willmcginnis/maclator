@@ -1212,15 +1212,60 @@ fn stays_beneath(name: &str) -> bool {
 
 /// Whether host descriptor `fd` is the directory at host path `host` (same device and inode;
 /// `host` is followed through symlinks, as the descriptor's open was). False when either is
-/// unreadable.
-fn same_host_dir(fd: i32, host: &str) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(fd, &mut st) } != 0 {
-        return false;
-    }
-    std::fs::metadata(host).is_ok_and(|m| m.dev() == st.st_dev as u64 && m.ino() == st.st_ino as u64)
+/// unreadable (None). Returns that (device, inode). The descriptor is read once, and the
+/// pair compared is the pair returned: read twice, a guest thread's dup2 between the reads let the
+/// check pass on one directory and act on the other.
+fn same_host_dir(fd: i32, host: &str) -> Option<(u64, u64)> {
+    let k = fd_dev_ino(fd)?;
+    let same = path_dev_ino(host) == Some(k);
+    same.then_some(k)
 }
+
+/// The (device, inode) host descriptor `fd` is on; None when fstat fails.
+fn fd_dev_ino(fd: i32) -> Option<(u64, u64)> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    (unsafe { libc::fstat(fd, &mut st) } == 0).then_some((st.st_dev as u64, st.st_ino as u64))
+}
+
+/// The (device, inode) at host path `p`, followed through symlinks; None when stat fails.
+fn path_dev_ino(p: &str) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino()))
+}
+
+/// The host's own path for descriptor `fd` (F_GETPATH), unmapped; None when it cannot be read.
+fn fd_host_getpath(fd: i32) -> Option<String> {
+    let mut path = [0u8; 1024];
+    if fd < 0 || unsafe { libc::fcntl(fd, libc::F_GETPATH, path.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let end = path.iter().position(|&c| c == 0)?;
+    std::str::from_utf8(&path[..end]).ok().map(str::to_string)
+}
+
+/// Where a kept NOFOLLOW_ANY call goes. Not
+/// through the guest's descriptor number (a guest thread's dup2 after the check would move the
+/// call; E2 v2's race) and not through a pin: a pin is a descriptor of the
+/// directory, and closing any descriptor of a vnode releases the process's POSIX locks on it, so a
+/// pin could never be closed, a full table sent the call to the absolute rewrite (ELOOP through a
+/// symlinked sysroot path), a duplicate kept the guest's flock locks alive past its own last
+/// close, and every pin took a number from the guest's descriptor table. Instead the call is
+/// rewritten to the directory's canonical host path, F_GETPATH of the checked descriptor, which
+/// has no symlink in it (so NOFOLLOW_ANY walks it as XNU walks the descriptor: measured on macOS 27.0.1, arm64,
+/// /var/... gives ELOOP and its F_GETPATH spelling /private/var/... opens), then `name`. The path
+/// is accepted only when it is still the directory the check saw (`dir`, from the check's single
+/// fstat): a dup2 between the check and F_GETPATH gives another directory's path, and the caller
+/// checks again. None when F_GETPATH or the stat fails or the directory differs. No descriptor is
+/// made, so nothing is ever closed, nothing is shared, and nothing is held.
+fn canonical_dir(fd: i32, dir: (u64, u64), getpath: impl FnOnce(i32) -> Option<String>, stat: impl FnOnce(&str) -> Option<(u64, u64)>) -> Option<String> {
+    let p = getpath(fd)?;
+    (stat(&p) == Some(dir)).then_some(p)
+}
+
+/// How many times a kept NOFOLLOW_ANY call re-checks when the descriptor's path is not the
+/// directory just checked (a guest thread's dup2 or rename in between) before it goes to the
+/// rewrite, as a call that fails the check does.
+const CANONICAL_TRIES: usize = 3;
 
 /// The `inside` test for a NOFOLLOW_ANY call through descriptor `fd` with name `name`, whose
 /// recorded guest path is `guest` (fd_guest_path). All three must hold:
@@ -1232,10 +1277,47 @@ fn same_host_dir(fd: i32, host: &str) -> bool {
 ///    descriptor opened by a call that was itself kept (openat(rootfd, "System/Library/dyld",
 ///    O_RESOLVE_BENEATH)) is recorded with the redirected guest path while it sits on the
 ///    host's real directory.
-fn nofollow_any_inside(name: &str, fd: i32, guest: Option<String>, redirect: impl FnOnce(&str) -> Option<String>) -> bool {
-    !name.starts_with('/')
-        && stays_beneath(name)
-        && guest.and_then(|d| redirect(&d)).is_some_and(|h| same_host_dir(fd, &h))
+///
+/// Returns the directory, as (device, inode), when all three hold. The lexical
+/// tests run first and the redirect next, so a call that fails them costs no system call.
+fn nofollow_any_inside(name: &str, fd: i32, guest: Option<String>, redirect: impl FnOnce(&str) -> Option<String>) -> Option<((u64, u64), String)> {
+    if name.starts_with('/') || !stays_beneath(name) {
+        return None;
+    }
+    let h = guest.and_then(|d| redirect(&d))?;
+    same_host_dir(fd, &h).map(|k| (k, h))
+}
+
+/// Where a kept NOFOLLOW_ANY call that passed the check goes.
+#[derive(Debug, PartialEq, Eq)]
+enum Kept {
+    /// To `path`, the checked directory's canonical host path and the name, at AT_FDCWD.
+    Path { path: String, redirected: String },
+    /// Through the guest's own descriptor number, as it came: `path` would reach MAXPATHLEN.
+    Number { redirected: String },
+}
+
+/// The route for a kept call through a
+/// directory whose canonical host path (F_GETPATH) is `canonical` and whose redirected path (the
+/// guest's record through paths::redirect, which the check found to be the same directory) is
+/// `redirected`, for relative name `name`. The joined path `canonical/name` can reach
+/// MAXPATHLEN where the name alone, through the descriptor, does not (natively XNU limits the name a
+/// call passes, not the directory's own path); the host would answer ENAMETOOLONG, as the absolute
+/// rewrite does. Then the call goes through the guest's number as it came, which E2 v2 did for every
+/// such call: right unless a guest thread's dup2 moves the number between the check and the call
+/// (Inferred; E2 v2's race, now only for a joined path of 1,024 bytes or more). The
+/// place is spelled by the redirect (`redirected/name`) for inside_sysroot, whose prefix is the
+/// sysroot as canonicalised when it was set (realpath); F_GETPATH spells some of the same directories
+/// otherwise (measured on macOS 27.0.1, arm64: a sysroot named under /System/Volumes/Data/private/var keeps that
+/// spelling in realpath while F_GETPATH answers /private/var; case and Unicode variants came back
+/// alike from both), so the canonical path's byte prefix can miss the sysroot.
+fn kept_route(canonical: &str, redirected: &str, name: &str) -> Kept {
+    let redirected = format!("{redirected}/{name}");
+    if canonical.len() + 1 + name.len() >= MAXPATHLEN {
+        Kept::Number { redirected }
+    } else {
+        Kept::Path { path: format!("{canonical}/{name}"), redirected }
+    }
 }
 
 fn bsd(cpu: &mut Cpu, n: u64, args: [u64; 8]) {
@@ -1252,6 +1334,7 @@ fn bsd_read(cpu: &mut Cpu, n: u64, mut args: [u64; 8], read: impl FnOnce(u64) ->
     let mut guest_path: Option<String> = None;
     let mut in_sysroot = false;
     let mut unread: Option<u64> = None;
+    let mut canon: Option<Kept> = None;
     if let Some(i) = pidx {
         let name = call_name(n, &args, i, |p| {
             let name = read(p);
@@ -1282,12 +1365,45 @@ fn bsd_read(cpu: &mut Cpu, n: u64, mut args: [u64; 8], read: impl FnOnce(u64) ->
                 // from the payload. In that case fall back to the real guest
                 // absolute path, rather than looking only inside the overlay.
                 // Never when the flags bind the call to its descriptor (keep_descriptor).
-                let inside = || {
+                // A NOFOLLOW_ANY call that passes the check goes to the checked
+                // directory's canonical host path (canonical_dir), not through the guest's number except as kept_route says,
+                // and never through a descriptor Maclator made.
+                // kept_route decides between that path and
+                // the guest's number (a joined path reaching MAXPATHLEN), and spells the call's place
+                // by the redirect for inside_sysroot.
+                let check = || {
                     let fd = args[0] as i32;
-                    nofollow_any_inside(&orig, fd, fd_guest_path(fd), crate::paths::redirect)
-                };
-                let replacement = if at && keep_descriptor(n, &args, inside) {
+                    for _ in 0..CANONICAL_TRIES {
+                        let (dir, h) = nofollow_any_inside(&orig, fd, fd_guest_path(fd), crate::paths::redirect)?;
+                        if let Some(p) = canonical_dir(fd, dir, fd_host_getpath, path_dev_ino) {
+                            return Some(kept_route(&p, &h, &orig));
+                        }
+                    }
                     None
+                };
+                let inside = || {
+                    canon = check();
+                    canon.is_some()
+                };
+                let mut spelled: Option<String> = None;
+                let replacement = if at && keep_descriptor(n, &args, inside) {
+                    match canon.take() {
+                        Some(Kept::Path { path, redirected }) => {
+                            if TRACE.load(Ordering::Relaxed) {
+                                eprintln!("[canonical] #{n} {orig} -> {path}");
+                            }
+                            spelled = Some(redirected);
+                            Some(path)
+                        }
+                        Some(Kept::Number { redirected }) => {
+                            if TRACE.load(Ordering::Relaxed) {
+                                eprintln!("[canonical] #{n} {orig}: kept on descriptor {} (the joined path reaches MAXPATHLEN)", args[0] as i32);
+                            }
+                            spelled = Some(redirected);
+                            None
+                        }
+                        None => None,
+                    }
                 } else if host_as_is {
                     Some(full.clone())
                 } else {
@@ -1296,7 +1412,7 @@ fn bsd_read(cpu: &mut Cpu, n: u64, mut args: [u64; 8], read: impl FnOnce(u64) ->
                     }).or_else(|| left_the_prefix(&before, &full, crate::paths::redirect))
                 };
                 if let Some(new) = replacement {
-                    let ins = inside_sysroot(&new, crate::paths::cache_dir().as_deref());
+                    let ins = inside_sysroot(spelled.as_deref().unwrap_or(&new), crate::paths::cache_dir().as_deref());
                     if let Ok(c) = std::ffi::CString::new(new) {
                         args[i] = c.as_ptr() as u64;
                         if at {
@@ -1305,6 +1421,8 @@ fn bsd_read(cpu: &mut Cpu, n: u64, mut args: [u64; 8], read: impl FnOnce(u64) ->
                         keep = Some(c);
                         in_sysroot = ins;
                     }
+                } else if let Some(sp) = spelled {
+                    in_sysroot = inside_sysroot(&sp, crate::paths::cache_dir().as_deref());
                 }
                 guest_path = Some(full);
             }
@@ -2392,18 +2510,18 @@ mod tests {
         let g = || Some("/System/Library/dyld".to_string());
         let to = |p: &std::path::Path| { let p = p.to_string_lossy().into_owned(); move |_: &str| Some(p.clone()) };
         // the descriptor is the redirected directory: by its own path, or through a symlink to it
-        assert!(nofollow_any_inside("dyld_shared_cache_arm64e", s.as_raw_fd(), g(), to(&sys)));
-        assert!(nofollow_any_inside("dyld_shared_cache_arm64e", s.as_raw_fd(), g(), to(&link)));
-        assert!(nofollow_any_inside("a/../x", s.as_raw_fd(), g(), to(&sys)));
+        assert!(nofollow_any_inside("dyld_shared_cache_arm64e", s.as_raw_fd(), g(), to(&sys)).is_some());
+        assert!(nofollow_any_inside("dyld_shared_cache_arm64e", s.as_raw_fd(), g(), to(&link)).is_some());
+        assert!(nofollow_any_inside("a/../x", s.as_raw_fd(), g(), to(&sys)).is_some());
         // The guest path is redirected, but the host descriptor sits elsewhere
-        assert!(!nofollow_any_inside("dyld_shared_cache_arm64e", o.as_raw_fd(), g(), to(&sys)));
+        assert!(nofollow_any_inside("dyld_shared_cache_arm64e", o.as_raw_fd(), g(), to(&sys)).is_none());
         // A name that climbs out of the descriptor
-        assert!(!nofollow_any_inside("../sys/x", s.as_raw_fd(), g(), to(&sys)));
+        assert!(nofollow_any_inside("../sys/x", s.as_raw_fd(), g(), to(&sys)).is_none());
         // an absolute name, no guest path, a guest path that is not redirected, a closed fd
-        assert!(!nofollow_any_inside("/x", s.as_raw_fd(), g(), to(&sys)));
-        assert!(!nofollow_any_inside("x", s.as_raw_fd(), None, to(&sys)));
-        assert!(!nofollow_any_inside("x", s.as_raw_fd(), g(), |_: &str| None));
-        assert!(!nofollow_any_inside("x", -1, g(), to(&sys)));
+        assert!(nofollow_any_inside("/x", s.as_raw_fd(), g(), to(&sys)).is_none());
+        assert!(nofollow_any_inside("x", s.as_raw_fd(), None, to(&sys)).is_none());
+        assert!(nofollow_any_inside("x", s.as_raw_fd(), g(), |_: &str| None).is_none());
+        assert!(nofollow_any_inside("x", -1, g(), to(&sys)).is_none());
         drop(s);
         drop(o);
         std::fs::remove_file(&link).unwrap();
@@ -3159,5 +3277,138 @@ mod tests {
         set_len(64);
         assert_eq!(call(274, [hm.as_ptr() as u64, 10, buf, lenp, newp, 4, 0, 0]), Err(libc::EPERM as u64));
         unsafe { libc::munmap(m, 2 * pg) };
+    }
+
+    #[test]
+    fn a_kept_call_goes_to_the_canonical_path_of_the_directory_that_was_checked() {
+        // No descriptor is made for a kept call.
+        use std::os::unix::io::AsRawFd;
+        let base = std::env::temp_dir().join(format!("maclator-l3-test-{}", std::process::id()));
+        let (a, b) = (base.join("a"), base.join("b"));
+        for d in [&a, &b] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(a.join("only-a"), b"").unwrap();
+        // a, reached through a symlink: the test's temp dir is /var/folders/..., and /var is one
+        let link = base.join("link-a");
+        std::os::unix::fs::symlink(&a, &link).unwrap();
+        let da = std::fs::File::open(&link).unwrap();
+        let db = std::fs::File::open(&b).unwrap();
+        let (fa, fb) = (da.as_raw_fd(), db.as_raw_fd());
+        let (ka, kb) = (fd_dev_ino(fa).unwrap(), fd_dev_ino(fb).unwrap());
+        let nofollow_any_open = |path: &str| -> Result<(), i32> {
+            let c = std::ffi::CString::new(path).unwrap();
+            let r = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | O_NOFOLLOW_ANY as i32) };
+            if r < 0 {
+                return Err(unsafe { *libc::__error() });
+            }
+            unsafe { libc::close(r) };
+            Ok(())
+        };
+        // 1. the canonical path is a's, has no symlink in it, and opens under NOFOLLOW_ANY
+        let p = canonical_dir(fa, ka, fd_host_getpath, path_dev_ino).expect("a's own path");
+        assert_eq!(path_dev_ino(&p), Some(ka));
+        assert_eq!(nofollow_any_open(&format!("{p}/only-a")), Ok(()));
+        // must-fail control: the same file by the path the descriptor was opened with crosses a
+        // symlink (link-a, and /var), which NOFOLLOW_ANY refuses: the rewrite L v3 never takes
+        let given = format!("{}/only-a", link.to_str().unwrap());
+        assert_eq!(nofollow_any_open(&given), Err(libc::ELOOP));
+        // 2. the check saw a, then a guest thread's dup2 put b on the number: F_GETPATH answers b's
+        //    path, which is not a, so no path (the caller checks again)
+        let g = unsafe { libc::dup(fa) };
+        assert_eq!(canonical_dir(g, ka, |fd| { assert_eq!(unsafe { libc::dup2(fb, fd) }, fd); fd_host_getpath(fd) }, path_dev_ino), None);
+        assert_eq!(canonical_dir(g, kb, fd_host_getpath, path_dev_ino).map(|p| path_dev_ino(&p)), Some(Some(kb)), "control: b's own");
+        // 3. a path that names something else by the time it is stat'd (a rename in between) is
+        //    refused; an unreadable descriptor or path gives none
+        assert_eq!(canonical_dir(fa, ka, fd_host_getpath, |_: &str| Some(kb)), None);
+        assert_eq!(canonical_dir(-1, ka, fd_host_getpath, path_dev_ino), None);
+        assert_eq!(canonical_dir(fa, ka, |_| None, path_dev_ino), None);
+        // 4. the guest's POSIX lock on a survives (no descriptor of a was made and closed): another
+        //    process still sees it
+        let mut lk: libc::flock = unsafe { std::mem::zeroed() };
+        lk.l_type = libc::F_RDLCK as i16;
+        lk.l_whence = libc::SEEK_SET as i16;
+        assert_eq!(unsafe { libc::fcntl(fa, libc::F_SETLK, &lk as *const libc::flock) }, 0);
+        assert!(canonical_dir(fa, ka, fd_host_getpath, path_dev_ino).is_some());
+        let ca = std::ffi::CString::new(a.to_str().unwrap()).unwrap();
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            let f = unsafe { libc::open(ca.as_ptr(), libc::O_RDONLY) };
+            let mut q: libc::flock = unsafe { std::mem::zeroed() };
+            q.l_type = libc::F_WRLCK as i16;
+            q.l_whence = libc::SEEK_SET as i16;
+            let r = unsafe { libc::fcntl(f, libc::F_GETLK, &mut q as *mut libc::flock) };
+            unsafe { libc::_exit(if r != 0 { 3 } else if q.l_type == libc::F_UNLCK as i16 { 1 } else { 0 }) };
+        }
+        let mut st = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut st, 0) }, pid);
+        assert!(libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0, "the lock is still held (child status {st:#x})");
+        unsafe { libc::close(g) };
+        drop((da, db));
+        std::fs::remove_file(&link).unwrap();
+        std::fs::remove_file(a.join("only-a")).unwrap();
+        for d in [&a, &b, &base] {
+            std::fs::remove_dir(d).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_kept_route_reaching_maxpathlen_or_spelled_otherwise_stays_right() {
+        // The joined path is used up to 1,023 bytes; at 1,024 the call keeps the guest's number
+        let d = format!("/{}", "d".repeat(600));
+        let name = |k: usize| "n".repeat(k);
+        let r = "/r/sys/x";
+        let fits = 1023 - d.len() - 1;
+        assert_eq!(kept_route(&d, r, &name(fits)), Kept::Path { path: format!("{d}/{}", name(fits)), redirected: format!("{r}/{}", name(fits)) });
+        assert_eq!(kept_route(&d, r, &name(fits + 1)), Kept::Number { redirected: format!("{r}/{}", name(fits + 1)) });
+        assert!(matches!(kept_route("/a", r, "b"), Kept::Path { .. }), "control: a short path");
+        // the boundary is the host's: a 1,023-byte path is looked up, a 1,024-byte one is ENAMETOOLONG
+        let probe = |len: usize| -> i32 {
+            let p = std::ffi::CString::new(format!("/{}", "x".repeat(len - 1))).unwrap();
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            unsafe { libc::stat(p.as_ptr(), &mut st) };
+            unsafe { *libc::__error() }
+        };
+        assert_eq!(probe(1023), libc::ENAMETOOLONG, "a 255+ byte component is too long on its own: the probe's own control");
+        let deep = |len: usize| -> i32 {
+            let mut p = String::new();
+            while p.len() + 101 <= len {
+                p.push('/');
+                p.push_str(&"y".repeat(100));
+            }
+            while p.len() < len {
+                p.push('/');
+                if p.len() < len {
+                    p.push_str(&"z".repeat(len - p.len()));
+                }
+            }
+            assert_eq!(p.len(), len);
+            let c = std::ffi::CString::new(p).unwrap();
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            unsafe { libc::stat(c.as_ptr(), &mut st) };
+            unsafe { *libc::__error() }
+        };
+        assert_eq!(deep(1023), libc::ENOENT, "a 1,023-byte path is looked up");
+        assert_eq!(deep(1024), libc::ENAMETOOLONG, "a 1,024-byte path is not");
+        // inside_sysroot is asked with the redirect's spelling, whose prefix is the sysroot's
+        let sysroot = "/System/Volumes/Data/private/var/w/sys";
+        let k = kept_route("/private/var/w/sys/d00", &format!("{sysroot}/d00"), "racefile");
+        let Kept::Path { path, redirected } = k else { panic!("a short path is a Path") };
+        assert!(inside_sysroot(&redirected, Some(sysroot)));
+        assert!(!inside_sysroot(&path, Some(sysroot)), "must-fail control: the F_GETPATH spelling misses the sysroot");
+        // and the spelling difference is real: a directory opened by its /System/Volumes/Data name has a
+        // /private F_GETPATH (the test's temp dir is /var/folders/...), while realpath keeps the name given
+        use std::os::unix::io::AsRawFd;
+        let t = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let svd = format!("/System/Volumes/Data{}", t.display());
+        if let Ok(f) = std::fs::File::open(&svd) {
+            let gp = fd_host_getpath(f.as_raw_fd()).unwrap();
+            assert!(!gp.starts_with("/System/Volumes/Data/"), "F_GETPATH {gp}");
+            assert_eq!(path_dev_ino(&gp), fd_dev_ino(f.as_raw_fd()));
+            let rp = std::fs::canonicalize(&svd).unwrap();
+            assert!(rp.starts_with("/System/Volumes/Data/"), "realpath {}", rp.display());
+        } else {
+            eprintln!("no /System/Volumes/Data spelling of {} here: the measurement half skipped", t.display());
+        }
     }
 }
