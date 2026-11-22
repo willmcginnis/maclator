@@ -2067,6 +2067,13 @@ pub(crate) fn ld_st_single(cpu: &mut Cpu, insn: u32) -> R {
     let size = bits(insn, 11, 10);
     let rn = bits(insn, 9, 5);
     let rt = bits(insn, 4, 0);
+    // LDAP1/STL1 {Vt.D}[i] (FEAT_LRCPC3) is the no-offset form with Rm=00001. Every other
+    // no-offset form needs Rm=0, so any other non-zero Rm is unallocated: refuse it rather
+    // than run it as a plain LD1/ST1. STL1 is a store-release and gets the fence below.
+    let lrcpc3 = !post && rm == 1 && r == 0 && opcode == 0b100 && s == 0 && size == 0b01;
+    if !post && rm != 0 && !lrcpc3 {
+        return Err(unimpl(insn));
+    }
     let selem = ((opcode & 1) << 1 | r) + 1;
     let mut scale = opcode >> 1;
     let base = cpu.xs(rn);
@@ -2125,6 +2132,9 @@ pub(crate) fn ld_st_single(cpu: &mut Cpu, insn: u32) -> R {
             }
             addr += eb as u64;
         }
+    }
+    if lrcpc3 && !load {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst); // STL1: RCsc release
     }
     if post {
         let inc = if rm == 31 { addr - base } else { cpu.xr(rm) };

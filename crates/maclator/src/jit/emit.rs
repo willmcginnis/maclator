@@ -2097,6 +2097,14 @@ impl<'a> E<'a> {
 
     /// Acquire/release loads and stores and LSE atomics. x86's TSO ordering already gives
     /// acquire/release semantics for plain accesses, and LOCK-prefixed ops are full barriers.
+    /// But a store-release followed by a load-acquire (LDAR) must not be reordered (RCsc),
+    /// and TSO lets a later load pass an earlier store, so STLR, STLLR and STLUR (every size)
+    /// end with MFENCE, as the interpreter's fence(SeqCst) does. STLLR is a Store-LORelease:
+    /// outside any LORegion it is an ordinary store-release (Arm ARM DDI0487J.a B2.3.12-13),
+    /// and nothing here configures a LORegion. LDAPR/LDAPUR (RCpc) may pass, so need none.
+    /// Other store-release forms are not translated here: exclusives, CAS and the LSE ops go
+    /// to the interpreter or use LOCK-prefixed/XCHG ops; STL1 is routed to the interpreter in
+    /// `ldst`; STLR pre-index, STILP and SIMD STLUR are unimplemented in both and abort.
     fn try_atomics(&mut self, insn: u32) -> Option<bool> {
         let rt = bits(insn, 4, 0);
         let rn = bits(insn, 9, 5);
@@ -2106,7 +2114,11 @@ impl<'a> E<'a> {
         if insn & 0x3FBF_7C00 == 0x089F_7C00 {
             let load = bit(insn, 22) != 0;
             self.ldx(rax, rn, true);
-            return Some(self.access(rt, false, size, load as u32, false));
+            let ok = self.access(rt, false, size, load as u32, false);
+            if ok && !load {
+                a!(self, mfence()); // STLR (o0=1) and STLLR (o0=0): both store-release here
+            }
+            return Some(ok);
         }
         // LDAPR (RCpc)
         if insn & 0x3FFF_FC00 == 0x38BF_C000 {
@@ -2122,7 +2134,11 @@ impl<'a> E<'a> {
                 a!(self, add(rax, rcx));
             }
             let opc = bits(insn, 23, 22);
-            return Some(self.access_sized(rt, false, size, opc));
+            let ok = self.access_sized(rt, false, size, opc);
+            if ok && opc == 0 {
+                a!(self, mfence()); // STLUR is a store-release, like STLR
+            }
+            return Some(ok);
         }
         // CAS/CASA/CASL/CASAL
         if insn & 0x3FA0_7C00 == 0x08A0_7C00 {
@@ -2224,6 +2240,9 @@ impl<'a> E<'a> {
             if let Some(r) = self.try_atomics(insn) {
                 return r;
             }
+        } else if insn & 0xBFBF_FC00 == 0x0D01_8400 {
+            // LDAP1/STL1 (FEAT_LRCPC3): leave to the interpreter, which fences STL1
+            return false;
         } else if insn & 0xBF00_0000 == 0x0C00_0000 || insn & 0xBF00_0000 == 0x0D00_0000 {
             // AdvSIMD load/store structure forms
             return self.simd_fp(insn);

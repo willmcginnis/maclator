@@ -25,7 +25,11 @@ pub(crate) fn ldst(cpu: &mut Cpu, insn: u32) -> R {
             let size = bits(insn, 31, 30);
             let opc = bits(insn, 23, 22);
             let addr = cpu.xs(rn).wrapping_add(sext(bits(insn, 20, 12) as u64, 9));
-            return ld_st_gpr(cpu, rt, addr, size, opc, true);
+            let r = ld_st_gpr(cpu, rt, addr, size, opc, true);
+            if opc == 0 {
+                fence(Ordering::SeqCst); // STLUR: store-release, as STLR below
+            }
+            return r;
         }
         0b011000 | 0b011100 => {
             // load literal
@@ -353,11 +357,10 @@ fn exclusive(cpu: &mut Cpu, insn: u32) -> R {
                     cpu.setx(rt, v);
                 } else {
                     // Store-release followed by a possible load-acquire must not
-                    // be reordered (RCsc), so use a full fence on x86.
+                    // be reordered (RCsc), so use a full fence on x86. STLLR (o0=0)
+                    // too: with no LORegion it is an ordinary store-release.
                     write_sized(addr, nb, cpu.xr(rt));
-                    if o0 != 0 {
-                        fence(Ordering::SeqCst);
-                    }
+                    fence(Ordering::SeqCst);
                 }
             }
             _ => {
