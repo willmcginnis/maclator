@@ -96,6 +96,50 @@ fn guest_cstr(p: u64, max: usize, mut read: impl FnMut(u64, &mut [u8]) -> bool) 
     None
 }
 
+fn guest_name(p: u64) -> Option<String> {
+    guest_cstr(p, GUEST_NAME_MAX, crate::guestmem::read)
+}
+
+/// Whether XNU never reads call `n`'s name: fstatat and fstatat64 with AT_FDONLY use the descriptor
+/// alone (xnu-12377.1.9 bsd/vfs/vfs_syscalls.c, fstatat_internal: fp_getfvp, no nameiat).
+fn name_unread(n: u64, args: &[u64; 8]) -> bool {
+    matches!(n, 469 | 470) && args[3] & AT_FDONLY != 0
+}
+
+/// The name bsd() looks at for path argument `i`, or None to pass the call through as it came:
+/// a NULL name, a name XNU never reads (name_unread; `read` is not called), or one `read` cannot
+/// read in full. Passed through, the host kernel answers as XNU does: EFAULT where it reads the
+/// name, and its own earlier answer where it checks something first (an invalid fstatat or
+/// faccessat flag is EINVAL before the name is read).
+fn call_name(n: u64, args: &[u64; 8], i: usize, read: impl FnOnce(u64) -> Option<String>) -> Option<String> {
+    let p = args[i];
+    if p == 0 {
+        return None;
+    }
+    let trace = TRACE.load(Ordering::Relaxed);
+    if name_unread(n, args) {
+        if trace {
+            eprintln!("[path] #{n} {p:#x} not read (AT_FDONLY): passed through");
+        }
+        return None;
+    }
+    let name = read(p);
+    if name.is_none() && trace {
+        eprintln!("[path] #{n} {p:#x} unreadable: passed through");
+    }
+    name
+}
+
+/// What to say when call `n`'s name at `p` could not be read and the host call still succeeded:
+/// the kernel read what guestmem::read could not, so it walked the guest's path as it came, with
+/// no redirect, into the host's own files. Reaches stderr without --trace: nothing else shows it.
+/// A failed host call says nothing: that is the answer an unreadable name is expected to get.
+fn unread_name_warning(n: u64, p: u64, host_ok: bool) -> Option<String> {
+    host_ok.then(|| {
+        format!("[maclator] warning: #{n} name at {p:#x} could not be read but the host call succeeded: it ran unredirected")
+    })
+}
+
 /// Handle SVC. `cpu.pc` already points after the SVC.
 pub fn handle_svc(cpu: &mut Cpu) {
     let num = cpu.x[16] as u32 as i32;
@@ -360,15 +404,27 @@ fn nofollow_any_inside(name: &str, fd: i32, guest: Option<String>, redirect: imp
         && guest.and_then(|d| redirect(&d)).is_some_and(|h| same_host_dir(fd, &h))
 }
 
-fn bsd(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
+fn bsd(cpu: &mut Cpu, n: u64, args: [u64; 8]) {
+    if let Some(warning) = bsd_read(cpu, n, args, guest_name) {
+        eprintln!("{warning}");
+    }
+}
+
+/// bsd() with its name reader a parameter, so a test can give it a memory that refuses a name the
+/// kernel can read. Returns unread_name_warning's answer for this call.
+fn bsd_read(cpu: &mut Cpu, n: u64, mut args: [u64; 8], read: impl FnOnce(u64) -> Option<String>) -> Option<String> {
     let (pidx, at) = path_arg(n);
     let mut keep: Option<std::ffi::CString> = None;
     let mut guest_path: Option<String> = None;
+    let mut unread: Option<u64> = None;
     if let Some(i) = pidx {
-        // A name we cannot read (or longer than GUEST_NAME_MAX) is passed through untouched:
-        // the host kernel then returns the appropriate error (EFAULT for an unreadable name),
-        // instead of the translator faulting on the guest's pointer.
-        let name = if args[i] != 0 { guest_cstr(args[i], GUEST_NAME_MAX, crate::guestmem::read) } else { None };
+        let name = call_name(n, &args, i, |p| {
+            let name = read(p);
+            if name.is_none() {
+                unread = Some(p);
+            }
+            name
+        });
         if let Some(orig) = name {
             let full = guest_full_path(&orig, at, || fd_guest_path(args[0] as i32));
             if TRACE.load(Ordering::Relaxed) {
@@ -405,6 +461,7 @@ fn bsd(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
     }
     bsd_inner(cpu, n, args);
     drop(keep);
+    let warning = unread.and_then(|p| unread_name_warning(n, p, cpu.cf == 0));
     if cpu.cf == 0 && crate::paths::overlay_root().is_some() {
         if matches!(n, 92 | 406) && matches!(args[1], 50 | 102) {
             rewrite_fd_path(cpu, &args);
@@ -439,6 +496,7 @@ fn bsd(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
             m.remove(&(args[0] as i32));
         }
     }
+    warning
 }
 
 fn bsd_inner(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
@@ -1134,5 +1192,255 @@ mod tests {
         std::fs::remove_dir(&sys).unwrap();
         std::fs::remove_dir(&other).unwrap();
         std::fs::remove_dir(&base).unwrap();
+    }
+
+    /// The piece size upstream's guest_cstr reads in (its PIECE): no read crosses one.
+    const NAME_READ_CHUNK: u64 = 4096;
+
+    /// A fake guest memory: `bytes` at address `base`, readable below `limit` only. It records
+    /// every read that crosses a NAME_READ_CHUNK boundary (guest_cstr must make none).
+    struct Fake { base: u64, bytes: Vec<u8>, limit: u64, crossed: std::cell::Cell<u32>, reads: std::cell::Cell<u32> }
+    impl Fake {
+        fn new(base: u64, bytes: &[u8], limit: u64) -> Fake {
+            Fake { base, bytes: bytes.to_vec(), limit, crossed: 0.into(), reads: 0.into() }
+        }
+        fn read(&self, at: u64, buf: &mut [u8]) -> bool {
+            self.reads.set(self.reads.get() + 1);
+            let end = at + buf.len() as u64;
+            if buf.len() > 0 && at / NAME_READ_CHUNK != (end - 1) / NAME_READ_CHUNK {
+                self.crossed.set(self.crossed.get() + 1);
+            }
+            if at < self.base || end > self.limit || end > self.base + self.bytes.len() as u64 {
+                return false;
+            }
+            buf.copy_from_slice(&self.bytes[(at - self.base) as usize..(end - self.base) as usize]);
+            true
+        }
+    }
+
+    #[test]
+    fn guest_cstr_reads_a_name_chunk_by_chunk_up_to_a_fault() {
+        let c = NAME_READ_CHUNK;
+        // a name that ends with its NUL on the last byte before an unreadable chunk
+        let mut m = vec![b'x'; 2 * c as usize];
+        let at = 0x10000 + c - 5;
+        m[(c - 5) as usize..c as usize].copy_from_slice(b"dyld\0");
+        let f = Fake::new(0x10000, &m, 0x10000 + c);
+        assert_eq!(guest_cstr(at, 8192, |a, b| f.read(a, b)).as_deref(), Some("dyld"));
+        // must-fail control: the same name with no NUL runs into the unreadable chunk
+        m[(c - 1) as usize] = b'1';
+        let f = Fake::new(0x10000, &m, 0x10000 + c);
+        assert_eq!(guest_cstr(at, 8192, |a, b| f.read(a, b)), None);
+        // and readable all the way, it is read across the boundary in two reads, neither crossing it
+        let f = Fake::new(0x10000, &m, 0x10000 + 2 * c);
+        assert_eq!(guest_cstr(at, 8192, |a, b| f.read(a, b)), None, "no NUL in the whole memory");
+        m[c as usize + 3] = 0;
+        let f = Fake::new(0x10000, &m, 0x10000 + 2 * c);
+        assert_eq!(guest_cstr(at, 8192, |a, b| f.read(a, b)).as_deref(), Some("dyld1xxx"));
+        assert_eq!(f.reads.get(), 2);
+        assert_eq!(f.crossed.get(), 0, "a read crossed a chunk boundary");
+        // an empty name; an unreadable first byte; a NUL that comes only after `max` bytes
+        // (a fake chunk is readable whole or not at all, as a real page is)
+        let f = Fake::new(0x20000, &[0u8; 4096], 0x21000);
+        assert_eq!(guest_cstr(0x20000, 8192, |a, b| f.read(a, b)).as_deref(), Some(""));
+        assert_eq!(guest_cstr(0x1000, 8192, |a, b| f.read(a, b)), None);
+        let f = Fake::new(0x20000, b"aaaaaaaaaaaaaaaa\0", 0x30000);
+        assert_eq!(guest_cstr(0x20000, 16, |a, b| f.read(a, b)), None, "16 bytes and no NUL: too long");
+        assert_eq!(guest_cstr(0x20000, 17, |a, b| f.read(a, b)).as_deref(), Some("aaaaaaaaaaaaaaaa"));
+    }
+
+    /// Two host pages, the second PROT_NONE; the name `tail` placed to end on the first page's last
+    /// byte. Returns (mapping, page size, address of the name).
+    fn guard_page(tail: &[u8]) -> (*mut libc::c_void, usize, u64) {
+        let pg = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let m = unsafe { libc::mmap(std::ptr::null_mut(), 2 * pg, libc::PROT_READ | libc::PROT_WRITE,
+                                    libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0) };
+        assert_ne!(m, libc::MAP_FAILED);
+        let at = m as u64 + (pg - tail.len()) as u64;
+        unsafe {
+            std::ptr::copy_nonoverlapping(tail.as_ptr(), at as *mut u8, tail.len());
+            assert_eq!(libc::mprotect((m as u64 + pg as u64) as *mut libc::c_void, pg, libc::PROT_NONE), 0);
+        }
+        (m, pg, at)
+    }
+
+    #[test]
+    fn guest_name_never_faults_on_guest_memory() {
+        // positive control: an ordinary name
+        let c = std::ffi::CString::new("/System/Library/dyld/x").unwrap();
+        assert_eq!(guest_name(c.as_ptr() as u64).as_deref(), Some("/System/Library/dyld/x"));
+        // a name ending, NUL and all, just before a PROT_NONE page; then one that runs into it
+        let (m, pg, at) = guard_page(b"dyld_shared_cache_arm64e\0");
+        assert_eq!(guest_name(at).as_deref(), Some("dyld_shared_cache_arm64e"));
+        let (m2, _, at2) = guard_page(b"dyld_sha");
+        assert_eq!(guest_name(at2), None);
+        assert_eq!(guest_name(m2 as u64 + pg as u64), None, "the PROT_NONE page itself");
+        // address 0x1000: __PAGEZERO (4 GiB on x86_64), as in rows U5-U7
+        assert_eq!(guest_name(0x1000), None);
+        unsafe {
+            libc::munmap(m, 2 * pg);
+            libc::munmap(m2, 2 * pg);
+        }
+    }
+
+    #[test]
+    fn call_name_reads_only_what_xnu_reads() {
+        let asked = std::cell::Cell::new(false);
+        let read = |_: u64| { asked.set(true); Some("x".to_string()) };
+        // fstatat and fstatat64 with AT_FDONLY: the name is not read, whatever else is set
+        for n in [469, 470] {
+            let mut x = a(3, AT_FDONLY);
+            x[1] = 0x1000;
+            assert_eq!(call_name(n, &x, 1, read), None);
+            x[3] = AT_FDONLY | AT_SYMLINK_NOFOLLOW_ANY | 0x80;
+            assert_eq!(call_name(n, &x, 1, read), None);
+        }
+        assert!(!asked.get(), "an AT_FDONLY name was read");
+        // NULL is not read either
+        assert_eq!(call_name(470, &[0; 8], 1, read), None);
+        assert!(!asked.get(), "a NULL name was read");
+        // must-fail controls: 0x400 means nothing of the kind to openat (O_TRUNC) or faccessat
+        let mut x = a(2, AT_FDONLY);
+        x[1] = 0x1000;
+        assert_eq!(call_name(463, &x, 1, read).as_deref(), Some("x"));
+        assert!(asked.get(), "openat's name was not read");
+        let asked2 = std::cell::Cell::new(false);
+        let mut x = a(3, AT_FDONLY);
+        x[1] = 0x1000;
+        assert_eq!(call_name(466, &x, 1, |_| { asked2.set(true); None }), None);
+        assert!(asked2.get(), "faccessat's name was not read");
+        // a plain call's name, in args[0]
+        assert_eq!(call_name(5, &a(0, 0x1000), 0, |p| Some(format!("{p:#x}"))).as_deref(), Some("0x1000"));
+    }
+
+    #[test]
+    fn bsd_passes_an_unreadable_name_to_the_host_kernel() {
+        // Real calls: the host kernel answers what XNU answers natively (rows U5-U7, and the
+        // EINVAL-before-the-name case). Unpatched, every one of these crashed the process.
+        use std::os::unix::io::AsRawFd;
+        let base = std::env::temp_dir().join(format!("maclator-g-test-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("f"), b"").unwrap();
+        let d = std::fs::File::open(&base).unwrap();
+        let fd = d.as_raw_fd() as u64;
+        let mut st = [0u8; 512];
+        let sb = st.as_mut_ptr() as u64;
+        let call = |n: u64, args: [u64; 8]| -> Result<u64, u64> {
+            let mut cpu = Cpu::new();
+            bsd(&mut cpu, n, args);
+            if cpu.cf == 0 { Ok(cpu.x[0]) } else { Err(cpu.x[0]) }
+        };
+        let e = |v: i32| -> Result<u64, u64> { Err(v as u64) };
+        // positive control: a readable name through the same descriptor
+        let f = std::ffi::CString::new("f").unwrap();
+        let r = call(463, [fd, f.as_ptr() as u64, 0, 0, 0, 0, 0, 0]);
+        assert!(r.is_ok(), "openat(fd, \"f\") {r:?}");
+        unsafe { libc::close(r.unwrap() as i32) };
+        assert!(call(470, [fd, f.as_ptr() as u64, sb, 0, 0, 0, 0, 0]).is_ok());
+        // U5-U7 on address 0x1000
+        assert!(call(470, [fd, 0x1000, sb, AT_FDONLY, 0, 0, 0, 0]).is_ok(), "U5: AT_FDONLY ignores the name");
+        assert!(call(469, [fd, 0x1000, sb, AT_FDONLY, 0, 0, 0, 0]).is_ok(), "fstatat AT_FDONLY");
+        assert_eq!(call(470, [fd, 0x1000, sb, 0, 0, 0, 0, 0]), e(libc::EFAULT), "U6");
+        assert_eq!(call(463, [fd, 0x1000, 0, 0, 0, 0, 0, 0]), e(libc::EFAULT), "U7");
+        assert_eq!(call(466, [fd, 0x1000, 0, 0, 0, 0, 0, 0]), e(libc::EFAULT), "faccessat");
+        assert_eq!(call(5, [0x1000, 0, 0, 0, 0, 0, 0, 0]), e(libc::EFAULT), "open");
+        // XNU checks fstatat's flags before the name: an invalid one is EINVAL, not EFAULT
+        assert_eq!(call(470, [fd, 0x1000, sb, 0x80, 0, 0, 0, 0]), e(libc::EINVAL), "AT_REMOVEDIR");
+        // a name running into a PROT_NONE page; 1024 bytes with no NUL before one
+        let (m, pg, at) = guard_page(b"dyld_sha");
+        assert_eq!(call(463, [fd, at, 0, 0, 0, 0, 0, 0]), e(libc::EFAULT), "into the guard page");
+        let (m2, _, at2) = guard_page(&[b'a'; 1024]);
+        assert_eq!(call(463, [fd, at2, 0, 0, 0, 0, 0, 0]), e(libc::ENAMETOOLONG), "1024 bytes, no NUL");
+        unsafe {
+            libc::munmap(m, 2 * pg);
+            libc::munmap(m2, 2 * pg);
+        }
+        drop(d);
+        std::fs::remove_file(base.join("f")).unwrap();
+        std::fs::remove_dir(&base).unwrap();
+    }
+
+    #[test]
+    fn unread_name_warning_needs_a_host_success() {
+        let w = unread_name_warning(463, 0x1000, true).unwrap();
+        assert!(w.starts_with("[maclator] warning: #463 name at 0x1000 "), "{w}");
+        assert_eq!(unread_name_warning(463, 0x1000, false), None, "must-fail control: the host refused it");
+    }
+
+    #[test]
+    fn bsd_warns_when_the_host_read_what_guest_memory_refused() {
+        // A fake memory that refuses every read, in front of a name the kernel can read: the shape
+        // of a disagreement between guestmem::read and the kernel (rows U15 and U16 make a real one).
+        use std::os::unix::io::AsRawFd;
+        let base = std::env::temp_dir().join(format!("maclator-g2-test-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("f"), b"").unwrap();
+        let d = std::fs::File::open(&base).unwrap();
+        let fd = d.as_raw_fd() as u64;
+        let mut st = [0u8; 512];
+        let sb = st.as_mut_ptr() as u64;
+        let f = std::ffi::CString::new("f").unwrap();
+        let fp = f.as_ptr() as u64;
+        let refuses = Fake::new(0x20000, b"", 0x20000);
+        let refused = |p: u64| guest_cstr(p, GUEST_NAME_MAX, |a, b| refuses.read(a, b));
+        let call = |n: u64, args: [u64; 8], read: &dyn Fn(u64) -> Option<String>| {
+            let mut cpu = Cpu::new();
+            let w = bsd_read(&mut cpu, n, args, |p| read(p));
+            (cpu.cf == 0, cpu.x[0], w)
+        };
+        // the host opens it, read or not; only the refused read warns
+        let (ok, r, w) = call(463, [fd, fp, 0, 0, 0, 0, 0, 0], &refused);
+        assert!(ok, "the host call failed: {r}");
+        unsafe { libc::close(r as i32) };
+        assert!(w.is_some_and(|w| w.contains("#463")), "a refused name the host read gave no warning");
+        assert!(refuses.reads.get() > 0, "the fake memory was not asked");
+        // must-fail controls: a name that reads; a host call that fails; AT_FDONLY, which reads nothing
+        let (ok, r, w) = call(463, [fd, fp, 0, 0, 0, 0, 0, 0], &guest_name);
+        assert!(ok);
+        unsafe { libc::close(r as i32) };
+        assert_eq!(w, None, "a name that read warned");
+        let (ok, r, w) = call(463, [fd, 0x1000, 0, 0, 0, 0, 0, 0], &refused);
+        assert_eq!((ok, r), (false, libc::EFAULT as u64));
+        assert_eq!(w, None, "EFAULT warned");
+        let (ok, _, w) = call(470, [fd, 0x1000, sb, AT_FDONLY, 0, 0, 0, 0], &refused);
+        assert!(ok);
+        assert_eq!(w, None, "AT_FDONLY warned");
+        let (ok, _, w) = call(470, [fd, 0, sb, AT_FDONLY, 0, 0, 0, 0], &refused);
+        assert!(ok);
+        assert_eq!(w, None, "NULL with AT_FDONLY warned");
+        drop(d);
+        std::fs::remove_file(base.join("f")).unwrap();
+        std::fs::remove_dir(&base).unwrap();
+    }
+
+    #[test]
+    fn guest_name_reads_real_memory_across_a_4k_boundary() {
+        // Two readable host pages (4 KiB or more each) and then a PROT_NONE one.
+        let c = NAME_READ_CHUNK as usize;
+        let pg = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let m = unsafe { libc::mmap(std::ptr::null_mut(), 3 * pg, libc::PROT_READ | libc::PROT_WRITE,
+                                    libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0) };
+        assert_ne!(m, libc::MAP_FAILED);
+        let guard = m as u64 + 2 * pg as u64;
+        assert_eq!(unsafe { libc::mprotect(guard as *mut libc::c_void, pg, libc::PROT_NONE) }, 0);
+        // a short name across a 4 KiB boundary, in the middle of readable memory
+        let at = m as u64 + c as u64 - 4;
+        unsafe { std::ptr::copy_nonoverlapping(b"dyld_shared_cache\0".as_ptr(), at as *mut u8, 18) };
+        assert_eq!(guest_name(at).as_deref(), Some("dyld_shared_cache"));
+        // longer than one chunk, its NUL the last byte before the PROT_NONE page: one read from the
+        // start to GUEST_NAME_MAX would run into that page, and stopping at the first boundary would
+        // lose the tail
+        let len = c + 900;
+        let at = guard - len as u64;
+        unsafe {
+            std::ptr::write_bytes(at as *mut u8, b'a', len - 1);
+            *(guard as *mut u8).sub(1) = 0;
+        }
+        assert_ne!(at / NAME_READ_CHUNK, (guard - 1) / NAME_READ_CHUNK, "the name does not cross");
+        assert_eq!(guest_name(at).map(|n| n.len()), Some(len - 1));
+        // must-fail control: the same length with no NUL runs into the page
+        unsafe { *(guard as *mut u8).sub(1) = b'a' };
+        assert_eq!(guest_name(at), None);
+        unsafe { libc::munmap(m, 3 * pg) };
     }
 }
