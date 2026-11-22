@@ -302,6 +302,12 @@ fn cache_layout(head: &[u8; 32], file_len: u64) -> Option<(usize, usize, usize)>
 
 fn load_file(path: &std::path::Path, start: u64, end: u64) -> std::io::Result<usize> {
     let mut f = std::fs::File::open(path)?;
+    // The code is run as it is, so only a file of ours in a directory of ours, both writable by no one else.
+    let uid = unsafe { libc::geteuid() };
+    let dir_ok = path.parent().is_some_and(|d| std::fs::symlink_metadata(d).is_ok_and(|md| md.is_dir() && owned(&md, uid)));
+    if !dir_ok || !f.metadata().is_ok_and(|md| md.is_file() && owned(&md, uid)) {
+        return Ok(0);
+    }
     let mut head = [0u8; 32];
     if f.read_exact(&mut head).is_err() {
         return Ok(0);
@@ -353,7 +359,9 @@ pub fn save_profile() {
     flush_pending();
     let imgs = IMAGES.lock().unwrap().clone();
     let seen = SEEN.lock().unwrap().clone();
-    let _ = std::fs::create_dir_all(cache_dir());
+    if !owned_dir(&cache_dir(), unsafe { libc::geteuid() }) {
+        return;
+    }
     let mut rebuild = Vec::new();
     for (i, img) in imgs.iter().enumerate() {
         let path = file_for(img, "profile");
@@ -556,7 +564,9 @@ pub fn build_standalone(path: &str) -> std::io::Result<usize> {
     let img_end = hi.wrapping_add(slide);
     let key = format!("main-{}-{}", hex(&m.uuid), fnv(&[path.as_bytes()]));
     let img = Image { name: path.to_string(), key, start: img_start, end: img_end, entries, loaded: false, cached: false };
-    let _ = std::fs::create_dir_all(cache_dir());
+    if !owned_dir(&cache_dir(), unsafe { libc::geteuid() }) {
+        return Err(std::io::Error::other("the cache directory is not ours alone"));
+    }
     let prof = read_profile(&file_for(&img, "profile"));
     build(&img, &prof)?;
     let n = load_count(&file_for(&img, "aot"));
@@ -637,5 +647,61 @@ mod tests {
         std::fs::write(&p, bytes).unwrap();
         assert_eq!(load_file(&p, 0x1000, 0x2000).unwrap(), 0);
         std::fs::remove_file(p).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::*;
+
+    fn chmod(p: &std::path::Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// An AOT file of one block (16 bytes of int3) for guest pc `pc`, in `dir`.
+    fn aot_file(dir: &std::path::Path, pc: u64) -> std::path::PathBuf {
+        let mut b = Vec::new();
+        b.extend_from_slice(MAGIC);
+        b.extend_from_slice(&TRANSLATOR_VERSION.to_le_bytes());
+        b.extend_from_slice(&flags_word().to_le_bytes());
+        b.extend_from_slice(&1u64.to_le_bytes());
+        b.extend_from_slice(&16u64.to_le_bytes());
+        b.extend_from_slice(&pc.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes());
+        b.resize(code_offset(1), 0);
+        b.extend_from_slice(&[0xcc; 16]);
+        let p = dir.join("t.aot");
+        std::fs::write(&p, b).unwrap();
+        p
+    }
+
+    #[test]
+    fn load_refuses_an_aot_file_or_directory_writable_by_others() {
+        /// Removes the test's directory when the test ends, a panic included.
+        struct Gone(std::path::PathBuf);
+        impl Drop for Gone {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let d = std::env::temp_dir().join(format!("mcl-aot-owner-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        let _gone = Gone(d.clone());
+        chmod(&d, 0o755);
+        let p = aot_file(&d, 0x7d00_0000_0000);
+        assert_eq!(load_file(&p, 0x7d00_0000_0000, 0x7d00_0000_1000).unwrap(), 1, "control: ours");
+        for (what, file, dir) in [("group-writable file", 0o664, 0o755), ("other-writable file", 0o646, 0o755), ("group-writable directory", 0o644, 0o775), ("other-writable directory", 0o644, 0o757)] {
+            chmod(&p, file);
+            chmod(&d, dir);
+            assert_eq!(load_file(&p, 0x7d00_0000_0000, 0x7d00_0000_1000).unwrap(), 0, "{what}");
+        }
+        chmod(&p, 0o644);
+        chmod(&d, 0o755);
+        assert_eq!(load_file(&p, 0x7d00_0000_0000, 0x7d00_0000_1000).unwrap(), 1, "control: ours again");
+        let link = d.join("l");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&d, &link).unwrap();
+        assert_eq!(load_file(&link.join("t.aot"), 0x7d00_0000_0000, 0x7d00_0000_1000).unwrap(), 0, "a directory reached through a symlink");
     }
 }
