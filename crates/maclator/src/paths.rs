@@ -29,7 +29,18 @@ const CACHE_PREFIXES: &[&str] = &[
 ];
 
 pub fn set_cache_dir(d: &str) {
-    *CACHE_DIR.lock().unwrap() = Some(d.trim_end_matches('/').to_string());
+    *CACHE_DIR.lock().unwrap() = Some(canonical_dir(d));
+}
+
+/// Directory `d` (--sysroot, or one discover_sysroot found) by its canonical path,
+/// resolved once, here. The redirect builds host paths by string from this, so a sysroot spelled
+/// through a symlink (/var and /tmp are symlinks on macOS) put that symlink into every rewritten
+/// path, and a NOFOLLOW_ANY call through one gave ELOOP where XNU succeeds (rows Y5, Y6, K2).
+/// The overlay root is canonicalized already (set_overlay_root). When `d` cannot be
+/// resolved, it is kept as given, trimmed, as before.
+fn canonical_dir(d: &str) -> String {
+    let d = d.trim_end_matches('/');
+    std::fs::canonicalize(d).ok().and_then(|p| p.to_str().map(str::to_string)).unwrap_or_else(|| d.to_string())
 }
 
 pub fn set_overlay_root(d: &str) -> std::io::Result<()> {
@@ -165,6 +176,27 @@ mod tests {
         assert!(normalized_absolute("/../../Library").is_none());
         assert!(overlay_path(&root, "Library/Developer/PrivateFrameworks/Example.framework").is_none());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn canonical_dir_resolves_the_sysroot_once() {
+        let base = std::env::temp_dir().join(format!("maclator-f-test-{}", std::process::id()));
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let want = std::fs::canonicalize(&real).unwrap().to_string_lossy().into_owned();
+        let l = link.to_string_lossy().into_owned();
+        assert_eq!(canonical_dir(&l), want);
+        assert_eq!(canonical_dir(&format!("{l}/")), want);
+        assert_eq!(canonical_dir(&format!("{l}//")), want);
+        assert_ne!(canonical_dir(&l), l, "must-fail control: the link's own spelling kept");
+        // a path that cannot be resolved is kept as given, trimmed
+        let missing = base.join("missing").to_string_lossy().into_owned();
+        assert_eq!(canonical_dir(&format!("{missing}/")), missing);
+        std::fs::remove_file(&link).unwrap();
+        std::fs::remove_dir(&real).unwrap();
+        std::fs::remove_dir(&base).unwrap();
     }
 
     #[test]
