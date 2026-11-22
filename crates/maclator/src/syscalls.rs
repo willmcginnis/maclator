@@ -1972,6 +1972,17 @@ fn kept_route(canonical: &str, redirected: &str, name: &str) -> Kept {
 }
 
 fn bsd(cpu: &mut Cpu, n: u64, args: [u64; 8]) {
+    bsd_gated(cpu, n, args, crate::paths::rewriting());
+}
+
+/// With nothing to redirect (no cache dir and no overlay root, paths::rewriting), the guest's paths are the
+/// host's: a call goes to the host as it came, with no name read or joined and no descriptor or working
+/// directory recorded.
+fn bsd_gated(cpu: &mut Cpu, n: u64, args: [u64; 8], rewriting: bool) {
+    if !rewriting {
+        bsd_inner(cpu, n, args);
+        return;
+    }
     if let Some(warning) = bsd_read(cpu, n, args, guest_name) {
         eprintln!("{warning}");
     }
@@ -3767,7 +3778,7 @@ mod tests {
         let sb = st.as_mut_ptr() as u64;
         let call = |n: u64, args: [u64; 8]| -> Result<u64, u64> {
             let mut cpu = Cpu::new();
-            bsd(&mut cpu, n, args);
+            bsd_gated(&mut cpu, n, args, true); // the name-reading path, whatever another test set the sysroot to
             if cpu.cf == 0 { Ok(cpu.x[0]) } else { Err(cpu.x[0]) }
         };
         let e = |v: i32| -> Result<u64, u64> { Err(v as u64) };
@@ -3834,6 +3845,27 @@ mod tests {
         assert_eq!(recorded.as_deref(), Some("/"), "must-fail control: the guest's spelling recorded for a climb-out");
         assert!(FD_VPATHS.lock().unwrap().as_ref().is_none_or(|m| !m.contains_key(&fd)), "close removed the record");
         std::fs::remove_dir(&sys).unwrap();
+    }
+
+    #[test]
+    fn nothing_recorded_with_nothing_to_redirect() {
+        // open("/") records "/" for later *at calls when names can be redirected (the control), and
+        // nothing when they cannot: the call goes to the host as it came.
+        let root = c"/";
+        let open = |rewriting: bool| {
+            let mut cpu = Cpu::new();
+            bsd_gated(&mut cpu, 5, [root.as_ptr() as u64, libc::O_RDONLY as u64 | libc::O_DIRECTORY as u64, 0, 0, 0, 0, 0, 0], rewriting);
+            assert_eq!(cpu.cf, 0, "open failed: {}", cpu.x[0]);
+            let fd = cpu.x[0] as i32;
+            (fd, FD_VPATHS.lock().unwrap().as_ref().and_then(|m| m.get(&fd).cloned()))
+        };
+        let (fd, rec) = open(true);
+        let mut c = Cpu::new();
+        bsd_gated(&mut c, 6, [fd as u64, 0, 0, 0, 0, 0, 0, 0], true);
+        assert_eq!(rec.as_deref(), Some("/"), "must-fail control: rewriting records the descriptor");
+        let (fd, rec) = open(false);
+        unsafe { libc::close(fd) };
+        assert_eq!(rec, None, "a descriptor recorded with nothing to redirect");
     }
 
     #[test]

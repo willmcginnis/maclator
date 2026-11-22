@@ -32,7 +32,12 @@ pub fn set_cache_dir(d: &str) {
     let c = canonical_dir(d);
     note_cache_dir_id(&c);
     *CACHE_DIR.lock().unwrap() = Some(c);
+    REWRITING.store(true, std::sync::atomic::Ordering::SeqCst);
 }
+
+/// Whether a cache dir or an overlay root is set (rewriting). Set only by the two setters, which main calls
+/// before the guest starts; an atomic, so the per-syscall check takes no lock.
+static REWRITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The sysroot's (device, inode), taken when the sysroot is set,
 /// at startup, while its path can still be searched. A working directory inside the sysroot is held by the host
@@ -79,6 +84,7 @@ pub fn set_overlay_root(d: &str) -> std::io::Result<()> {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "overlay root is not a directory"));
     }
     *OVERLAY_ROOT.lock().unwrap() = Some(root);
+    REWRITING.store(true, std::sync::atomic::Ordering::SeqCst);
     Ok(())
 }
 
@@ -159,6 +165,42 @@ pub fn cache_dir() -> Option<String> {
     CACHE_DIR.lock().unwrap().clone()
 }
 
+/// Whether any guest path can be redirected: a cache dir or an overlay root is set. With neither,
+/// the guest's paths are the host's and path-taking calls go through untouched.
+pub fn rewriting() -> bool {
+    REWRITING.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Whether `--sysroot DIR` can be used. The sysroot stands in for the cache directory, not for a
+/// root filesystem: `/` would send `<prefix>/dyld_shared_cache_arm64e` to `/dyld_shared_cache_arm64e`.
+pub fn check_sysroot(d: &str) -> Result<(), String> {
+    let c = canonical_dir(d);
+    if c.is_empty() || c == "/" {
+        return Err(format!(
+            "--sysroot {d:?} is not supported: the sysroot names the directory holding dyld_shared_cache_arm64e, \
+             not a root filesystem; to use the host's own cache, leave it out or pass --no-sysroot"
+        ));
+    }
+    Ok(())
+}
+
+/// Whether to look for a sysroot (discover_sysroot): not with one set, not with `--no-sysroot`, and
+/// not when the host already has the arm64e cache (host_has_cache): then `$MACLATOR_SYSROOT` is not
+/// read either; pass `--sysroot` to use another cache.
+pub fn discovery_needed(set: bool, no_sysroot: bool, host_cache: bool) -> bool {
+    !set && !no_sysroot && !host_cache
+}
+
+/// Whether the host has the arm64e cache under one of the standard directories: on macOS 26 and
+/// later it sits in the OS cryptex, not in /System/Library/dyld.
+pub fn host_has_cache() -> bool {
+    cache_in(CACHE_PREFIXES)
+}
+
+fn cache_in(dirs: &[&str]) -> bool {
+    dirs.iter().any(|d| Path::new(d).join("dyld_shared_cache_arm64e").is_file())
+}
+
 /// Whether guest path `path` is exactly one of the cache prefixes while a cache dir is set: the
 /// guest directory that IS the sysroot (the path rewrite treats it as a directory however the host
 /// reaches the sysroot).
@@ -237,6 +279,50 @@ mod tests {
         std::fs::remove_file(&link).unwrap();
         std::fs::remove_dir(&real).unwrap();
         std::fs::remove_dir(&base).unwrap();
+    }
+
+    #[test]
+    fn sysroot_slash_is_refused() {
+        for d in ["/", "//", "/.", "/usr/.."] {
+            assert!(check_sysroot(d).is_err(), "{d}");
+        }
+        let t = std::env::temp_dir();
+        assert!(check_sysroot(&t.to_string_lossy()).is_ok(), "must-fail control: a real directory");
+    }
+
+    #[test]
+    fn cache_in_checks_every_directory() {
+        let base = std::env::temp_dir().join(format!("maclator-n-test-{}", std::process::id()));
+        let (with, without) = (base.join("with"), base.join("without"));
+        std::fs::create_dir_all(&with).unwrap();
+        std::fs::create_dir_all(&without).unwrap();
+        std::fs::write(with.join("dyld_shared_cache_arm64e"), b"").unwrap();
+        let (w, wo) = (with.to_string_lossy().into_owned(), without.to_string_lossy().into_owned());
+        // the cache in the first directory (the cryptex one), none in the last (/System/Library/dyld)
+        assert!(cache_in(&[&w, &wo]), "the cache in the first directory not seen");
+        assert!(!cache_in(&[&wo]), "must-fail control: no cache");
+        std::fs::remove_file(with.join("dyld_shared_cache_arm64e")).unwrap();
+        std::fs::remove_dir(&with).unwrap();
+        std::fs::remove_dir(&without).unwrap();
+        std::fs::remove_dir(&base).unwrap();
+    }
+
+    #[test]
+    fn no_sysroot_skips_discovery() {
+        assert!(discovery_needed(false, false, false), "must-fail control: neither set, no host cache");
+        assert!(!discovery_needed(false, true, false), "--no-sysroot still discovers");
+        assert!(!discovery_needed(true, false, false), "a sysroot set");
+        assert!(!discovery_needed(false, false, true), "the host has the cache");
+    }
+
+    #[test]
+    fn host_cache_seen_in_the_cryptex() {
+        // On macOS 26 and later (measured on 27.0.1) the cache is only in the OS cryptex; skipped elsewhere.
+        let c = Path::new(CACHE_PREFIXES[0]).join("dyld_shared_cache_arm64e");
+        if !c.is_file() || Path::new(CACHE_PREFIXES[2]).join("dyld_shared_cache_arm64e").is_file() {
+            return;
+        }
+        assert!(host_has_cache(), "the cryptex cache not seen");
     }
 
     #[test]

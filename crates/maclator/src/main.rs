@@ -55,6 +55,7 @@ fn usage() -> ! {
     eprintln!("  --no-aot        JIT only: don't load or build AOT translations");
     eprintln!("  --dyld PATH     arm64 dyld to use (default /usr/lib/dyld)");
     eprintln!("  --sysroot DIR   directory with the arm64 dyld shared cache files");
+    eprintln!("  --no-sysroot    use the host's own cache; ignore $MACLATOR_SYSROOT, ~/.maclator, ~/maclator-sysroot");
     eprintln!("  --overlay-root DIR  local Xcode component payloads (experimental)");
     eprintln!("  --trace         trace system calls");
     eprintln!("  --gpu           route the guest's Metal API to the host GPU");
@@ -75,6 +76,7 @@ fn main() {
     let mut gpu_flag = false;
     let mut print_plan = false;
     let mut dry_run = false;
+    let mut no_sysroot = false;
     let mut guest_cwd: Option<String> = None;
     while let Some(a) = args.first().cloned() {
         match a.as_str() {
@@ -163,7 +165,16 @@ fn main() {
                 if args.is_empty() {
                     usage();
                 }
-                paths::set_cache_dir(&args.remove(0));
+                let d = args.remove(0);
+                if let Err(e) = paths::check_sysroot(&d) {
+                    eprintln!("maclator: {e}");
+                    std::process::exit(2);
+                }
+                paths::set_cache_dir(&d);
+            }
+            "--no-sysroot" => {
+                no_sysroot = true;
+                args.remove(0);
             }
             "--overlay-root" => {
                 args.remove(0);
@@ -218,8 +229,12 @@ fn main() {
     if args.is_empty() {
         usage();
     }
-    if paths::cache_dir().is_none() && !std::path::Path::new("/System/Library/dyld/dyld_shared_cache_arm64e").exists() {
-        if let Some(d) = paths::discover_sysroot() {
+    if no_sysroot && paths::cache_dir().is_some() {
+        eprintln!("maclator: --sysroot and --no-sysroot together");
+        std::process::exit(2);
+    }
+    if paths::discovery_needed(paths::cache_dir().is_some(), no_sysroot, paths::host_has_cache()) {
+        if let Some(d) = paths::discover_sysroot().filter(|d| paths::check_sysroot(d).is_ok()) {
             paths::set_cache_dir(&d);
         }
     }
@@ -314,6 +329,8 @@ fn main() {
         if let Some(d) = paths::cache_dir() {
             fwd.push("--sysroot".into());
             fwd.push(d);
+        } else if no_sysroot {
+            fwd.push("--no-sysroot".into());
         }
         if let Some(root) = paths::overlay_root() {
             fwd.push("--overlay-root".into());
