@@ -66,6 +66,9 @@ const PAGE16: u64 = 0x4000;
 /// (kGUARD_EXC_DEALLOC_GAP) on current Darwin, fatal in a platform binary, whose mmap hints the kernel does not honour.
 unsafe fn reserve_cache(hint: u64, size: u64) -> std::io::Result<u64> {
     let Some(over) = size.checked_add(PAGE16) else { return Err(std::io::Error::from_raw_os_error(libc::ENOMEM)) };
+    // A test may have the hint ignored, as the kernel ignores a platform binary's.
+    #[cfg(test)]
+    let hint = if HINT_IGNORED.with(|h| h.get()) { 0 } else { hint };
     let p = libc::mmap(hint as *mut _, over as usize, libc::PROT_NONE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0);
     if p == libc::MAP_FAILED {
         return Err(std::io::Error::last_os_error());
@@ -113,6 +116,148 @@ unsafe fn trim(addr: u64, len: u64) -> std::io::Result<()> {
     }
 }
 
+/// The shared cache at one base per boot, as XNU slides its shared region once per boot.
+unsafe fn reserve_boot_base(hint: u64, span: u64) -> std::io::Result<u64> {
+    // Under test, the store and the boot are the test's own (TEST_BOOT), never the real ones; with none set, S 1.4.
+    #[cfg(test)]
+    {
+        let set = TEST_BOOT.with(|t| t.borrow().clone());
+        return match set {
+            Some((dir, boot)) => unsafe { reserve_boot_base_in(&dir, &boot, hint, span) },
+            None => unsafe { reserve_cache(hint, span) },
+        };
+    }
+    #[cfg(not(test))]
+    match boot_session_uuid() {
+        Some(boot) => unsafe { reserve_boot_base_in(&crate::aot::cache_dir(), &boot, hint, span) },
+        None => unsafe { reserve_cache(hint, span) },
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test sets this to have reserve_cache's hint ignored, as the kernel ignores a platform binary's.
+    static HINT_IGNORED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The store directory and boot UUID a test gives map_and_slide_at; None leaves the boot base out.
+    static TEST_BOOT: std::cell::RefCell<Option<(std::path::PathBuf, String)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// kern.bootsessionuuid: a new value each boot.
+fn boot_session_uuid() -> Option<String> {
+    let mut buf = [0u8; 64];
+    let mut len = buf.len();
+    let r = unsafe { libc::sysctlbyname(c"kern.bootsessionuuid".as_ptr(), buf.as_mut_ptr() as *mut _, &mut len, std::ptr::null_mut(), 0) };
+    let s = std::str::from_utf8(&buf[..len.min(buf.len())]).ok()?.trim_end_matches('\0');
+    (r == 0 && !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')).then(|| s.to_string())
+}
+
+fn boot_base_path(dir: &std::path::Path, boot: &str, span: u64) -> std::path::PathBuf {
+    dir.join(format!("dsc-base-{boot}-{span:x}"))
+}
+
+fn boot_base_record(boot: &str, span: u64, base: u64) -> String {
+    format!("MCLBASE1 {boot} {span:x} {base:x}\n")
+}
+
+/// This boot's recorded base for a cache of `span` bytes, if a record of ours says so.
+fn read_boot_base(dir: &std::path::Path, boot: &str, span: u64) -> Option<u64> {
+    let uid = unsafe { libc::geteuid() };
+    let dmd = std::fs::symlink_metadata(dir).ok()?;
+    if !(dmd.is_dir() && crate::aot::owned(&dmd, uid)) {
+        return None;
+    }
+    let path = boot_base_path(dir, boot, span);
+    let md = std::fs::symlink_metadata(&path).ok()?;
+    if !(md.is_file() && crate::aot::owned(&md, uid) && md.len() < 256) {
+        return None;
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
+    let mut f = text.trim_end().split(' ');
+    let (magic, b, s, base) = (f.next()?, f.next()?, f.next()?, f.next()?);
+    if magic != "MCLBASE1" || b != boot || s != format!("{span:x}") || f.next().is_some() {
+        return None;
+    }
+    let base = u64::from_str_radix(base, 16).ok()?;
+    (base != 0 && base % PAGE16 == 0).then_some(base)
+}
+
+/// Publish `base` as this boot's base: the first writer wins (link(2) fails on an existing name).
+fn write_boot_base(dir: &std::path::Path, boot: &str, span: u64, base: u64) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let uid = unsafe { libc::geteuid() };
+    if !crate::aot::owned_dir(dir, uid) {
+        return;
+    }
+    let path = boot_base_path(dir, boot, span);
+    let ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let tmp = dir.join(format!("dsc-base-{boot}-{span:x}.{}.{ns}.tmp", std::process::id()));
+    let ok = (|| -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o644).open(&tmp)?;
+        f.write_all(boot_base_record(boot, span, base).as_bytes())?;
+        f.sync_all()?;
+        std::fs::hard_link(&tmp, &path)
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    if let Err(e) = ok {
+        if e.kind() != std::io::ErrorKind::AlreadyExists {
+            eprintln!("maclator: could not record this boot's shared cache base in {}: {e}", path.display());
+        }
+    }
+}
+
+/// Take exactly [base, base + span): fixed, never overwriting, so an occupied range fails and nothing is replaced.
+unsafe fn reserve_exact(base: u64, span: u64) -> std::io::Result<()> {
+    extern "C" {
+        static mach_task_self_: u32;
+        fn mach_vm_allocate(task: u32, addr: *mut u64, size: u64, flags: i32) -> i32;
+    }
+    extern "C" {
+        fn mach_vm_deallocate(task: u32, addr: u64, size: u64) -> i32;
+    }
+    const VM_FLAGS_FIXED: i32 = 0;
+    if base == 0 || base % PAGE16 != 0 || span == 0 || base.checked_add(span).is_none() {
+        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    let mut a = base;
+    let kr = unsafe { mach_vm_allocate(mach_task_self_, &mut a, span, VM_FLAGS_FIXED) };
+    if kr != 0 {
+        return Err(std::io::Error::other(format!("mach_vm_allocate fixed: kern_return {kr}")));
+    }
+    if a != base || unsafe { libc::mprotect(base as *mut _, span as usize, libc::PROT_NONE) } != 0 {
+        let e = if a != base { std::io::Error::other(format!("mach_vm_allocate fixed returned {a:#x}")) } else { std::io::Error::last_os_error() };
+        unsafe { mach_vm_deallocate(mach_task_self_, a, span) };
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// `reserve_boot_base` with its directory and boot named, so a test can give its own.
+unsafe fn reserve_boot_base_in(dir: &std::path::Path, boot: &str, hint: u64, span: u64) -> std::io::Result<u64> {
+    if let Some(b) = read_boot_base(dir, boot, span) {
+        match unsafe { reserve_exact(b, span) } {
+            Ok(()) => return Ok(b),
+            Err(e) => eprintln!("[maclator] this boot's shared cache base {b:#x} is occupied in this process ({e}); sliding this process alone"),
+        }
+        return unsafe { reserve_cache(hint, span) };
+    }
+    // The first process of the boot takes the preferred base exactly when it is free (a platform binary's hint is
+    // ignored, but the fixed-mapping probe measured that it can still take the base fixed), else where the kernel puts it.
+    // Only the preferred base is recorded: a base the kernel placed (the band it uses for this process's own
+    // mappings) is likelier to be taken in the next process, and a first writer's record lasts the whole boot.
+    match unsafe { reserve_exact(hint, span) } {
+        Ok(()) => {
+            write_boot_base(dir, boot, span, hint);
+            Ok(hint)
+        }
+        Err(_) => unsafe { reserve_cache(hint, span) },
+    }
+}
+
 /// The errno a failed cache reservation reports to dyld: the kernel's own, or ENOMEM when there is none.
 fn reservation_errno(e: &std::io::Error) -> i64 {
     e.raw_os_error().unwrap_or(libc::ENOMEM) as i64
@@ -146,7 +291,7 @@ fn map_and_slide_at(hint: u64, files_count: u32, files: u64, mappings_count: u32
             return libc::EINVAL as i64;
         }
     };
-    let base = match unsafe { reserve_cache(hint, span) } {
+    let base = match unsafe { reserve_boot_base(hint, span) } {
         Ok(b) => b,
         Err(e) => {
             eprintln!("maclator: reserving {span:#x} bytes for the shared cache failed: {e}");
@@ -1519,6 +1664,24 @@ mod tests {
             libc::munmap(b as *mut _, LEN as usize);
             libc::munmap(occ, 0x1000);
 
+            // With a boot record, a second mapping of the cache (a
+            // second process, its hint elsewhere) lands at the first one's base.
+            let d = boot_dir("wired");
+            TEST_BOOT.with(|t| *t.borrow_mut() = Some((d.clone(), "B00T-W".to_string())));
+            let (rc, got) = map_test_cache(FREE_AT, &src, LEN);
+            assert_eq!(rc, 0, "boot base: the first mapping maps");
+            let first = got.expect("boot base: the first mapping is registered").base;
+            assert_eq!(first, FREE_AT, "control: the first mapping lands at its free hint");
+            libc::munmap(first as *mut _, LEN as usize);
+            let (rc, got) = map_test_cache(OCCUPIED_AT, &src, LEN);
+            assert_eq!(rc, 0, "boot base: the second mapping maps");
+            let second = got.expect("boot base: the second mapping is registered");
+            assert_eq!(second.base, first, "boot base: map_and_slide_at did not take this boot's recorded base");
+            assert_eq!(std::slice::from_raw_parts(second.base as *const u8, LEN as usize), &src[..]);
+            libc::munmap(second.base as *mut _, LEN as usize);
+            TEST_BOOT.with(|t| *t.borrow_mut() = None);
+            let _ = std::fs::remove_dir_all(&d);
+
             // A reservation the kernel cannot make fails the call with ENOMEM and registers nothing.
             let (rc, got) = map_test_cache(FREE_AT, &src, 1 << 60);
             assert_eq!(rc, libc::ENOMEM as i64, "failed reservation: the call did not fail");
@@ -1552,6 +1715,147 @@ mod tests {
                 assert_eq!(again as u64, hint, "after a failed {which} trim the reservation was not released");
             }
         }
+    }
+
+    /// A fresh store directory of ours, mode 0700, under $TMPDIR; the test removes it.
+    fn boot_dir(tag: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::DirBuilderExt;
+        let d = std::env::temp_dir().join(format!("mcl-boot-base-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::DirBuilder::new().mode(0o700).create(&d).expect("boot dir");
+        d
+    }
+
+    // A second process of the same boot takes the first one's base, even with its own hint elsewhere.
+    #[test]
+    fn a_second_process_of_the_boot_gets_the_same_base() {
+        const FIRST: u64 = 0x2800_0000_0000;
+        const SECOND: u64 = 0x2900_0000_0000;
+        let d = boot_dir("same");
+        unsafe {
+            let b1 = reserve_boot_base_in(&d, "B00T-1", FIRST, LEN).expect("first process");
+            assert_eq!(b1, FIRST, "control: the first process lands at its free hint");
+            assert_eq!(read_boot_base(&d, "B00T-1", LEN), Some(b1), "the first process recorded no base for its boot");
+            libc::munmap(b1 as *mut _, LEN as usize); // the first process is gone
+            let c = reserve_cache(SECOND, LEN).expect("control");
+            assert_eq!(c, SECOND, "control: without a record the second hint lands at its own address");
+            libc::munmap(c as *mut _, LEN as usize);
+            let b2 = reserve_boot_base_in(&d, "B00T-1", SECOND, LEN).expect("second process");
+            assert_eq!(b2, b1, "the second process of the boot did not get the recorded base");
+            libc::munmap(b2 as *mut _, LEN as usize);
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // The recorded base occupied in this process: it is left alone, this process slides alone, the record stays.
+    #[test]
+    fn an_occupied_boot_base_falls_back_to_a_slide_of_its_own() {
+        const AT: u64 = 0x2a00_0000_0000;
+        let d = boot_dir("occupied");
+        write_boot_base(&d, "B00T-2", LEN, AT);
+        unsafe {
+            let occ = libc::mmap(AT as *mut _, 0x4000, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0);
+            assert_eq!(occ as u64, AT, "control: the recorded base starts free");
+            *(occ as *mut u8) = 0x5a;
+            let b = reserve_boot_base_in(&d, "B00T-2", AT, LEN).expect("an occupied boot base must fall back, not fail");
+            // Read through the fault-tolerant path: a range replaced and made PROT_NONE must fail this assertion,
+            // not crash the test.
+            let mut held = [0u8; 1];
+            let readable = crate::guestmem::read(occ as u64, &mut held);
+            assert!(readable && held[0] == 0x5a, "occupied boot base: what held it was overwritten (readable {readable}, byte {:#x})", held[0]);
+            assert_ne!(b, AT, "occupied boot base: the cache was put over what holds it");
+            assert_eq!(b % PAGE16, 0, "occupied boot base: the fallback is not 16 KiB-aligned");
+            assert_eq!(read_boot_base(&d, "B00T-2", LEN), Some(AT), "occupied boot base: the record was changed");
+            libc::munmap(b as *mut _, LEN as usize);
+            libc::munmap(occ, 0x4000);
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // A platform binary's hint is ignored, but the first process of the boot still takes the free preferred base
+    // exactly (fixed), and records it; a base the kernel placed is never recorded.
+    #[test]
+    fn the_first_process_takes_the_preferred_base_exactly_when_its_hint_is_ignored() {
+        const AT: u64 = 0x2d00_0000_0000;
+        const BUSY: u64 = 0x2e00_0000_0000;
+        let d = boot_dir("exact");
+        HINT_IGNORED.with(|h| h.set(true));
+        unsafe {
+            let c = reserve_cache(AT, LEN).expect("control");
+            assert_ne!(c, AT, "control: with the hint ignored, the kernel places the reservation elsewhere");
+            libc::munmap(c as *mut _, LEN as usize);
+            let b = reserve_boot_base_in(&d, "B00T-X", AT, LEN).expect("first process");
+            assert_eq!(b, AT, "the first process did not take the free preferred base exactly");
+            assert_eq!(read_boot_base(&d, "B00T-X", LEN), Some(AT), "the preferred base was not recorded");
+            libc::munmap(b as *mut _, LEN as usize);
+            // The preferred base occupied in the first process of another boot: it slides, and records nothing.
+            let occ = libc::mmap(BUSY as *mut _, 0x4000, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0);
+            assert_eq!(occ as u64, BUSY, "control: the busy base starts free");
+            let b = reserve_boot_base_in(&d, "B00T-Y", BUSY, LEN).expect("a busy preferred base must slide, not fail");
+            assert_ne!(b, BUSY);
+            assert_eq!(read_boot_base(&d, "B00T-Y", LEN), None, "a base the kernel placed was recorded for the boot");
+            libc::munmap(b as *mut _, LEN as usize);
+            libc::munmap(occ, 0x4000);
+        }
+        HINT_IGNORED.with(|h| h.set(false));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // A record that is not exactly ours, for this boot and this span, is not read.
+    #[test]
+    fn a_malformed_boot_record_is_ignored() {
+        const AT: u64 = 0x2f00_0000_0000;
+        let d = boot_dir("malformed");
+        let path = boot_base_path(&d, "B00T-M", LEN);
+        std::fs::write(&path, boot_base_record("B00T-M", LEN, AT)).unwrap();
+        assert_eq!(read_boot_base(&d, "B00T-M", LEN), Some(AT), "control: a well-formed record reads");
+        let bad = [
+            ("magic", format!("MCLBASE2 B00T-M {LEN:x} {AT:x}\n")),
+            ("span", format!("MCLBASE1 B00T-M {:x} {AT:x}\n", LEN + 0x4000)),
+            ("unaligned", format!("MCLBASE1 B00T-M {LEN:x} {:x}\n", AT + 0x1000)),
+            ("zero", format!("MCLBASE1 B00T-M {LEN:x} 0\n")),
+            ("extra field", format!("MCLBASE1 B00T-M {LEN:x} {AT:x} 1\n")),
+        ];
+        for (what, text) in bad {
+            std::fs::write(&path, text).unwrap();
+            assert_eq!(read_boot_base(&d, "B00T-M", LEN), None, "a record with a bad {what} was read");
+        }
+        std::fs::write(&path, boot_base_record("B00T-M", LEN, AT)).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+            assert_eq!(read_boot_base(&d, "B00T-M", LEN), None, "a record others can write was read");
+            std::fs::remove_file(&path).unwrap();
+            let real = d.join("real");
+            std::fs::write(&real, boot_base_record("B00T-M", LEN, AT)).unwrap();
+            std::os::unix::fs::symlink(&real, &path).unwrap();
+            assert_eq!(read_boot_base(&d, "B00T-M", LEN), None, "a symlinked record was read");
+        }
+        unsafe {
+            assert!(reserve_exact(AT + 0x1000, LEN).is_err(), "reserve_exact took an unaligned base");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // A record from another boot, free and well formed, is never taken, and this boot gets a record of its own.
+    #[test]
+    fn a_record_from_another_boot_is_ignored() {
+        const OLD: u64 = 0x2b00_0000_0000;
+        const NEW: u64 = 0x2c00_0000_0000;
+        let d = boot_dir("stale");
+        write_boot_base(&d, "OLD-B00T", LEN, OLD);
+        assert_eq!(read_boot_base(&d, "OLD-B00T", LEN), Some(OLD), "control: the other boot's record reads back");
+        // The same record copied under this boot's name still names the other boot inside, so it is refused too.
+        std::fs::write(boot_base_path(&d, "NEW-B00T", LEN + 0x4000), boot_base_record("OLD-B00T", LEN + 0x4000, OLD)).unwrap();
+        assert_eq!(read_boot_base(&d, "NEW-B00T", LEN + 0x4000), None, "a record naming another boot inside was read");
+        unsafe {
+            let b = reserve_boot_base_in(&d, "NEW-B00T", NEW, LEN).expect("this boot");
+            assert_ne!(b, OLD, "a record from another boot was taken");
+            assert_eq!(b, NEW, "control: with no record of its own boot it lands at its hint");
+            assert_eq!(read_boot_base(&d, "NEW-B00T", LEN), Some(NEW), "this boot recorded no base of its own");
+            libc::munmap(b as *mut _, LEN as usize);
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
