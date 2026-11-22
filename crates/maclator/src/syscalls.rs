@@ -282,6 +282,84 @@ fn descriptor_bound(n: u64, args: &[u64; 8]) -> bool {
     bits != 0
 }
 
+// The NOFOLLOW_ANY flags (same source): no symlink may be crossed. XNU checks only the components
+// it actually traverses from its starting point, so through a descriptor they depend on it too.
+// AT_SYMLINK_NOFOLLOW_ANY and FSOPT_NOFOLLOW_ANY share 0x0800 (O_EXCL in openat's oflag).
+const O_NOFOLLOW_ANY: u64 = 0x2000_0000;
+const AT_SYMLINK_NOFOLLOW_ANY: u64 = 0x0800;
+const FSOPT_NOFOLLOW_ANY: u64 = 0x0800;
+
+/// Whether *at call `n` carries a NOFOLLOW_ANY flag: openat's O_NOFOLLOW_ANY, faccessat's,
+/// fstatat's or fstatat64's AT_SYMLINK_NOFOLLOW_ANY, getattrlistat's FSOPT_NOFOLLOW_ANY.
+fn nofollow_any(n: u64, args: &[u64; 8]) -> bool {
+    let bits = match n {
+        463 | 464 => args[2] & O_NOFOLLOW_ANY,
+        466 | 469 | 470 => args[3] & AT_SYMLINK_NOFOLLOW_ANY,
+        476 => args[5] & FSOPT_NOFOLLOW_ANY,
+        _ => 0,
+    };
+    bits != 0
+}
+
+/// Whether an *at call must keep its own descriptor and name (no rewrite to AT_FDCWD and an
+/// absolute path). Always when descriptor_bound. With a NOFOLLOW_ANY flag, only when `inside()`
+/// (see `nofollow_any_inside`): the host descriptor is the redirected directory and the name never
+/// leaves it. Rewritten, the absolute path walks every component of the sysroot's path, and a
+/// symlink there (a sysroot reached through one; on macOS /var and /tmp are symlinks) gave ELOOP
+/// where XNU succeeds. Anything else is left to the rewrite. `inside` is asked only for a
+/// NOFOLLOW_ANY call that descriptor_bound does not already keep.
+fn keep_descriptor(n: u64, args: &[u64; 8], inside: impl FnOnce() -> bool) -> bool {
+    descriptor_bound(n, args) || (nofollow_any(n, args) && inside())
+}
+
+/// Whether relative name `name` stays beneath its starting directory: no `..` component ever
+/// climbs above it ("a/../b" stays, "../x" and "a/../../x" do not). Lexical; a symlink among the
+/// components is the host kernel's to judge, and under NOFOLLOW_ANY it refuses one.
+fn stays_beneath(name: &str) -> bool {
+    let mut depth = 0i64;
+    for c in name.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            _ => depth += 1,
+        }
+    }
+    true
+}
+
+/// Whether host descriptor `fd` is the directory at host path `host` (same device and inode;
+/// `host` is followed through symlinks, as the descriptor's open was). False when either is
+/// unreadable.
+fn same_host_dir(fd: i32, host: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return false;
+    }
+    std::fs::metadata(host).is_ok_and(|m| m.dev() == st.st_dev as u64 && m.ino() == st.st_ino as u64)
+}
+
+/// The `inside` test for a NOFOLLOW_ANY call through descriptor `fd` with name `name`, whose
+/// recorded guest path is `guest` (fd_guest_path). All three must hold:
+///  - the name is relative and stays beneath the descriptor (stays_beneath). A `..` that climbs
+///    out walks the HOST parent of the sysroot from a kept descriptor, not the guest parent;
+///    the rewrite is then left to decide;
+///  - the guest path is redirected, to host path `h`;
+///  - the descriptor really is `h` (same_host_dir). The guest path alone does not say so: a
+///    descriptor opened by a call that was itself kept (openat(rootfd, "System/Library/dyld",
+///    O_RESOLVE_BENEATH)) is recorded with the redirected guest path while it sits on the
+///    host's real directory.
+fn nofollow_any_inside(name: &str, fd: i32, guest: Option<String>, redirect: impl FnOnce(&str) -> Option<String>) -> bool {
+    !name.starts_with('/')
+        && stays_beneath(name)
+        && guest.and_then(|d| redirect(&d)).is_some_and(|h| same_host_dir(fd, &h))
+}
+
 fn bsd(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
     let (pidx, at) = path_arg(n);
     let mut keep: Option<std::ffi::CString> = None;
@@ -300,8 +378,12 @@ fn bsd(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
                 // A relative path beneath an overlaid directory may be absent
                 // from the payload. In that case fall back to the real guest
                 // absolute path, rather than looking only inside the overlay.
-                // Never when the flags bind the call to its descriptor (descriptor_bound).
-                let replacement = if at && descriptor_bound(n, &args) {
+                // Never when the flags bind the call to its descriptor (keep_descriptor).
+                let inside = || {
+                    let fd = args[0] as i32;
+                    nofollow_any_inside(&orig, fd, fd_guest_path(fd), crate::paths::redirect)
+                };
+                let replacement = if at && keep_descriptor(n, &args, inside) {
                     None
                 } else {
                     crate::paths::redirect(&full).or_else(|| {
@@ -957,5 +1039,100 @@ mod tests {
         assert!(!descriptor_bound(476, &a(3, FSOPT_RESOLVE_BENEATH)));
         assert!(!descriptor_bound(473, &[u64::MAX; 8])); // readlinkat has no flags
         assert!(!descriptor_bound(5, &[u64::MAX; 8])); // not an *at call
+    }
+
+    #[test]
+    fn nofollow_any_flags() {
+        for n in [463, 464] {
+            assert!(nofollow_any(n, &a(2, O_NOFOLLOW_ANY)));
+            assert!(nofollow_any(n, &a(2, O_NOFOLLOW_ANY | 0x0201)));
+            // must-fail controls: AT_SYMLINK_NOFOLLOW_ANY's value in openat's oflag is O_EXCL,
+            // O_NOFOLLOW (0x100) is not NOFOLLOW_ANY, and the right bit in the wrong slot
+            assert!(!nofollow_any(n, &a(2, AT_SYMLINK_NOFOLLOW_ANY)));
+            assert!(!nofollow_any(n, &a(2, 0x0100)));
+            assert!(!nofollow_any(n, &a(3, O_NOFOLLOW_ANY)));
+        }
+        for n in [466, 469, 470] {
+            assert!(nofollow_any(n, &a(3, AT_SYMLINK_NOFOLLOW_ANY)));
+            assert!(!nofollow_any(n, &a(3, 0x0020))); // AT_SYMLINK_NOFOLLOW
+            assert!(!nofollow_any(n, &a(3, O_NOFOLLOW_ANY))); // the openat value in an AT_ flag
+            assert!(!nofollow_any(n, &a(2, AT_SYMLINK_NOFOLLOW_ANY))); // wrong slot
+        }
+        assert!(nofollow_any(476, &a(5, FSOPT_NOFOLLOW_ANY)));
+        assert!(!nofollow_any(476, &a(5, 0x1))); // FSOPT_NOFOLLOW
+        assert!(!nofollow_any(476, &a(3, FSOPT_NOFOLLOW_ANY))); // wrong slot
+        assert!(!nofollow_any(473, &[u64::MAX; 8])); // readlinkat has no flags
+        assert!(!nofollow_any(5, &[u64::MAX; 8])); // not an *at call
+        assert!(!nofollow_any(463, &a(2, 0)));
+    }
+
+    #[test]
+    fn keep_descriptor_needs_inside_only_for_nofollow_any() {
+        let asked = std::cell::Cell::new(false);
+        let yes = || { asked.set(true); true };
+        // a NOFOLLOW_ANY call keeps its descriptor exactly when inside() says so
+        assert!(keep_descriptor(463, &a(2, O_NOFOLLOW_ANY), yes));
+        assert!(asked.get());
+        assert!(!keep_descriptor(463, &a(2, O_NOFOLLOW_ANY), || false));
+        assert!(keep_descriptor(469, &a(3, AT_SYMLINK_NOFOLLOW_ANY), || true));
+        assert!(!keep_descriptor(469, &a(3, AT_SYMLINK_NOFOLLOW_ANY), || false));
+        assert!(keep_descriptor(466, &a(3, AT_SYMLINK_NOFOLLOW_ANY), || true));
+        assert!(keep_descriptor(476, &a(5, FSOPT_NOFOLLOW_ANY), || true));
+        assert!(!keep_descriptor(476, &a(5, FSOPT_NOFOLLOW_ANY), || false));
+        // descriptor-bound flags keep it whatever inside() says, and do not ask it
+        let asked = std::cell::Cell::new(false);
+        assert!(keep_descriptor(469, &a(3, AT_FDONLY), || { asked.set(true); false }));
+        assert!(keep_descriptor(463, &a(2, O_RESOLVE_BENEATH), || { asked.set(true); false }));
+        assert!(!asked.get(), "inside() asked for a call descriptor_bound already keeps");
+        // must-fail control: no flag at all never keeps it, and inside() is not asked
+        let asked = std::cell::Cell::new(false);
+        assert!(!keep_descriptor(463, &a(2, 0), || { asked.set(true); true }));
+        assert!(!keep_descriptor(469, &a(3, 0x0020), || { asked.set(true); true }));
+        assert!(!asked.get(), "inside() asked for a call with no binding flag");
+    }
+
+    #[test]
+    fn stays_beneath_refuses_a_climb_out() {
+        for n in ["x", "a/b", "./x", "a/../x", "a/./../b", "a/b/../../c", "", "a//b"] {
+            assert!(stays_beneath(n), "{n} stays beneath");
+        }
+        // must-fail controls: out of the cache dir and back in, and a climb hidden behind a descent
+        for n in ["..", "../x", "../dyld/dyld_shared_cache_arm64e", "a/../../x", "./../x", "a/b/../../../c"] {
+            assert!(!stays_beneath(n), "{n} climbs out");
+        }
+    }
+
+    #[test]
+    fn nofollow_any_inside_needs_the_host_descriptor_to_be_the_redirect() {
+        use std::os::unix::io::AsRawFd;
+        let base = std::env::temp_dir().join(format!("maclator-e2v2-test-{}", std::process::id()));
+        let (sys, other) = (base.join("sys"), base.join("other"));
+        std::fs::create_dir_all(&sys).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let link = base.join("sys-link");
+        std::os::unix::fs::symlink(&sys, &link).unwrap();
+        let s = std::fs::File::open(&sys).unwrap();
+        let o = std::fs::File::open(&other).unwrap();
+        let g = || Some("/System/Library/dyld".to_string());
+        let to = |p: &std::path::Path| { let p = p.to_string_lossy().into_owned(); move |_: &str| Some(p.clone()) };
+        // the descriptor is the redirected directory: by its own path, or through a symlink to it
+        assert!(nofollow_any_inside("dyld_shared_cache_arm64e", s.as_raw_fd(), g(), to(&sys)));
+        assert!(nofollow_any_inside("dyld_shared_cache_arm64e", s.as_raw_fd(), g(), to(&link)));
+        assert!(nofollow_any_inside("a/../x", s.as_raw_fd(), g(), to(&sys)));
+        // The guest path is redirected, but the host descriptor sits elsewhere
+        assert!(!nofollow_any_inside("dyld_shared_cache_arm64e", o.as_raw_fd(), g(), to(&sys)));
+        // A name that climbs out of the descriptor
+        assert!(!nofollow_any_inside("../sys/x", s.as_raw_fd(), g(), to(&sys)));
+        // an absolute name, no guest path, a guest path that is not redirected, a closed fd
+        assert!(!nofollow_any_inside("/x", s.as_raw_fd(), g(), to(&sys)));
+        assert!(!nofollow_any_inside("x", s.as_raw_fd(), None, to(&sys)));
+        assert!(!nofollow_any_inside("x", s.as_raw_fd(), g(), |_: &str| None));
+        assert!(!nofollow_any_inside("x", -1, g(), to(&sys)));
+        drop(s);
+        drop(o);
+        std::fs::remove_file(&link).unwrap();
+        std::fs::remove_dir(&sys).unwrap();
+        std::fs::remove_dir(&other).unwrap();
+        std::fs::remove_dir(&base).unwrap();
     }
 }
