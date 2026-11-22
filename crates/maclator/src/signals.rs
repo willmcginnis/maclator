@@ -4,11 +4,11 @@
 use maclator_core::cpu::Cpu;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::Mutex;
+use crate::forksync::FMutex;
 
 #[derive(Clone, Copy, Default)]
 pub struct GuestAction { pub handler: u64, pub tramp: u64, pub mask: u32, pub flags: u32 }
-static ACTIONS: Mutex<[GuestAction; 32]> = Mutex::new([GuestAction { handler: 0, tramp: 0, mask: 0, flags: 0 }; 32]);
+pub(crate) static ACTIONS: FMutex<[GuestAction; 32]> = FMutex::new([GuestAction { handler: 0, tramp: 0, mask: 0, flags: 0 }; 32]);
 const SIG_IGN: u64 = 1;
 const UC_TRAD: i32 = 1;
 const UC_FLAVOR: i32 = 30;

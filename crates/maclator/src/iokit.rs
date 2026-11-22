@@ -8,7 +8,7 @@
 //! without ever reaching the kernel.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use crate::forksync::FMutex;
 
 const KERN_SUCCESS: u32 = 0;
 const K_IO_RETURN_UNSUPPORTED: u32 = 0xe000_02c7;
@@ -19,7 +19,7 @@ const ID_ITERATOR_NEXT: u32 = 2802;
 const K_IO_RETURN_NO_DEVICE: u32 = 0xe000_02c0;
 
 #[derive(Clone, Copy, PartialEq)]
-enum Kind {
+pub(crate) enum Kind {
     Service,
     /// Notification iterator that yields one fake service, then ends.
     Iterator { delivered: bool },
@@ -28,7 +28,7 @@ enum Kind {
 /// Service classes that exist only on Apple Silicon.
 const FAKE_CLASSES: &[&str] = &["AppleDiagnosticDataAccessReadOnly"];
 
-static FAKE_PORTS: Mutex<Option<HashMap<u32, Kind>>> = Mutex::new(None);
+pub(crate) static FAKE_PORTS: FMutex<Option<HashMap<u32, Kind>>> = FMutex::new(None);
 
 extern "C" {
     static mach_task_self_: u32;

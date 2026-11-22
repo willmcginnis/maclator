@@ -188,7 +188,7 @@ pub fn handle_svc(cpu: &mut Cpu) {
 
 /// Guest paths of open fds, so relative *at lookups can resolve both the dyld
 /// cache and optional Xcode component overlay without changing the host files.
-static FD_VPATHS: std::sync::Mutex<Option<std::collections::HashMap<i32, String>>> = std::sync::Mutex::new(None);
+pub(crate) static FD_VPATHS: crate::forksync::FMutex<Option<std::collections::HashMap<i32, String>>> = crate::forksync::FMutex::new(None);
 
 fn vpath_join(base: &str, rel: &str) -> String {
     if base == "/" {
@@ -1479,7 +1479,8 @@ fn bsd_inner(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
             // (mach_task_self, MIG reply ports, ...); the JIT reads guest memory through
             // mach_vm_read with the cached task port.
             crate::engine::flush_profile();
-            let pid = unsafe { libc::fork() };
+            // With every translator lock held across it.
+            let pid = crate::forksafe::fork();
             if pid < 0 {
                 set_err(cpu, unsafe { *libc::__error() } as u64);
             } else if pid == 0 {
@@ -2170,7 +2171,7 @@ fn mach_trap(cpu: &mut Cpu, n: u64) {
         // dyld-loaded libraries land at the same addresses every run (persistent AOT cache).
         // The arena is a large PROT_NONE reservation; allocations overwrite pieces of it.
         const ARENA_SIZE: u64 = 64 << 30;
-        static ARENA: std::sync::OnceLock<(u64, std::sync::atomic::AtomicU64)> = std::sync::OnceLock::new();
+        static ARENA: crate::forksync::FOnceLock<(u64, std::sync::atomic::AtomicU64)> = crate::forksync::FOnceLock::new();
         let (base, next) = ARENA.get_or_init(|| {
             for cand in [0x40_0000_0000u64, 0x20_0000_0000, 0x10_0000_0000, 0x0c_0000_0000, 0x08_0000_0000] {
                 let p = unsafe {

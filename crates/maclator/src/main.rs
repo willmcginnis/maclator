@@ -1,10 +1,34 @@
 //! Maclator: run arm64 macOS programs on x86-64 Macs.
 
+// The translator's own output goes out with plain write(2), not through
+// std's stdout and stderr locks. A thread blocked writing to a full pipe would hold that lock for
+// as long as the pipe stays full, and a fork waits for every translator lock. These shadow std's
+// macros for every module below (textual scope comes before the prelude).
+macro_rules! eprintln {
+    () => { $crate::forksync::write_out(2, String::new(), true) };
+    ($($a:tt)*) => { $crate::forksync::write_out(2, format!($($a)*), true) };
+}
+#[allow(unused_macros)]
+macro_rules! eprint {
+    ($($a:tt)*) => { $crate::forksync::write_out(2, format!($($a)*), false) };
+}
+#[allow(unused_macros)]
+macro_rules! println {
+    () => { $crate::forksync::write_out(1, String::new(), true) };
+    ($($a:tt)*) => { $crate::forksync::write_out(1, format!($($a)*), true) };
+}
+#[allow(unused_macros)]
+macro_rules! print {
+    ($($a:tt)*) => { $crate::forksync::write_out(1, format!($($a)*), false) };
+}
+
 mod aot;
 mod bundle;
 mod cache;
 mod commpage;
 mod engine;
+mod forksafe;
+mod forksync;
 mod gpu;
 mod guestmem;
 mod hostsys;

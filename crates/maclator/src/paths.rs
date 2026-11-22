@@ -5,11 +5,11 @@
 //! version) and points Maclator at it with `--sysroot`. dyld's lookups in the
 //! standard cache directories are redirected there.
 
-use std::sync::Mutex;
+use crate::forksync::FMutex;
 use std::path::{Component, Path, PathBuf};
 
-static CACHE_DIR: Mutex<Option<String>> = Mutex::new(None);
-static OVERLAY_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
+pub(crate) static CACHE_DIR: FMutex<Option<String>> = FMutex::new(None);
+pub(crate) static OVERLAY_ROOT: FMutex<Option<PathBuf>> = FMutex::new(None);
 
 // Keep experimental Xcode components local to the emulated process. These
 // prefixes contain the unmodified payloads of Xcode's prerequisite packages.

@@ -19,14 +19,14 @@ use iced_x86::BlockEncoderOptions;
 use std::collections::{BTreeSet, HashSet};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use crate::forksync::FMutex;
 
 const MAGIC: &[u8; 8] = b"MCLAOT04";
 /// Bump when the translator's output changes.
 const TRANSLATOR_VERSION: u32 = 26;
 
 #[derive(Clone)]
-struct Image {
+pub(crate) struct Image {
     name: String,
     key: String,
     start: u64,
@@ -38,9 +38,9 @@ struct Image {
     cached: bool,
 }
 
-static IMAGES: Mutex<Vec<Image>> = Mutex::new(Vec::new());
+pub(crate) static IMAGES: FMutex<Vec<Image>> = FMutex::new(Vec::new());
 /// Blocks translated by the JIT this run (per image index).
-static SEEN: Mutex<Vec<HashSet<u64>>> = Mutex::new(Vec::new());
+pub(crate) static SEEN: FMutex<Vec<HashSet<u64>>> = FMutex::new(Vec::new());
 static ENABLED: AtomicBool = AtomicBool::new(true);
 static SAVED: AtomicBool = AtomicBool::new(false);
 
@@ -246,7 +246,8 @@ pub fn ensure_loaded() {
             Ok(n) if n > 0 => {
                 img.cached = true;
                 if std::env::var_os("MACLATOR_TRACE").is_some() || std::env::var_os("MACLATOR_STATS").is_some() {
-                    eprintln!("[maclator] aot: loaded {n} blocks for {} in {:.1} ms", img.name, begun.elapsed().as_secs_f64() * 1000.0);
+                    // The file's name too, so a test can match a load to the file it read.
+                    eprintln!("[maclator] aot: loaded {n} blocks for {} (file {}.aot) in {:.1} ms", img.name, img.key, begun.elapsed().as_secs_f64() * 1000.0);
                 }
             }
             _ => {}
@@ -361,7 +362,7 @@ pub fn save_profile() {
     let sync = std::env::var_os("MACLATOR_AOT_SYNC").is_some();
     // Fork: the child still has the guest's memory mapped, so it can read
     // the code it needs to translate.
-    let pid = if sync { 0 } else { unsafe { libc::fork() } };
+    let pid = if sync { 0 } else { crate::forksafe::fork() };
     if pid != 0 {
         return;
     }
@@ -374,8 +375,26 @@ pub fn save_profile() {
             libc::dup2(null, 2);
         }
     }
+    // With MACLATOR_AOT_DONE_FILE set, the builder
+    // says it finished, and how each image went, in that file (written whole, by rename) as its
+    // last act: "aot-build pid=<pid> images=<n> ok=<k> failed=<f>". A test can then tell a builder
+    // that finished from one still running or killed, which a count of .aot files cannot.
+    let done = std::env::var_os("MACLATOR_AOT_DONE_FILE");
+    let (mut ok, mut failed) = (0usize, 0usize);
+    let images = rebuild.len();
     for (img, prof) in rebuild {
-        let _ = build(&img, &prof);
+        match build(&img, &prof) {
+            Ok(()) => ok += 1,
+            Err(_) => failed += 1,
+        }
+    }
+    if let Some(done) = done {
+        let done = std::path::PathBuf::from(done);
+        let tmp = done.with_extension("tmp");
+        let line = format!("aot-build pid={} images={images} ok={ok} failed={failed}\n", std::process::id());
+        if std::fs::write(&tmp, line).is_ok() {
+            let _ = std::fs::rename(&tmp, &done);
+        }
     }
     if !sync {
         unsafe { libc::_exit(0) };

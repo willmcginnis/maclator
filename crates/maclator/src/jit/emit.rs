@@ -110,40 +110,40 @@ pub struct Unit {
 // r14 holds the chained execution budget; helpers preserve it under SysV.
 pub const NCREGS: usize = 4;
 pub fn register_budget() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ENABLED: crate::forksync::FOnceLock<bool> = crate::forksync::FOnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("MACLATOR_JIT_REGISTER_BUDGET").as_deref() != Ok("0"))
 }
 /// Keep budget-exhaustion exits outside the common block-entry path.
 pub fn cold_budget() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ENABLED: crate::forksync::FOnceLock<bool> = crate::forksync::FOnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("MACLATOR_JIT_BUDGET_COLD").as_deref() != Ok("0"))
 }
 /// FMA needs both the instruction and OS support for saving AVX state. Include
 /// this code-generation choice in the AOT cache flags, and allow an A/B opt-out.
 pub fn native_fma() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ENABLED: crate::forksync::FOnceLock<bool> = crate::forksync::FOnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("MACLATOR_JIT_FMA").as_deref() != Ok("0")
         && std::is_x86_feature_detected!("avx") && std::is_x86_feature_detected!("fma"))
 }
 pub fn direct_operands() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ENABLED: crate::forksync::FOnceLock<bool> = crate::forksync::FOnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("MACLATOR_JIT_OPERANDS").as_deref() != Ok("0"))
 }
 /// Consecutive native conditional selects preserve the producer's host flags.
 /// Keep this code-generation choice in AOT flags and allow same-binary A/B.
 pub fn csel_chain() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ENABLED: crate::forksync::FOnceLock<bool> = crate::forksync::FOnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("MACLATOR_JIT_CSEL_CHAIN").as_deref() != Ok("0"))
 }
 /// Full NZCV write-through in two word stores. SETcc/MOV preserve live
 /// branch flags; architectural state remains current at budget suspension.
 /// Set MACLATOR_JIT_PACKED_FLAGS=0 to compare the byte-store implementation.
 pub fn packed_flags() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ENABLED: crate::forksync::FOnceLock<bool> = crate::forksync::FOnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("MACLATOR_JIT_PACKED_FLAGS").as_deref() != Ok("0"))
 }
 pub fn loop_cache() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ENABLED: crate::forksync::FOnceLock<bool> = crate::forksync::FOnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("MACLATOR_JIT_LOOP_CACHE").as_deref() != Ok("0"))
 }
 pub static LOOP_CACHE_BLOCKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -856,8 +856,7 @@ fn flags_dead_at(mut pc: u64, read: &dyn Fn(u64) -> Option<u32>) -> bool {
 /// Debugging aid: MACLATOR_JIT_DISABLE=dpimm,branch,ldst,dpreg routes those
 /// instruction classes to the interpreter.
 fn disabled_classes() -> u32 {
-    use std::sync::OnceLock;
-    static D: OnceLock<u32> = OnceLock::new();
+    static D: crate::forksync::FOnceLock<u32> = crate::forksync::FOnceLock::new();
     *D.get_or_init(|| {
         let v = std::env::var("MACLATOR_JIT_DISABLE").unwrap_or_default();
         let mut m = 0;

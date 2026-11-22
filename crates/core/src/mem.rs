@@ -92,8 +92,16 @@ rw!(r64, w64, u64);
 /// vendors or old processors. AVX detection also checks OSXSAVE/XCR0.
 /// AMD APM Volume 2, section 7.3.2; Intel SDM Volume 3, access atomicity.
 pub fn native_pair_atomic() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
+    // 0 not yet known, 1 no, 2 yes. An atomic rather than a OnceLock: a forked child must not
+    // inherit a OnceLock another thread was initialising (maclator's forksafe forbids std
+    // synchronisation in statics), and racing first calls compute the same answer.
+    static STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    match STATE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    let v = (|| {
         #[cfg(target_arch = "x86_64")]
         {
             let vendor = std::arch::x86_64::__cpuid(0);
@@ -102,7 +110,9 @@ pub fn native_pair_atomic() -> bool {
         }
         #[cfg(not(target_arch = "x86_64"))]
         { false }
-    })
+    })();
+    STATE.store(if v { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+    v
 }
 
 /// A single aligned 128-bit load, including read-only memory. Unaligned

@@ -75,25 +75,101 @@ pub fn bsdthread_register(a: &[u64; 8]) -> Result<u64, u64> {
 struct SendCpu(Box<Cpu>);
 unsafe impl Send for SendCpu {}
 
-/// Spawn a host thread running guest code from `cpu`.
-fn spawn_guest(mut cpu: Box<Cpu>, setup: impl FnOnce(&mut Cpu) + Send + 'static) {
+/// Spawn a host thread running guest code from `cpu`. Err when the thread could not be started.
+fn spawn_guest(mut cpu: Box<Cpu>, setup: impl FnOnce(&mut Cpu) + Send + 'static) -> std::io::Result<()> {
     let sc = SendCpu(cpu_take(&mut cpu));
     // XNU writes the new thread's Mach port to the guest TSD before
     // bsdthread_create returns. The caller may inspect that slot immediately
     // (or detach the thread), so do not expose a partially initialized pthread.
-    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
     LIVE_THREADS.fetch_add(1, Ordering::SeqCst);
-    std::thread::Builder::new()
-        .stack_size(8 << 20)
-        .spawn(move || {
-            let mut c = sc;
-            setup(&mut c.0);
-            ready_tx.send(()).expect("guest thread creator disappeared");
-            crate::engine::run_thread(&mut c.0);
-            LIVE_THREADS.fetch_sub(1, Ordering::SeqCst);
-        })
-        .expect("failed to spawn host thread");
-    ready_rx.recv().expect("guest thread setup did not complete");
+    let r = spawn_ready(8 << 20, move |ready| {
+        let mut c = sc;
+        setup(&mut c.0);
+        ready();
+        crate::engine::run_thread(&mut c.0);
+        LIVE_THREADS.fetch_sub(1, Ordering::SeqCst);
+    });
+    if r.is_err() {
+        LIVE_THREADS.fetch_sub(1, Ordering::SeqCst);
+    }
+    r
+}
+
+/// Spawn a host thread running `body`, and return once it has called `ready`.
+/// The wait is a pthread mutex and condvar, not an mpsc channel. A
+/// channel parks this thread on its std parker, and in a fork child the forking thread's parker
+/// may hold a semaphore made in the parent, which the child does not have. And the thread is a
+/// plain pthread (forksync::spawn_host), not a std::thread.
+/// Err, not a wait for good, when the thread ends without calling `ready`
+/// (or could not be started): the creator's state is set to "gone" when the thread's closure is
+/// dropped. A panic in `body` aborts the process (panic = "abort"); under the unwinding test
+/// harness it ends the thread and also reads as "gone".
+/// Once `ready` has published, the thread's end takes no lock.
+/// The guest code that runs after `ready` may fork, and the child's copy of the handshake mutex may
+/// be held by the creator, which is not in the child; a cleanup that locked it would wait for good.
+/// `ready` sets an atomic flag (under the mutex, so the creator still sees the state change under
+/// it) and the drop returns at once when the flag is set: nobody waits on a handshake after ready.
+pub(crate) fn spawn_ready(stack: usize, body: impl FnOnce(&dyn Fn()) + Send + 'static) -> std::io::Result<()> {
+    use crate::forksync::{FCondvar, FMutex};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    /// 0 waiting, 1 ready, 2 the thread is gone without calling ready; and "ready was published"
+    struct Handshake(FMutex<u8>, FCondvar, AtomicBool);
+    struct GoneOnDrop(Arc<Handshake>);
+    impl Drop for GoneOnDrop {
+        fn drop(&mut self) {
+            if self.0 .2.load(Ordering::Acquire) {
+                return;
+            }
+            let mut g = self.0 .0.lock().unwrap();
+            if *g == 0 {
+                *g = 2;
+            }
+            drop(g);
+            self.0 .1.notify_all();
+        }
+    }
+    let hs = Arc::new(Handshake(FMutex::new(0), FCondvar::new(), AtomicBool::new(false)));
+    #[cfg(test)]
+    test_note_handshake(&hs.0);
+    let theirs = GoneOnDrop(hs.clone());
+    let started = crate::forksync::spawn_host("", stack, Box::new(move || {
+        let t = theirs;
+        body(&|| {
+            let mut g = t.0 .0.lock().unwrap();
+            *g = 1;
+            t.0 .2.store(true, Ordering::Release);
+            drop(g);
+            t.0 .1.notify_all();
+        });
+    }));
+    started?;
+    let mut g = hs.0.lock().unwrap();
+    while *g == 0 {
+        g = hs.1.wait(g).unwrap();
+    }
+    if *g == 1 {
+        Ok(())
+    } else {
+        Err(std::io::Error::other("the new host thread ended before it was ready"))
+    }
+}
+
+/// Tests: the handshake mutex of the latest spawn_ready, so a test can hold it across a
+/// fork the new thread makes. Valid while that thread runs (its GoneOnDrop holds the Arc).
+#[cfg(test)]
+static TEST_LAST_HANDSHAKE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn test_note_handshake(m: &crate::forksync::FMutex<u8>) {
+    TEST_LAST_HANDSHAKE.store(m as *const _ as usize, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn test_last_handshake() -> &'static crate::forksync::FMutex<u8> {
+    let p = TEST_LAST_HANDSHAKE.load(Ordering::SeqCst);
+    assert!(p != 0, "no handshake yet");
+    unsafe { &*(p as *const crate::forksync::FMutex<u8>) }
 }
 
 fn cpu_take(c: &mut Box<Cpu>) -> Box<Cpu> {
@@ -128,7 +204,8 @@ pub fn bsdthread_create(a: &[u64; 8]) -> Result<u64, u64> {
         if tsd_off != 0 && mts_off != 0 {
             unsafe { *((pthread + tsd_off + mts_off) as *mut u64) = port };
         }
-    });
+    })
+    .map_err(|_| libc::EAGAIN as u64)?;
     Ok(pthread)
 }
 

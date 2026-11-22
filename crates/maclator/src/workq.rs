@@ -18,7 +18,7 @@ use maclator_core::cpu::Cpu;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Condvar, Mutex, Once};
+use crate::forksync::{FCondvar, FMutex};
 
 // ---- constants (workqueue_syscalls.h, event_private.h, priority_private.h) ----
 
@@ -157,7 +157,7 @@ struct Job {
     wl: Option<u64>,
 }
 
-struct Worker {
+pub(crate) struct Worker {
     stack_low: u64,
     pthread: u64,
     tx: Option<Sender<Job>>,
@@ -187,7 +187,7 @@ impl Worker {
     }
 }
 
-static IDLE: Mutex<Vec<Worker>> = Mutex::new(Vec::new());
+pub(crate) static IDLE: FMutex<Vec<Worker>> = FMutex::new(Vec::new());
 
 thread_local! {
     static PARK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -219,9 +219,13 @@ fn spawn_worker_thread(w: Worker, job: Job, rx: Receiver<Job>) {
     let (stack_low, pthread) = (w.stack_low, w.pthread);
     let tx = w.tx.clone().unwrap();
     crate::threads::LIVE_THREADS.fetch_add(1, Ordering::SeqCst);
-    std::thread::Builder::new()
-        .stack_size(8 << 20)
-        .spawn(move || {
+    // A plain pthread, not a std::thread (forksync::spawn_host).
+    crate::forksync::spawn_host("", 8 << 20, Box::new(move || {
+            // The process this worker was made in. If a guest
+            // fork on this thread made it the forking thread of a child, it must not return to the
+            // idle list: its channel's receiver parks this thread's std parker, made in the parent.
+            let gen0 = crate::forksafe::generation();
+            let (mut rx, mut tx) = (rx, tx);
             let port = unsafe { libc::mach_thread_self() } as u64;
             if tsd_off != 0 && mts_off != 0 {
                 unsafe { *((pthread + tsd_off + mts_off) as *mut u64) = port };
@@ -250,9 +254,14 @@ fn spawn_worker_thread(w: Worker, job: Job, rx: Receiver<Job>) {
                     }
                 }
                 crate::engine::run_thread(&mut cpu);
-                if !PARK.with(|p| p.get()) {
-                    break;
-                }
+                // Every way out of run_thread goes through
+                // worker_after_run, so a stale worker forgets its channel ends whether it parked
+                // or terminated.
+                let (r, t) = match worker_after_run(PARK.with(|p| p.get()), worker_is_stale(gen0), rx, tx) {
+                    AfterRun::Idle(r, t) => (r, t),
+                    AfterRun::End => break,
+                };
+                (rx, tx) = (r, t);
                 // The workloop (if any) was released by the return path.
                 IDLE.lock().unwrap().push(Worker { stack_low, pthread, tx: Some(tx.clone()) });
                 match rx.recv() {
@@ -261,8 +270,39 @@ fn spawn_worker_thread(w: Worker, job: Job, rx: Receiver<Job>) {
                 }
             }
             crate::threads::LIVE_THREADS.fetch_sub(1, Ordering::SeqCst);
-        })
-        .expect("failed to spawn workqueue thread");
+    }))
+    .expect("failed to spawn workqueue thread");
+}
+
+/// What a workqueue worker's host thread does once the guest thread has left run_thread.
+pub(crate) enum AfterRun<J> {
+    /// Go back to the idle list and wait on the receiver (the ends, handed back).
+    Idle(Receiver<J>, Sender<J>),
+    /// End the host thread. The channel ends are already gone: dropped (a worker of this process
+    /// that terminated) or forgotten (a stale one).
+    End,
+}
+
+/// `parked`: the guest thread returned to the workqueue
+/// (WQOPS_THREAD_RETURN); otherwise it terminated. `stale`: this worker was made before the latest
+/// fork, so this is the forking thread of a child. A stale worker ends its thread and forgets its
+/// channel ends, never drops them: the parent's other clones and its receiver's state were copied,
+/// and dropping takes the channel's internal lock, which a parent thread may have held at the fork.
+/// J v4 checked staleness only on the parked path, so a stale worker that terminated dropped them.
+pub(crate) fn worker_after_run<J>(parked: bool, stale: bool, rx: Receiver<J>, tx: Sender<J>) -> AfterRun<J> {
+    if stale {
+        // (Natively the guest's libdispatch kills such a child before a parked worker gets here;
+        // the stress tool's workq-return mode compares.)
+        std::mem::forget(rx);
+        std::mem::forget(tx);
+        return AfterRun::End;
+    }
+    if !parked {
+        drop(rx);
+        drop(tx);
+        return AfterRun::End;
+    }
+    AfterRun::Idle(rx, tx)
 }
 
 fn flags_for(pp: u64) -> u64 {
@@ -288,12 +328,12 @@ fn flags_for(pp: u64) -> u64 {
 /// kernel keeps the manager's events pending while one is bound. Events that
 /// fire while the manager runs are held here and handed over when it parks.
 #[derive(Default)]
-struct ManagerState {
+pub(crate) struct ManagerState {
     active: bool,
     pending: Vec<Kev>,
 }
 
-static MANAGER: Mutex<Option<ManagerState>> = Mutex::new(None);
+pub(crate) static MANAGER: FMutex<Option<ManagerState>> = FMutex::new(None);
 
 thread_local! {
     static IS_MANAGER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -350,7 +390,7 @@ fn release_manager() {
 /// (filter, ident). The host kernel does not hand the guest's pthread priority
 /// (e.g. the event-manager flag) back on fired events, but the thread we start
 /// for the event depends on it.
-static ANON_QOS: Mutex<Option<HashMap<(i16, u64), i32>>> = Mutex::new(None);
+pub(crate) static ANON_QOS: FMutex<Option<HashMap<(i16, u64), i32>>> = FMutex::new(None);
 
 fn record_anon_qos(changes: u64, nchanges: u64) {
     let mut g = ANON_QOS.lock().unwrap();
@@ -375,13 +415,20 @@ fn restore_anon_qos(k: &mut Kev) {
 }
 
 static ANON_KQ: AtomicI32 = AtomicI32::new(-1);
-static ANON_MONITOR: Once = Once::new();
+/// Starts the monitor once per process (a fork child starts its own);
+/// a std Once cannot be reset in a fork child.
+pub(crate) static ANON_START: FMutex<()> = FMutex::new(());
 
 fn anon_kq() -> i32 {
-    ANON_MONITOR.call_once(|| {
+    let kq = ANON_KQ.load(Ordering::SeqCst);
+    if kq >= 0 {
+        return kq;
+    }
+    let _g = ANON_START.lock().unwrap();
+    if ANON_KQ.load(Ordering::SeqCst) < 0 {
         ANON_KQ.store(host_kqueue(), Ordering::SeqCst);
-        std::thread::Builder::new().name("maclator-workq".into()).spawn(anon_monitor).unwrap();
-    });
+        crate::forksync::spawn_host("maclator-workq", 2 << 20, Box::new(anon_monitor)).unwrap();
+    }
     ANON_KQ.load(Ordering::SeqCst)
 }
 
@@ -448,10 +495,10 @@ struct SyncKnote {
     woken: bool,
 }
 
-static WLOG: Mutex<std::collections::VecDeque<String>> = Mutex::new(std::collections::VecDeque::new());
+pub(crate) static WLOG: FMutex<std::collections::VecDeque<String>> = FMutex::new(std::collections::VecDeque::new());
 
 pub fn wlog_enabled() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static V: crate::forksync::FOnceLock<bool> = crate::forksync::FOnceLock::new();
     *V.get_or_init(|| std::env::var_os("MACLATOR_WL_LOG").is_some())
 }
 
@@ -472,7 +519,7 @@ pub fn dump_log() {
 }
 
 fn owner_tracking() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static V: crate::forksync::FOnceLock<bool> = crate::forksync::FOnceLock::new();
     *V.get_or_init(|| std::env::var_os("MACLATOR_WL_NO_OWNER").is_none())
 }
 
@@ -486,17 +533,81 @@ fn owner_key(port: u64) -> u64 {
     port & !3
 }
 
-struct WlState {
+pub(crate) struct WlState {
     loops: HashMap<u64, Workloop>,
     sync: HashMap<(u64, u64), SyncKnote>,
     /// workloop kq fd -> workloop id
     by_fd: HashMap<i32, u64>,
 }
 
-static WL: Mutex<Option<WlState>> = Mutex::new(None);
-static WL_CV: Condvar = Condvar::new();
+pub(crate) static WL: FMutex<Option<WlState>> = FMutex::new(None);
+static WL_CV: FCondvar = FCondvar::new();
 static WL_MON_KQ: AtomicI32 = AtomicI32::new(-1);
-static WL_MONITOR: Once = Once::new();
+/// As ANON_START, for the workloop monitor.
+pub(crate) static WL_MON_START: FMutex<()> = FMutex::new(());
+
+/// In a fork child, with every lock fresh. The parent's workers, manager
+/// thread and monitors are not in the child, and its kqueues are not inherited by a fork. An
+/// idle worker's channel is forgotten, never dropped or sent to: its receiver is parked in the
+/// parent, and waking it from the child is fatal. New workers and monitors start on demand.
+pub(crate) fn reset_in_child() {
+    // Safety: forksafe::fork's child branch, before the child starts a thread.
+    unsafe { WL_CV.reinit_in_child() };
+    // The forking thread's own bindings name the parent's
+    // manager slot and workloops, which are dropped below.
+    IS_MANAGER.with(|m| m.set(false));
+    BOUND_WL.with(|b| b.set(None));
+    std::mem::forget(std::mem::take(&mut *IDLE.lock().unwrap()));
+    std::mem::forget(MANAGER.lock().unwrap().take());
+    std::mem::forget(WL.lock().unwrap().take());
+    std::mem::forget(ANON_QOS.lock().unwrap().take());
+    ANON_KQ.store(-1, Ordering::SeqCst);
+    WL_MON_KQ.store(-1, Ordering::SeqCst);
+}
+
+/// A worker made before the latest fork in this process (so in a parent)
+/// is the forking thread of a child and must not wait on its parent-made receiver.
+pub(crate) fn worker_is_stale(gen0: u64) -> bool {
+    crate::forksafe::generation() != gen0
+}
+
+#[cfg(test)]
+pub(crate) fn test_is_manager() -> bool {
+    IS_MANAGER.with(|m| m.get())
+}
+
+#[cfg(test)]
+pub(crate) fn test_set_manager_and_wl() {
+    IS_MANAGER.with(|m| m.set(true));
+    BOUND_WL.with(|b| b.set(Some(7)));
+}
+
+#[cfg(test)]
+pub(crate) fn test_bound_wl() -> Option<u64> {
+    BOUND_WL.with(|b| b.get())
+}
+
+/// Tests: park a fake idle worker's receiver on a thread of this process.
+#[cfg(test)]
+pub(crate) fn test_park_an_idle_worker() -> std::thread::JoinHandle<()> {
+    let (tx, rx) = channel::<Job>();
+    let h = std::thread::spawn(move || drop(rx.recv()));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let mut w = Worker::new().expect("worker stack");
+    w.tx = Some(tx);
+    IDLE.lock().unwrap().push(w);
+    h
+}
+
+#[cfg(test)]
+pub(crate) fn test_idle_len() -> usize {
+    IDLE.lock().unwrap().len()
+}
+
+#[cfg(test)]
+pub(crate) fn test_clear_idle() {
+    IDLE.lock().unwrap().clear();
+}
 
 fn with_wl<R>(f: impl FnOnce(&mut WlState) -> R) -> R {
     let mut g = WL.lock().unwrap();
@@ -505,10 +616,15 @@ fn with_wl<R>(f: impl FnOnce(&mut WlState) -> R) -> R {
 }
 
 fn wl_mon_kq() -> i32 {
-    WL_MONITOR.call_once(|| {
+    let kq = WL_MON_KQ.load(Ordering::SeqCst);
+    if kq >= 0 {
+        return kq;
+    }
+    let _g = WL_MON_START.lock().unwrap();
+    if WL_MON_KQ.load(Ordering::SeqCst) < 0 {
         WL_MON_KQ.store(host_kqueue(), Ordering::SeqCst);
-        std::thread::Builder::new().name("maclator-workloops".into()).spawn(wl_monitor).unwrap();
-    });
+        crate::forksync::spawn_host("maclator-workloops", 2 << 20, Box::new(wl_monitor)).unwrap();
+    }
     WL_MON_KQ.load(Ordering::SeqCst)
 }
 
@@ -747,7 +863,7 @@ fn kevent_id(args: &[u64; 8]) -> hostsys::SysResult {
     kevent_qos(kq, 0, 0, out, nout, data, avail, (flags & (KEVENT_FLAG_STACK_DATA | KEVENT_FLAG_IMMEDIATE)) | KEVENT_FLAG_IMMEDIATE)
 }
 
-fn finish_wait(mut g: std::sync::MutexGuard<'_, Option<WlState>>, key: (u64, u64), nerr: u64) -> hostsys::SysResult {
+fn finish_wait(mut g: crate::forksync::FMutexGuard<'_, Option<WlState>>, key: (u64, u64), nerr: u64) -> hostsys::SysResult {
     loop {
         let st = g.as_mut().unwrap();
         match st.sync.get(&key) {

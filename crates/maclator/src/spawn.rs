@@ -6,12 +6,12 @@
 use crate::hostsys::{self, SysResult};
 use std::ffi::CString;
 use crate::slices::arm64_only;
-use std::sync::Mutex;
+use crate::forksync::FMutex;
 
 const SYS_EXECVE: u64 = 59;
 
 /// Options to forward to re-launched children (`--sysroot X`, `--dyld D`, ...).
-static FORWARD: Mutex<Vec<String>> = Mutex::new(Vec::new());
+pub(crate) static FORWARD: FMutex<Vec<String>> = FMutex::new(Vec::new());
 
 pub fn configure(flags: Vec<String>) {
     *FORWARD.lock().unwrap() = flags;

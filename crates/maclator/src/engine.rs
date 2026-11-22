@@ -7,6 +7,7 @@ use maclator_core::cpu::Cpu;
 use maclator_core::disasm::disasm;
 use maclator_core::interp::{self, Exit};
 use std::cell::Cell;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 thread_local! {
     static EXIT_REQUESTED: Cell<bool> = const { Cell::new(false) };
@@ -26,7 +27,170 @@ pub fn flush_profile() {
 }
 
 /// Registry of running guest CPUs (for SIGUSR1 diagnostics).
-static CPUS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+pub(crate) static CPUS: crate::forksync::FMutex<Vec<usize>> = crate::forksync::FMutex::new(Vec::new());
+
+/// In a fork child, only the forking thread's CPU is running.
+/// And the parent's dump thread is not there; start the child's own, on a
+/// pipe of its own (the inherited one is shared with the parent's dump thread).
+pub(crate) fn reset_in_child() {
+    let me = CURRENT_CPU.with(|c| c.get());
+    CPUS.lock().unwrap().retain(|&k| k == me);
+    if DUMP_W.load(Ordering::SeqCst) >= 0 {
+        let (r, w) = (DUMP_R.swap(-1, Ordering::SeqCst), DUMP_W.swap(-1, Ordering::SeqCst));
+        unsafe {
+            libc::close(r);
+            libc::close(w);
+        }
+        start_dump_thread();
+    }
+}
+
+// The SIGUSR1 handler takes no lock and allocates nothing. It
+// writes one byte to a pipe, and a dump thread (started with the handler) does the dump outside
+// any signal handler. J v3's handler formatted text and took the symbol locks on whatever thread
+// the signal landed on: on a thread interrupted inside malloc, while another thread held those
+// locks inside fork() waiting for malloc's lock, that was a deadlock.
+static DUMP_R: AtomicI32 = AtomicI32::new(-1);
+/// Dumps done (tests: the SIGUSR1 storm's positive control).
+static DUMPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn dumps_done() -> u64 {
+    DUMPS.load(Ordering::Relaxed)
+}
+static DUMP_W: AtomicI32 = AtomicI32::new(-1);
+
+/// SIGUSR2 lines handled (tests: the positive control of the SIGUSR2 scenario).
+static USR2_DONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn usr2_done() -> u64 {
+    USR2_DONE.load(Ordering::Relaxed)
+}
+
+extern "C" fn request_dump(_: i32) {
+    let w = DUMP_W.load(Ordering::Relaxed);
+    if w >= 0 {
+        let b = 1u8;
+        let e = unsafe { *libc::__error() };
+        unsafe { libc::write(w, &b as *const u8 as *const libc::c_void, 1) };
+        unsafe { *libc::__error() = e };
+    }
+}
+
+fn start_dump_thread() {
+    let mut fds = [-1i32; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return;
+    }
+    unsafe {
+        for fd in fds {
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+        // A full pipe drops a request rather than block the handler.
+        let fl = libc::fcntl(fds[1], libc::F_GETFL);
+        libc::fcntl(fds[1], libc::F_SETFL, fl | libc::O_NONBLOCK);
+    }
+    let r = fds[0];
+    let started = crate::forksync::spawn_host("maclator-dump", 1 << 20, Box::new(move || {
+        // No signal is handled on this thread (its handlers would only ask it to dump).
+        unsafe {
+            let mut all: libc::sigset_t = std::mem::zeroed();
+            libc::sigfillset(&mut all);
+            for s in [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGFPE, libc::SIGTRAP] {
+                libc::sigdelset(&mut all, s);
+            }
+            libc::pthread_sigmask(libc::SIG_BLOCK, &all, std::ptr::null_mut());
+        }
+        // The pipe also carries SIGUSR2's text lines (each
+        // written whole: shorter than PIPE_BUF), which this thread copies to fd 2; a 0x01 byte
+        // is a SIGUSR1 dump request. A write blocked on a full stderr blocks only this thread,
+        // which holds no translator lock.
+        let mut buf = [0u8; 1024];
+        loop {
+            let n = unsafe { libc::read(r, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n > 0 {
+                let got = &buf[..n as usize];
+                let text: Vec<u8> = got.iter().copied().filter(|&c| c != 1).collect();
+                let mut b = &text[..];
+                while !b.is_empty() {
+                    let k = unsafe { libc::write(2, b.as_ptr() as *const libc::c_void, b.len()) };
+                    if k > 0 {
+                        b = &b[k as usize..];
+                    } else if k < 0 && unsafe { *libc::__error() } == libc::EINTR {
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
+                if got.contains(&1) {
+                    dump_threads(0);
+                }
+            } else if n < 0 && unsafe { *libc::__error() } == libc::EINTR {
+                continue;
+            } else {
+                return; // the pipe was closed (a fork child replaced it)
+            }
+        }
+    }));
+    if started.is_ok() {
+        DUMP_R.store(fds[0], Ordering::SeqCst);
+        DUMP_W.store(fds[1], Ordering::SeqCst);
+    } else {
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+    }
+}
+
+/// Append `s` to `buf` at `*at` (truncating at the end). Signal-safe: no allocation.
+fn put(buf: &mut [u8], at: &mut usize, s: &[u8]) {
+    for &c in s {
+        if *at < buf.len() {
+            buf[*at] = c;
+            *at += 1;
+        }
+    }
+}
+
+/// Append `v` in hex (no 0x). Signal-safe.
+fn put_hex(buf: &mut [u8], at: &mut usize, v: u64) {
+    let mut d = [0u8; 16];
+    let mut n = 0;
+    let mut x = v;
+    loop {
+        d[n] = b"0123456789abcdef"[(x & 15) as usize];
+        n += 1;
+        x >>= 4;
+        if x == 0 {
+            break;
+        }
+    }
+    while n > 0 {
+        n -= 1;
+        put(buf, at, &d[n..n + 1]);
+    }
+}
+
+/// Append `v` in decimal. Signal-safe.
+fn put_dec(buf: &mut [u8], at: &mut usize, v: u64) {
+    let mut d = [0u8; 20];
+    let mut n = 0;
+    let mut x = v;
+    loop {
+        d[n] = b'0' + (x % 10) as u8;
+        n += 1;
+        x /= 10;
+        if x == 0 {
+            break;
+        }
+    }
+    while n > 0 {
+        n -= 1;
+        put(buf, at, &d[n..n + 1]);
+    }
+}
 
 thread_local! {
     static CURRENT_CPU: Cell<usize> = const { Cell::new(0) };
@@ -34,48 +198,75 @@ thread_local! {
 
 /// SIGUSR2: print this thread's guest registers without taking any locks
 /// (usable in forked children where other threads' locks may be stuck).
+/// The handler never writes to fd 2, which
+/// can block (a full pipe) while this thread holds a translator lock that a fork waits for. It
+/// hands each line to the dump thread through the non-blocking request pipe (a full pipe drops the
+/// line), and the dump thread writes it. With no dump thread the line is dropped. errno is kept.
 extern "C" fn dump_current(_: i32) {
+    let w = DUMP_W.load(Ordering::Relaxed);
+    if w < 0 {
+        return;
+    }
+    let e = unsafe { *libc::__error() };
+    let mut sent = false;
+    format_current(|line| {
+        unsafe { libc::write(w, line.as_ptr() as *const libc::c_void, line.len()) };
+        sent = true;
+    });
+    if sent {
+        USR2_DONE.fetch_add(1, Ordering::Relaxed);
+    }
+    unsafe { *libc::__error() = e };
+}
+
+/// fault_dump's use: the same lines, written straight to fd 2 (fault_dump has pointed it at a file
+/// and is about to end the process).
+fn dump_current_direct() {
+    format_current(|line| {
+        unsafe { libc::write(2, line.as_ptr() as *const libc::c_void, line.len()) };
+    });
+}
+
+/// Format this thread's registers and the JIT counters as two lines (each under 512 bytes, so a
+/// pipe write of one is atomic) into a stack buffer, handing each to `emit`. Signal-safe.
+fn format_current(mut emit: impl FnMut(&[u8])) {
     let p = CURRENT_CPU.with(|c| c.get());
     if p == 0 {
         return;
     }
     let cpu = unsafe { &*(p as *const Cpu) };
-    let mut buf = [0u8; 1024];
-    unsafe {
-        let n = libc::snprintf(
-            buf.as_mut_ptr() as *mut libc::c_char,
-            buf.len(),
-            b"[usr2] pid %d pc=%llx lr=%llx sp=%llx x0=%llx x1=%llx x2=%llx x3=%llx x8=%llx x16=%llx x19=%llx x20=%llx x21=%llx x22=%llx\n\0".as_ptr() as *const libc::c_char,
-            libc::getpid(),
-            cpu.pc,
-            cpu.x[30],
-            cpu.x[31],
-            cpu.x[0],
-            cpu.x[1],
-            cpu.x[2],
-            cpu.x[3],
-            cpu.x[8],
-            cpu.x[16],
-            cpu.x[19],
-            cpu.x[20],
-            cpu.x[21],
-            cpu.x[22],
-        );
-        libc::write(2, buf.as_ptr() as *const libc::c_void, (n.max(0) as usize).min(buf.len() - 1));
-        let (blocks, ms, interp, entries, fb) = crate::jit::stats_snapshot();
-        let n = libc::snprintf(
-            buf.as_mut_ptr() as *mut libc::c_char,
-            buf.len(),
-            b"[stats] pid %d translated=%llu blocks in %llu ms, cold-interpreted=%llu blocks, block-entries=%llu, fallback-insns=%llu\n\0".as_ptr() as *const libc::c_char,
-            libc::getpid(),
-            blocks,
-            ms,
-            interp,
-            entries,
-            fb,
-        );
-        libc::write(2, buf.as_ptr() as *const libc::c_void, (n.max(0) as usize).min(buf.len() - 1));
+    // Formatted by hand into a stack buffer; snprintf is not async-signal-safe.
+    let mut buf = [0u8; 512];
+    let mut at = 0;
+    put(&mut buf, &mut at, b"[usr2] pid ");
+    put_dec(&mut buf, &mut at, unsafe { libc::getpid() } as u64);
+    let regs: [(&[u8], u64); 13] = [
+        (b" pc=", cpu.pc), (b" lr=", cpu.x[30]), (b" sp=", cpu.x[31]), (b" x0=", cpu.x[0]), (b" x1=", cpu.x[1]),
+        (b" x2=", cpu.x[2]), (b" x3=", cpu.x[3]), (b" x8=", cpu.x[8]), (b" x16=", cpu.x[16]), (b" x19=", cpu.x[19]),
+        (b" x20=", cpu.x[20]), (b" x21=", cpu.x[21]), (b" x22=", cpu.x[22]),
+    ];
+    for (k, v) in regs {
+        put(&mut buf, &mut at, k);
+        put_hex(&mut buf, &mut at, v);
     }
+    put(&mut buf, &mut at, b"\n");
+    emit(&buf[..at]);
+    let (blocks, ms, interp, entries, fb) = crate::jit::stats_snapshot();
+    let mut at = 0;
+    put(&mut buf, &mut at, b"[stats] pid ");
+    put_dec(&mut buf, &mut at, unsafe { libc::getpid() } as u64);
+    for (k, v) in [(&b" translated="[..], blocks), (b" blocks in ", ms), (b" ms, cold-interpreted=", interp), (b" blocks, block-entries=", entries), (b", fallback-insns=", fb)] {
+        put(&mut buf, &mut at, k);
+        put_dec(&mut buf, &mut at, v);
+    }
+    put(&mut buf, &mut at, b"\n");
+    emit(&buf[..at]);
+}
+
+/// Tests: make `p` this thread's current guest CPU, as run_thread does.
+#[cfg(test)]
+pub(crate) fn test_set_current_cpu(p: usize) {
+    CURRENT_CPU.with(|c| c.set(p));
 }
 
 pub fn run_thread(cpu: &mut Cpu) {
@@ -90,7 +281,11 @@ pub fn run_thread(cpu: &mut Cpu) {
     crate::signals::leave_thread();
 }
 
-extern "C" fn dump_threads(_: i32) {
+/// The SIGUSR1 dump, run on the dump thread (and by fault_dump, on a thread that is about to exit
+/// the process). It takes locks and allocates, so it must never run inside a signal handler on a
+/// thread that may hold a lock or be inside malloc.
+fn dump_threads(_: i32) {
+    DUMPS.fetch_add(1, Ordering::Relaxed);
     crate::workq::dump_log();
     // Best effort, racy by design: this is a debugging aid.
     let list = CPUS.try_lock().map(|g| g.clone()).unwrap_or_default();
@@ -117,7 +312,10 @@ extern "C" fn dump_threads(_: i32) {
 }
 
 pub fn install_debug_handler() {
-    unsafe { libc::signal(libc::SIGUSR1, dump_threads as usize) };
+    if DUMP_W.load(Ordering::SeqCst) < 0 {
+        start_dump_thread();
+    }
+    unsafe { libc::signal(libc::SIGUSR1, request_dump as usize) };
     unsafe { libc::signal(libc::SIGUSR2, dump_current as usize) };
     if std::env::var_os("MACLATOR_DUMP_ON_FAULT").is_some() {
         unsafe {
@@ -154,10 +352,11 @@ extern "C" fn fault_dump(sig: i32, info: *mut libc::siginfo_t, context: *mut lib
             libc::dup2(fd, 2);
         }
     }
+    crate::forksync::output_direct_on_this_thread();
     eprintln!("maclator: host signal {sig} in emulator; guest state:");
     // Always emit the current thread first: the registry mutex may be held by
     // another thread, especially in a fork child or during thread creation.
-    dump_current(sig);
+    dump_current_direct();
     unsafe {
         let address = if info.is_null() { std::ptr::null_mut() } else { (*info).si_addr };
         let code = if info.is_null() { 0 } else { (*info).si_code };

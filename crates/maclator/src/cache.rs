@@ -8,12 +8,12 @@
 //! info (rebasing; pointer-auth signing is the identity in Maclator).
 
 use crate::hostsys;
-use std::sync::Mutex;
+use crate::forksync::FMutex;
 
 /// Where we place the arm64 shared region (unslid start 0x180000000).
 pub const CACHE_BASE: u64 = 0x6_0000_0000;
 
-pub static CACHE: Mutex<Option<MappedCache>> = Mutex::new(None);
+pub static CACHE: FMutex<Option<MappedCache>> = FMutex::new(None);
 
 #[derive(Debug, Clone)]
 pub struct MappedCache {

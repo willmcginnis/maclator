@@ -9,8 +9,9 @@
 
 use maclator_core::cpu::Cpu;
 use std::ffi::CString;
+use crate::forksync::{FCondvar, FMutex, FOnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub const SYS_MCL_HOSTCALL: u64 = 0x4D43;
@@ -67,7 +68,7 @@ pub fn inject(envp: &mut Vec<String>) -> bool {
     true
 }
 
-static BRIDGE: OnceLock<Option<(CallFn, Option<extern "C" fn()>)>> = OnceLock::new();
+static BRIDGE: FOnceLock<Option<(CallFn, Option<extern "C" fn()>)>> = FOnceLock::new();
 
 fn bridge() -> Option<(CallFn, Option<extern "C" fn()>)> {
     *BRIDGE.get_or_init(|| {
@@ -94,8 +95,11 @@ fn bridge() -> Option<(CallFn, Option<extern "C" fn()>)> {
 }
 
 /// Hand-off state between a guest thread and its dedicated bridge thread. Both sides spin briefly
-/// (a bridged call is usually answered within microseconds) and then park; `unpark` tokens make the
-/// park/unpark pairing race-free.
+/// (a bridged call is usually answered within microseconds) and then wait on `cv`.
+/// The wait is a pthread mutex and condvar (forksync), not std's
+/// park/unpark. A guest thread that made a bridged call and then forked keeps this state in its
+/// thread-local in the child, where the bridge thread does not exist and a std parker made in the
+/// parent cannot be used; `gen` makes that state stale there, and a new bridge thread is started.
 struct Shared {
     /// 0 idle, 1 request posted, 2 reply ready, 3 shut down
     state: AtomicU32,
@@ -104,8 +108,20 @@ struct Shared {
     len: AtomicU64,
     out_p: AtomicU64,
     out_n: AtomicU64,
-    bridge_parked: AtomicBool,
-    caller_parked: AtomicBool,
+    bridge_waiting: AtomicBool,
+    caller_waiting: AtomicBool,
+    m: FMutex<()>,
+    cv: FCondvar,
+}
+
+impl Shared {
+    /// Wake the other side: take the mutex so a waiter that saw the old state is already waiting.
+    fn wake(&self, waiting: &AtomicBool) {
+        if waiting.load(Ordering::SeqCst) {
+            drop(self.m.lock().unwrap());
+            self.cv.notify_all();
+        }
+    }
 }
 
 /// Host frameworks (CoreFoundation, XPC, Metal) must never run on a guest thread: the kernel
@@ -114,13 +130,13 @@ struct Shared {
 /// guest thread gets its own dedicated bridge thread and hands its calls over.
 struct BridgeThread {
     sh: Arc<Shared>,
-    bridge: std::thread::Thread,
-    caller: std::thread::Thread,
+    /// forksafe::generation() when the bridge thread was started.
+    gen: u64,
 }
 
-/// Spin budgets in microseconds, `MACLATOR_GPU_SPIN=caller,bridge` (default 20,20; 0,0 = always park).
+/// Spin budgets in microseconds, `MACLATOR_GPU_SPIN=caller,bridge` (default 20,20; 0,0 = always wait).
 fn spin_budgets() -> (Duration, Duration) {
-    static B: OnceLock<(Duration, Duration)> = OnceLock::new();
+    static B: FOnceLock<(Duration, Duration)> = FOnceLock::new();
     *B.get_or_init(|| {
         let (c, b) = std::env::var("MACLATOR_GPU_SPIN")
             .ok()
@@ -133,8 +149,9 @@ fn spin_budgets() -> (Duration, Duration) {
     })
 }
 
-/// Spin (bounded in time), then park, until `done()`; `flag` tells the other side an unpark is needed.
-fn wait_for(done: impl Fn() -> bool, flag: &AtomicBool, spin: Duration) {
+/// Spin (bounded in time), then wait on the condvar, until `done()`; `flag` tells the other side a
+/// wake-up is needed.
+fn wait_for(sh: &Shared, done: impl Fn() -> bool, flag: &AtomicBool, spin: Duration) {
     let t0 = Instant::now();
     let mut n = 0u32;
     loop {
@@ -146,13 +163,14 @@ fn wait_for(done: impl Fn() -> bool, flag: &AtomicBool, spin: Duration) {
             std::hint::spin_loop();
             continue;
         }
+        let mut g = sh.m.lock().unwrap();
         flag.store(true, Ordering::SeqCst);
-        if done() {
-            flag.store(false, Ordering::SeqCst);
-            return;
+        while !done() {
+            g = sh.cv.wait(g).unwrap();
         }
-        std::thread::park();
         flag.store(false, Ordering::SeqCst);
+        drop(g);
+        return;
     }
 }
 
@@ -165,35 +183,28 @@ impl BridgeThread {
             len: AtomicU64::new(0),
             out_p: AtomicU64::new(0),
             out_n: AtomicU64::new(0),
-            bridge_parked: AtomicBool::new(false),
-            caller_parked: AtomicBool::new(false),
+            bridge_waiting: AtomicBool::new(false),
+            caller_waiting: AtomicBool::new(false),
+            m: FMutex::new(()),
+            cv: FCondvar::new(),
         });
-        let caller = std::thread::current();
         let sh2 = sh.clone();
-        let h = std::thread::Builder::new()
-            .name("maclator-gpu".into())
-            .stack_size(8 << 20)
-            .spawn({
-                let caller = caller.clone();
-                move || loop {
-                    wait_for(|| matches!(sh2.state.load(Ordering::Acquire), 1 | 3), &sh2.bridge_parked, spin_budgets().1);
-                    if sh2.state.load(Ordering::Acquire) == 3 {
-                        return;
-                    }
-                    let mut outlen = 0u64;
-                    let p = unsafe {
-                        f(sh2.op.load(Ordering::Relaxed), sh2.input.load(Ordering::Relaxed) as *const u8, sh2.len.load(Ordering::Relaxed), &mut outlen)
-                    };
-                    sh2.out_p.store(p as u64, Ordering::Relaxed);
-                    sh2.out_n.store(outlen, Ordering::Relaxed);
-                    sh2.state.store(2, Ordering::SeqCst);
-                    if sh2.caller_parked.load(Ordering::SeqCst) {
-                        caller.unpark();
-                    }
-                }
-            })
-            .expect("spawn GPU bridge thread");
-        BridgeThread { sh, bridge: h.thread().clone(), caller }
+        crate::forksync::spawn_host("maclator-gpu", 8 << 20, Box::new(move || loop {
+            wait_for(&sh2, || matches!(sh2.state.load(Ordering::Acquire), 1 | 3), &sh2.bridge_waiting, spin_budgets().1);
+            if sh2.state.load(Ordering::Acquire) == 3 {
+                return;
+            }
+            let mut outlen = 0u64;
+            let p = unsafe {
+                f(sh2.op.load(Ordering::Relaxed), sh2.input.load(Ordering::Relaxed) as *const u8, sh2.len.load(Ordering::Relaxed), &mut outlen)
+            };
+            sh2.out_p.store(p as u64, Ordering::Relaxed);
+            sh2.out_n.store(outlen, Ordering::Relaxed);
+            sh2.state.store(2, Ordering::SeqCst);
+            sh2.wake(&sh2.caller_waiting);
+        }))
+        .expect("spawn GPU bridge thread");
+        BridgeThread { sh, gen: crate::forksafe::generation() }
     }
 
     fn call(&self, op: u64, input: u64, len: u64) -> (u64, u64) {
@@ -202,21 +213,27 @@ impl BridgeThread {
         sh.input.store(input, Ordering::Relaxed);
         sh.len.store(len, Ordering::Relaxed);
         sh.state.store(1, Ordering::SeqCst);
-        if sh.bridge_parked.load(Ordering::SeqCst) {
-            self.bridge.unpark();
-        }
-        wait_for(|| sh.state.load(Ordering::Acquire) == 2, &sh.caller_parked, spin_budgets().0);
+        sh.wake(&sh.bridge_waiting);
+        wait_for(sh, || sh.state.load(Ordering::Acquire) == 2, &sh.caller_waiting, spin_budgets().0);
         let r = (sh.out_p.load(Ordering::Relaxed), sh.out_n.load(Ordering::Relaxed));
         sh.state.store(0, Ordering::Release);
         r
+    }
+
+    /// Made before the latest fork in this process: its bridge thread is not in this process.
+    fn stale(&self) -> bool {
+        self.gen != crate::forksafe::generation()
     }
 }
 
 impl Drop for BridgeThread {
     fn drop(&mut self) {
+        if self.stale() {
+            // Its mutex may have been copied held by the parent's bridge thread: do not touch it.
+            return;
+        }
         self.sh.state.store(3, Ordering::SeqCst);
-        self.bridge.unpark();
-        let _ = &self.caller;
+        self.sh.wake(&self.sh.bridge_waiting);
     }
 }
 
@@ -227,9 +244,20 @@ thread_local! {
 fn call_on_bridge_thread(f: CallFn, op: u64, input: u64, len: u64) -> Option<(u64, u64)> {
     BRIDGE_THREAD.with(|b| {
         let mut b = b.borrow_mut();
+        if b.as_ref().is_some_and(|bt| bt.stale()) {
+            // A fork child's forking thread: forget the parent's bridge (never drop it; its Shared
+            // is kept alive by the leak) and start this process's own.
+            std::mem::forget(b.take());
+        }
         let bt = b.get_or_insert_with(|| BridgeThread::spawn(f));
         Some(bt.call(op, input, len))
     })
+}
+
+/// Tests: a bridged call through `f`, on this thread's bridge thread.
+#[cfg(test)]
+pub(crate) fn test_call(f: CallFn, op: u64) -> (u64, u64) {
+    call_on_bridge_thread(f, op, 0, 0).unwrap()
 }
 
 /// Load the host bridge and warm the GPU up before the guest starts (see `mcl_warmup`).

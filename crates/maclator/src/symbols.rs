@@ -2,17 +2,17 @@
 
 use crate::cache;
 use maclator_core::cpu::Cpu;
-use std::sync::Mutex;
+use crate::forksync::FMutex;
 
 #[derive(Clone)]
-struct Img {
+pub(crate) struct Img {
     start: u64,
     end: u64,
     name: String,
 }
 
-static IMAGES: Mutex<Vec<Img>> = Mutex::new(Vec::new());
-static CACHE_IMAGES_LOADED: Mutex<bool> = Mutex::new(false);
+pub(crate) static IMAGES: FMutex<Vec<Img>> = FMutex::new(Vec::new());
+pub(crate) static CACHE_IMAGES_LOADED: FMutex<bool> = FMutex::new(false);
 
 pub fn add_image(start: u64, end: u64, name: &str) {
     IMAGES.lock().unwrap().push(Img { start, end, name: name.to_string() });

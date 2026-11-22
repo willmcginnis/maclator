@@ -34,7 +34,8 @@ impl std::hash::Hasher for Fx {
 }
 type FastMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<Fx>>;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock, RwLock};
+use crate::forksync::{FMutex, FRwLock};
+use crate::forksync::FOnceLock;
 
 /// Entries in each thread's indirect-branch translation cache.
 pub const IBTC_SIZE: usize = 32768;
@@ -111,10 +112,10 @@ pub struct CodeCache {
     slot_ptr: AtomicU64,
 }
 
-static CODE: OnceLock<CodeCache> = OnceLock::new();
+static CODE: FOnceLock<CodeCache> = FOnceLock::new();
 /// guest pc -> host code
-static BLOCKS: RwLock<Option<FastMap<u64, u64>>> = RwLock::new(None);
-static TRANSLATE: Mutex<()> = Mutex::new(());
+pub(crate) static BLOCKS: FRwLock<Option<FastMap<u64, u64>>> = FRwLock::new(None);
+pub(crate) static TRANSLATE: FMutex<()> = FMutex::new(());
 static EPOCH: AtomicU64 = AtomicU64::new(0);
 pub static JIT_ENABLED: AtomicBool = AtomicBool::new(true);
 
@@ -132,7 +133,7 @@ struct UnitRec {
 /// pages, which chained exit slots jump into which unit, and each slot's
 /// default (return-to-dispatcher) continuation.
 #[derive(Default)]
-struct JitIndex {
+pub(crate) struct JitIndex {
     units: Vec<UnitRec>,
     /// 16 KiB guest page -> unit ids overlapping it.
     pages: FastMap<u64, Vec<u32>>,
@@ -141,7 +142,7 @@ struct JitIndex {
     slot_cont: FastMap<u64, u64>,
 }
 
-static INDEX: Mutex<Option<JitIndex>> = Mutex::new(None);
+pub(crate) static INDEX: FMutex<Option<JitIndex>> = FMutex::new(None);
 static STATS_BLOCKS: AtomicU64 = AtomicU64::new(0);
 static STATS_INSNS: AtomicU64 = AtomicU64::new(0);
 static STATS_FALLBACK: AtomicU64 = AtomicU64::new(0);
@@ -152,7 +153,7 @@ static STATS_JIT_ENTRIES: AtomicU64 = AtomicU64::new(0);
 
 /// Executions of a block in the interpreter before it is JIT-compiled.
 fn hot_threshold() -> u32 {
-    static T: OnceLock<u32> = OnceLock::new();
+    static T: FOnceLock<u32> = FOnceLock::new();
     *T.get_or_init(|| std::env::var("MACLATOR_JIT_THRESHOLD").ok().and_then(|v| v.parse().ok()).unwrap_or(24))
 }
 
@@ -216,8 +217,11 @@ pub fn register_blocks(blocks: impl ExactSizeIterator<Item = (u64, u64)>) {
 
 // ---------------- helpers called from generated code ----------------
 
-static HIST_ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("MACLATOR_FALLBACK_HIST").is_some());
-static HIST: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+static HIST_ON: FOnceLock<bool> = FOnceLock::new();
+fn hist_on() -> bool {
+    *HIST_ON.get_or_init(|| std::env::var_os("MACLATOR_FALLBACK_HIST").is_some())
+}
+pub(crate) static HIST: FMutex<Option<HashMap<String, u64>>> = FMutex::new(None);
 static HIST_N: AtomicU64 = AtomicU64::new(0);
 
 /// Count executions of instructions that fall back to the interpreter, by mnemonic,
@@ -247,7 +251,7 @@ fn note_fallback_exec(insn: u32) {
 }
 
 extern "C" fn helper_interp(cpu: *mut Cpu, insn: u32, pc: u64) -> u64 {
-    if *HIST_ON {
+    if hist_on() {
         note_fallback_exec(insn);
     }
     let cpu = unsafe { &mut *cpu };
@@ -289,7 +293,7 @@ pub fn guest_reader() -> impl Fn(u64) -> Option<u32> {
 // ---------------- translation ----------------
 
 fn verify_mode() -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
+    static V: FOnceLock<bool> = FOnceLock::new();
     *V.get_or_init(|| std::env::var_os("MACLATOR_JIT_VERIFY").is_some())
 }
 
