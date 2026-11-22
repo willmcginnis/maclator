@@ -57,6 +57,16 @@ fn pread_all(fd: i32, buf: &mut [u8], off: u64) -> bool {
     true
 }
 
+/// MAP_FIXED over unmapped space raises EXC_GUARD (kGUARD_EXC_DEALLOC_GAP) on current Darwin: one logged exception per
+/// mapping in an ordinary process, fatal in a platform binary. So reserve first, by hint, as `loader::map_image` does.
+/// A range something already occupies stays as it is, and the MAP_FIXED that follows replaces it as before.
+unsafe fn reserve_if_unmapped(addr: u64, size: usize) {
+    let p = libc::mmap(addr as *mut _, size, libc::PROT_NONE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0);
+    if p != libc::MAP_FAILED && p as u64 != addr {
+        libc::munmap(p, size);
+    }
+}
+
 /// Handle `shared_region_map_and_slide_2_np(files_count, files, mappings_count, mappings)`.
 /// Returns 0 or an errno.
 pub fn map_and_slide_2(files_count: u32, files: u64, mappings_count: u32, mappings: u64) -> i64 {
@@ -81,6 +91,7 @@ pub fn map_and_slide_2(files_count: u32, files: u64, mappings_count: u32, mappin
             let size = m.size as usize;
             let prot = (m.init_prot & 3) as i32; // never map guest code executable on the host
             unsafe {
+                reserve_if_unmapped(addr, size);
                 let p = if f.fd < 0 {
                     // Dynamic config data lives in the caller's memory.
                     let p = libc::mmap(addr as *mut _, size, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_FIXED, -1, 0);
@@ -221,4 +232,48 @@ unsafe fn apply_slide_info(info: &[u8], region: u64, size: u64, slide: u64, unsl
 #[allow(dead_code)]
 fn _unused() {
     let _ = hostsys::CLASS_UNIX;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LEN: usize = 0x8000;
+    // Far above where unhinted mappings land, and one address per test: cargo runs these beside other tests' mappings.
+    const FREE_AT: u64 = 0x2000_0000_0000;
+    const OCCUPIED_AT: u64 = 0x2100_0000_0000;
+
+    // A hint lands at a free address and moves off an occupied one, so a second hint says whether the range is mapped.
+    fn is_mapped(addr: u64) -> bool {
+        unsafe {
+            let p = libc::mmap(addr as *mut _, LEN, libc::PROT_NONE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0);
+            assert!(p != libc::MAP_FAILED);
+            libc::munmap(p, LEN);
+            p as u64 != addr
+        }
+    }
+
+    #[test]
+    fn reserve_maps_a_free_range() {
+        assert!(!is_mapped(FREE_AT), "control: the range starts free");
+        unsafe { reserve_if_unmapped(FREE_AT, LEN) };
+        assert!(is_mapped(FREE_AT));
+        unsafe { libc::munmap(FREE_AT as *mut _, LEN) };
+    }
+
+    #[test]
+    fn reserve_leaves_an_occupied_range_alone() {
+        let next = OCCUPIED_AT + LEN as u64;
+        unsafe {
+            let p = libc::mmap(OCCUPIED_AT as *mut _, LEN, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0);
+            assert_eq!(p as u64, OCCUPIED_AT, "control: the range starts free");
+            assert!(!is_mapped(next), "control: the range after it starts free");
+            *(p as *mut u8) = 0x5a;
+            reserve_if_unmapped(OCCUPIED_AT, LEN);
+            assert_eq!(*(p as *const u8), 0x5a);
+            // The hint moved to the next free space, and was given back.
+            assert!(!is_mapped(next));
+            libc::munmap(p, LEN);
+        }
+    }
 }
