@@ -36,6 +36,7 @@ mod iokit;
 mod jit;
 mod loader;
 mod macho;
+mod memlimit;
 mod paths;
 mod signals;
 mod slices;
@@ -46,6 +47,10 @@ mod threads;
 mod workq;
 
 use std::sync::atomic::Ordering;
+
+/// Counts the translator's own heap, which `memlimit` charges to the process's memory limit.
+#[global_allocator]
+static ALLOC: memlimit::Counting = memlimit::Counting::new(&memlimit::HEAP_LIVE, true);
 
 fn usage() -> ! {
     eprintln!("usage: maclator [options] <arm64-program> [args...]");
@@ -68,6 +73,7 @@ fn usage() -> ! {
 }
 
 fn main() {
+    memlimit::init();
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let mut dyld = std::env::var("MACLATOR_DYLD").unwrap_or_else(|_| "/usr/lib/dyld".to_string());
     let mut no_aot = false;

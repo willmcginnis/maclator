@@ -254,6 +254,7 @@ mod tests {
         ("jit::signal_budget_selftest", "maclator/src/jit/signal_budget_selftest.rs", include_str!("jit/signal_budget_selftest.rs")),
         ("loader", "maclator/src/loader.rs", include_str!("loader.rs")),
         ("macho", "maclator/src/macho.rs", include_str!("macho.rs")),
+        ("memlimit", "maclator/src/memlimit.rs", include_str!("memlimit.rs")),
         ("main", "maclator/src/main.rs", include_str!("main.rs")),
         ("paths", "maclator/src/paths.rs", include_str!("paths.rs")),
         ("signals", "maclator/src/signals.rs", include_str!("signals.rs")),

@@ -184,6 +184,7 @@ impl CodeCache {
         if p + len > self.slot_ptr.load(Ordering::SeqCst) {
             panic!("maclator: JIT code cache exhausted");
         }
+        crate::memlimit::check();
         p
     }
     pub fn cursor(&self) -> u64 {
@@ -192,6 +193,15 @@ impl CodeCache {
     pub fn contains(&self, a: u64) -> bool {
         a >= self.base && a < self.end
     }
+    /// Bytes handed out, code and chaining slots: the part of the cache the process has written.
+    fn committed(&self) -> u64 {
+        (self.code_ptr.load(Ordering::Relaxed) - self.base) + (self.end - self.slot_ptr.load(Ordering::Relaxed))
+    }
+}
+
+/// Bytes of the JIT code cache in use; 0 before it exists.
+pub fn code_committed() -> u64 {
+    CODE.get().map_or(0, CodeCache::committed)
 }
 
 pub fn lookup(pc: u64) -> Option<u64> {
@@ -735,5 +745,37 @@ pub fn run(cpu: &mut Cpu) {
         }
         cpu.exit_reason = EXIT_CONTINUE;
         cpu.exit_data = 0;
+    }
+}
+
+#[cfg(test)]
+mod committed_tests {
+    use super::*;
+
+    #[test]
+    fn committed_counts_code_and_slots() {
+        let cc = CodeCache { base: 0x10000, end: 0x20000, code_ptr: AtomicU64::new(0x10000), slot_ptr: AtomicU64::new(0x20000) };
+        assert_eq!(cc.committed(), 0);
+        assert_eq!(cc.alloc(5), 0x10000);
+        assert_eq!(cc.committed(), 16);
+        cc.slot_ptr.store(0x20000 - 64, Ordering::SeqCst);
+        assert_eq!(cc.committed(), 80);
+    }
+
+    #[test]
+    fn code_committed_reads_the_cache() {
+        // In a child: the cache is a 4 GiB executable mapping, and with it every later fork of the
+        // test process is slow (under Rosetta 2, 7 s became 47 s for one fork-heavy test).
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            let before = code_committed();
+            code_cache().alloc(4096);
+            let ok = code_committed() >= before + 4096;
+            unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+        }
+        assert!(pid > 0);
+        let mut st = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut st, 0) }, pid);
+        assert!(libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0, "child status {st:#x}");
     }
 }
