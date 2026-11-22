@@ -165,8 +165,10 @@ thread_local! {
 
 pub fn code_cache() -> &'static CodeCache {
     CODE.get_or_init(|| unsafe {
+        // MAP_JIT: macOS 27's x86 kernel refuses an anonymous mapping that asks for write and
+        // execute at creation (EACCES) unless it is a JIT mapping. On x86 the region stays RWX.
         let p = libc::mmap(std::ptr::null_mut(), CODE_CACHE_SIZE as usize, libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-            libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0);
+            libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_JIT, -1, 0);
         assert!(p != libc::MAP_FAILED, "cannot allocate the JIT code cache: {}", std::io::Error::last_os_error());
         let base = p as u64;
         CodeCache { base, end: base + CODE_CACHE_SIZE, code_ptr: AtomicU64::new(base), slot_ptr: AtomicU64::new(base + CODE_CACHE_SIZE) }
