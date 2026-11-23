@@ -469,6 +469,9 @@ unsafe fn apply_slide_info(info: &[u8], region: u64, size: u64, slide: u64, unsl
 const SLID_FORMAT: u32 = 2;
 const SLID_MAGIC: &[u8; 8] = b"MCLSLID\0";
 const SLID_STAMP_MAGIC: &[u8; 8] = b"MCLSTMP\0";
+/// A refusal: a stamp's bytes under this magic instead, left beside a file one of whose chunks did not match when every
+/// chunk was checked, so the rest of that boot refuses the file at once rather than check it whole again under its lock.
+const SLID_REFUSED_MAGIC: &[u8; 8] = b"MCLRFSD\0";
 /// Pages slid per step while building a slid file, so building costs one chunk of memory, not the mapping.
 const SLID_CHUNK_PAGES: usize = 64;
 /// Bytes per recorded hash. Small, because a process hashes a few of them each time it maps a file: SHA-256 ran at 40 to
@@ -637,7 +640,9 @@ fn stamp_write(stamp: &std::path::Path, want: &[u8]) -> bool {
 /// `seed` are our effective uid and pid, `boot` this boot's session. Without a stamp of this boot for this file, every
 /// chunk is checked, under the file's `BuildLock` (waited for at most `wait_ms`) so that a process going second finds
 /// the first one's stamp rather than checking again, and a stamp is left if every chunk matches. With no `boot`, every
-/// chunk is checked and no stamp is trusted or left. On anything but `Mapped` the old mapping stays.
+/// chunk is checked and no stamp is trusted or left. A refusal of this boot for this file, left when every chunk was
+/// checked and one did not match, refuses it at once, before the lock and after it. On anything but `Mapped` the old
+/// mapping stays.
 #[allow(clippy::too_many_arguments)]
 unsafe fn map_slid(addr: u64, size: usize, prot: i32, path: &std::path::Path, id: &SlidId, uid: u32, seed: usize, boot: Option<&[u8]>, wait_ms: u64) -> Slid {
     use std::os::unix::fs::OpenOptionsExt;
@@ -667,10 +672,19 @@ unsafe fn map_slid(addr: u64, size: usize, prot: i32, path: &std::path::Path, id
     let stamp = path.with_extension("stamp");
     let want = boot.map(|b| stamp_bytes(b, &md, &rec[64 + 32 * n..]));
     let stamped = || want.as_ref().is_some_and(|w| stamp_ok(&stamp, w, uid));
+    let refusal_at = path.with_extension("refused");
+    let refusal = want.as_ref().map(|w| [&SLID_REFUSED_MAGIC[..], &w[SLID_STAMP_MAGIC.len()..]].concat());
+    let refused = || refusal.as_ref().is_some_and(|r| stamp_ok(&refusal_at, r, uid));
+    if refused() {
+        return refuse(path, "every chunk was checked earlier in this boot and one did not match");
+    }
     let mut lock = None;
     let mut trusted = stamped();
     if !trusted && want.is_some() {
         lock = BuildLock::take(&path.with_extension("lock"), wait_ms);
+        if refused() {
+            return refuse(path, "every chunk was checked earlier in this boot and one did not match");
+        }
         // Whether we got the lock or gave up waiting, the first process may have left its stamp meanwhile.
         trusted = stamped();
     }
@@ -678,12 +692,17 @@ unsafe fn map_slid(addr: u64, size: usize, prot: i32, path: &std::path::Path, id
     let mut buf = vec![0u8; id.chunk.min(size)];
     for c in chunks {
         let (off, len) = (c * id.chunk, (size - c * id.chunk).min(id.chunk));
-        if !pread_all(f.as_raw_fd(), &mut buf[..len], off as u64) || sha256(&buf[..len])[..] != rec[64 + 32 * c..96 + 32 * c] {
+        let read = pread_all(f.as_raw_fd(), &mut buf[..len], off as u64);
+        if !read || sha256(&buf[..len])[..] != rec[64 + 32 * c..96 + 32 * c] {
             if trusted {
                 // The file changed since its stamp was left: the next process checks every chunk, and refuses it too.
                 let _ = std::fs::remove_file(&stamp);
+            } else if let (true, Some(_), Some(r)) = (read, &lock, &refusal) {
+                // Every chunk was checked and this one does not match: the rest of this boot refuses the file without
+                // checking it again. A read that failed may not fail again, so it leaves no refusal.
+                let _ = stamp_write(&refusal_at, r);
             }
-            return refuse(path, &format!("chunk {c} does not match its hash"));
+            return refuse(path, &format!("chunk {c} {}", if read { "does not match its hash" } else { "could not be read" }));
         }
     }
     if let (false, Some(_), Some(w)) = (trusted, &lock, &want) {
@@ -1771,15 +1790,87 @@ mod slid_tests {
         flip(&path, UNSAMPLED);
         stamp_as_is(&path, &id, BOOT);
         assert_eq!(try_map(at, &path, &id, uid(), 2), (Slid::Mapped, want[0]), "control: a stamp of ours that only we can write is trusted");
+        // Each refusal below comes from checking every chunk, which leaves a refusal; it is taken away after each, so
+        // the next step is a check of the stamp again and not an early refusal.
+        let refusal = path.with_extension("refused");
         for (mode, what) in [(0o620, "a group-writable stamp"), (0o602, "an other-writable stamp")] {
             chmod(&stamp, mode);
             assert_eq!(try_map(at, &path, &id, uid(), 2), (Slid::Refused, 0), "{what} is not trusted");
+            assert!(std::fs::remove_file(&refusal).is_ok(), "{what}: control: every chunk was checked, so a refusal was left");
         }
         stamp_as_is(&path, &id, BOOT);
         let real = d.join("elsewhere");
         std::fs::rename(&stamp, &real).unwrap();
         std::os::unix::fs::symlink(&real, &stamp).unwrap();
         assert_eq!(try_map(at, &path, &id, uid(), 2), (Slid::Refused, 0), "a symlink to a stamp that matches is not trusted");
+        assert!(refusal.exists(), "control: every chunk was checked, so a refusal was left");
+    }
+
+    /// The refusal a process leaves when it checked every chunk of `path` in `boot` and one did not match.
+    fn refusal_as_is(path: &std::path::Path, boot: &[u8]) -> Vec<u8> {
+        let file = std::fs::read(path).unwrap();
+        let stamp = stamp_bytes(boot, &std::fs::metadata(path).unwrap(), &file[file.len() - 32..]);
+        [&SLID_REFUSED_MAGIC[..], &stamp[SLID_STAMP_MAGIC.len()..]].concat()
+    }
+
+    #[test]
+    fn a_file_refused_when_every_chunk_was_checked_is_refused_at_once_for_the_rest_of_the_boot() {
+        use std::os::unix::fs::PermissionsExt;
+        let at = STAMP_AT + 13 * STAMP_STEP;
+        let (_d, path, id, _) = built("refused-left");
+        let refusal = path.with_extension("refused");
+        flip(&path, UNSAMPLED);
+        assert_eq!(try_map(at, &path, &id, uid(), 2), (Slid::Refused, 0), "control: with no stamp every chunk is checked");
+        let md = std::fs::symlink_metadata(&refusal).expect("a file refused when every chunk was checked gets a refusal");
+        assert!(md.is_file() && md.permissions().mode() & 0o777 == 0o600, "the refusal is a file only we can read or write: {:o}", md.permissions().mode());
+        assert_eq!(std::fs::read(&refusal).unwrap(), refusal_as_is(&path, BOOT), "it names the boot, the file and its record");
+        // Another process holds the file's lock now, longer than this one waits: without the refusal this start would
+        // wait the whole 2 s for it and then check every chunk again.
+        let held = BuildLock::take(&path.with_extension("lock"), 2_000).expect("free once the first check let it go");
+        let t0 = std::time::Instant::now();
+        let got = try_map_waiting(at, &path, &id, uid(), 2, Some(BOOT), 2_000);
+        let took = t0.elapsed();
+        drop(held);
+        assert_eq!(got, (Slid::Refused, 0), "a refused file stays refused");
+        assert!(took < std::time::Duration::from_millis(1_000), "the refusal is trusted at once, without waiting for the lock: {took:?}");
+    }
+
+    #[test]
+    fn a_refusal_is_trusted_only_in_its_own_boot_and_for_the_file_as_it_names_it() {
+        let at = STAMP_AT + 14 * STAMP_STEP;
+        let (_d, path, id, want) = built("refused-scope");
+        flip(&path, UNSAMPLED);
+        assert_eq!(try_map(at, &path, &id, uid(), 2), (Slid::Refused, 0), "control: with no stamp every chunk is checked");
+        // The byte put back below what the refusal names: the same inode, size, modification time and record.
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        flip(&path, UNSAMPLED);
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(mtime).unwrap();
+        assert_eq!(std::fs::read(path.with_extension("refused")).unwrap(), refusal_as_is(&path, BOOT), "control: the refusal names the file as it is now");
+        // The limit, by design: in its own boot the refusal is trusted, though the file is sound again.
+        assert_eq!(try_map(at, &path, &id, uid(), 2), (Slid::Refused, 0), "in its own boot a refusal is trusted");
+        assert_eq!(try_map_in(at, &path, &id, uid(), 2, Some(BOOT_2)), (Slid::Mapped, want[0]), "a refusal left in another boot is not trusted: every chunk is checked");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        flip(&path, UNSAMPLED);
+        flip(&path, UNSAMPLED);
+        assert_eq!(try_map(at, &path, &id, uid(), 2), (Slid::Mapped, want[0]), "a file written since its refusal is checked whole again");
+    }
+
+    #[test]
+    fn a_process_waiting_for_the_check_trusts_the_refusal_it_left() {
+        let at = STAMP_AT + 15 * STAMP_STEP;
+        // A sound file, so a process that checked every chunk itself would map it: only the refusal refuses it.
+        let (_d, path, id, _) = built("refused-race");
+        let lock = path.with_extension("lock");
+        let first = BuildLock::take(&lock, 2_000).expect("free once the builder let it go");
+        let p = path.clone();
+        let second = std::thread::spawn(move || try_map(at, &p, &id, uid(), 2));
+        let went = goes_for_the_lock(&lock);
+        // What the first process leaves when a chunk did not match (here as if the file changed back after its check).
+        assert!(stamp_write(&path.with_extension("refused"), &refusal_as_is(&path, BOOT)));
+        drop(first);
+        let got = second.join().unwrap();
+        assert!(went, "control: it found no stamp and went for the lock");
+        assert_eq!(got, (Slid::Refused, 0), "a process that waited for the first one's check trusts the refusal it left");
     }
 
     #[test]
