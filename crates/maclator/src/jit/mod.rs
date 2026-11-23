@@ -162,6 +162,10 @@ thread_local! {
     static PENDING: Cell<Option<Exit>> = const { Cell::new(None) };
     static IBTC: RefCell<Option<Box<[[u64; 2]]>>> = const { RefCell::new(None) };
     static MY_EPOCH: Cell<u64> = const { Cell::new(0) };
+    /// Blocks whose code could not be read to translate them, with the calls to `translate` left before it tries to
+    /// read them again: both the dispatcher's tiering and its chaining ask, and neither retries the read at
+    /// every turn.
+    static UNREADABLE: RefCell<FastMap<u64, u32>> = RefCell::new(FastMap::default());
 }
 
 /// True for an errno that means the kernel REFUSED a MAP_JIT mapping, rather than ran out of room
@@ -360,17 +364,39 @@ fn emit_unit(pc: u64, slot_padding: usize) -> Unit {
     u
 }
 
-fn translate(pc: u64) -> u64 {
+/// The host code for the block at `pc`, translated now; None when the instruction at `pc` cannot be read through
+/// guestmem::read. A block built there would be nothing but an exit back to `pc`, which the dispatcher would enter
+/// again forever. The guest may still be able to execute it -- a policy
+/// that refuses mach_vm_read_overwrite on this task refuses a page the interpreter, which loads code directly, reads
+/// -- so the caller interprets the block instead, and a genuinely bad address faults there as it always has. After a
+/// failed read, the next `hot_threshold()` calls for that block on this thread answer None without reading.
+fn translate(pc: u64) -> Option<u64> {
+    let waiting = UNREADABLE.with(|u| match u.borrow_mut().get_mut(&pc) {
+        Some(n) if *n > 0 => {
+            *n -= 1;
+            true
+        }
+        _ => false,
+    });
+    if waiting {
+        return None;
+    }
     let t0 = std::time::Instant::now();
     let r = translate_inner(pc);
     STATS_TRANSLATE_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    if r.is_none() {
+        UNREADABLE.with(|u| u.borrow_mut().insert(pc, hot_threshold()));
+    }
     r
 }
 
-fn translate_inner(pc: u64) -> u64 {
+fn translate_inner(pc: u64) -> Option<u64> {
     let _g = TRANSLATE.lock().unwrap();
     if let Some(h) = lookup(pc) {
-        return h;
+        return Some(h);
+    }
+    if guest_reader()(pc).is_none() {
+        return None;
     }
     let cc = code_cache();
     let ip = cc.cursor();
@@ -417,11 +443,12 @@ fn translate_inner(pc: u64) -> u64 {
     drop(ix_guard);
     let mut g = BLOCKS.write().unwrap();
     g.get_or_insert_with(FastMap::default).insert(pc, at);
-    at
+    Some(at)
 }
 
+/// For the selftests, whose code is in pages of their own that always read.
 fn lookup_or_translate(pc: u64) -> u64 {
-    lookup(pc).unwrap_or_else(|| translate(pc))
+    lookup(pc).or_else(|| translate(pc)).expect("the selftest's own code could not be read")
 }
 
 /// Drop the translations built from guest code in [addr, addr+len) (self-modifying code,
@@ -757,20 +784,25 @@ pub fn run(cpu: &mut Cpu) {
                 let n = HOT.with(|h| {
                     let mut h = h.borrow_mut();
                     let c = h.entry(pc).or_insert(0);
-                    *c += 1;
+                    // Saturating: a block whose code is never readable is never translated, so its count never stops.
+                    *c = c.saturating_add(1);
                     *c
                 });
                 if n == 1 {
                     crate::aot::note_translated(pc);
                 }
-                if n < hot_threshold() {
-                    STATS_INTERP_BLOCKS.fetch_add(1, Ordering::Relaxed);
-                    if !interp_block(cpu) {
-                        return;
+                // None from translate: its code could not be read to translate it, so it is interpreted too.
+                let host = if n < hot_threshold() { None } else { translate(pc) };
+                match host {
+                    Some(h) => h,
+                    None => {
+                        STATS_INTERP_BLOCKS.fetch_add(1, Ordering::Relaxed);
+                        if !interp_block(cpu) {
+                            return;
+                        }
+                        continue;
                     }
-                    continue;
                 }
-                translate(pc)
             }
         };
         STATS_JIT_ENTRIES.fetch_add(1, Ordering::Relaxed);
@@ -785,9 +817,11 @@ pub fn run(cpu: &mut Cpu) {
             EXIT_CONTINUE => {
                 let slot = cpu.exit_data;
                 if slot != 0 && !verify_mode() {
-                    // Chain: point the exit slot straight at the target block.
-                    let target = lookup_or_translate(cpu.pc);
-                    chain_slot(slot, cpu.pc, target);
+                    // Chain: point the exit slot straight at the target block. A target whose code cannot be read is
+                    // not chained, so its exit keeps returning here, and the turn below interprets it.
+                    if let Some(target) = lookup(cpu.pc).or_else(|| translate(cpu.pc)) {
+                        chain_slot(slot, cpu.pc, target);
+                    }
                 }
             }
             EXIT_SVC => {
@@ -920,6 +954,67 @@ mod jit_refusal_tests {
             interp::exec(&mut cpu, insn).expect("the interpreter refused an instruction");
         }
         assert_eq!(cpu.x[0], 42, "the interpreter did not compute 42");
+    }
+
+    /// A block whose first instruction guestmem::read refuses is not translated, so nothing is left for the dispatcher
+    /// to re-enter forever; the caller interprets it. The refusal is checked before the code cache is touched,
+    /// so this maps no 4 GiB cache in the test process (see `committed_tests::code_committed_reads_the_cache`).
+    #[test]
+    fn a_block_whose_code_read_is_refused_is_not_translated() {
+        let page = unsafe {
+            libc::mmap(std::ptr::null_mut(), 0x1000, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0)
+        };
+        assert!(page != libc::MAP_FAILED, "no guest page");
+        let page = page as u64;
+        // BLOCK, then `ret` (encoding from clang), so the interpreted block ends there rather than at a zero word.
+        for (i, w) in BLOCK.iter().chain([0xd65f_03c0u32].iter()).enumerate() {
+            unsafe { std::ptr::write((page as *mut u32).add(i), *w) };
+        }
+        assert_eq!(guest_reader()(page), Some(BLOCK[0]), "control: unrefused, the block's first instruction reads");
+        crate::guestmem::REFUSE_READS_IN.with(|c| c.set((page, page + 0x1000)));
+        let unread = guest_reader()(page);
+        let got = translate(page);
+        crate::guestmem::REFUSE_READS_IN.with(|c| c.set((0, 0)));
+        assert!(unread.is_none(), "control: the refusal is in force");
+        assert!(got.is_none(), "a block whose code read is refused must not be translated");
+        assert!(lookup(page).is_none(), "no block may be published for it, or the dispatcher re-enters it forever");
+        let mut cpu = Cpu::default();
+        cpu.pc = page;
+        assert!(interp_block(&mut cpu), "the interpreter, which the caller takes instead, runs the block");
+        assert_eq!(cpu.x[0], 42, "and computes 42");
+    }
+
+    /// After a refused code read, the dispatcher's next `hot_threshold()` requests for that block -- from tiering or from
+    /// chaining, which asks at every exit into it -- do not read again; the one after that does.
+    /// Counted with guestmem's per-thread tally of refused reads.
+    #[test]
+    fn a_refused_block_is_not_read_again_until_its_backoff_has_passed() {
+        let page = unsafe {
+            libc::mmap(std::ptr::null_mut(), 0x1000, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0)
+        };
+        assert!(page != libc::MAP_FAILED, "no guest page");
+        let page = page as u64;
+        unsafe { std::ptr::write(page as *mut u32, BLOCK[0]) };
+        let noted = || crate::guestmem::REFUSALS_NOTED.with(|c| c.get());
+        assert!(hot_threshold() > 0, "control: a backoff of zero requests would test nothing");
+        crate::guestmem::REFUSE_READS_IN.with(|c| c.set((page, page + 0x1000)));
+        let before = noted();
+        let first = translate(page);
+        let after_first = noted();
+        let mut answers = Vec::new();
+        for _ in 0..hot_threshold() {
+            answers.push(translate(page));
+        }
+        let during = noted() - after_first;
+        let again = translate(page);
+        let after_again = noted() - after_first;
+        crate::guestmem::REFUSE_READS_IN.with(|c| c.set((0, 0)));
+        UNREADABLE.with(|u| u.borrow_mut().remove(&page));
+        unsafe { libc::munmap(page as *mut libc::c_void, 0x1000) };
+        assert!(after_first == before + 1, "control: the first request read the block and was refused");
+        assert!(first.is_none() && again.is_none() && answers.iter().all(Option::is_none), "a refused block is never translated");
+        assert!(during == 0, "a refused block was read again {during} times within its backoff");
+        assert!(after_again == 1, "after its backoff a refused block must be read again, once ({after_again})");
     }
 
     /// EINVAL, EPERM and EACCES are refusals the process survives; ENOMEM is not. ENOMEM is what a

@@ -12,7 +12,85 @@ extern "C" {
 
 pub fn read(addr: u64, buf: &mut [u8]) -> bool {
     let mut out = 0u64;
-    unsafe { mach_vm_read_overwrite(mach_task_self(), addr, buf.len() as u64, buf.as_mut_ptr() as u64, &mut out) == 0 }
+    let kr = match test_refusal(addr, buf.len()) {
+        Some(kr) => kr,
+        None => unsafe { mach_vm_read_overwrite(mach_task_self(), addr, buf.len() as u64, buf.as_mut_ptr() as u64, &mut out) },
+    };
+    finish_read(kr, addr, buf.len())
+}
+
+/// The kern_return_t values that mean the guest's address is bad: nothing readable is mapped there. Measured on macOS
+/// 27.0.1, both from an arm64 process and from an x86_64 one under Rosetta 2: NULL, an unmapped page, a PROT_NONE
+/// page, a read straddling into either, the top of user space, a non-canonical address, the kernel half and a range
+/// that wraps all answer KERN_INVALID_ADDRESS (1). KERN_PROTECTION_FAILURE (2) is the kernel's other answer for a page
+/// it will not read, so it is counted with it.
+fn bad_address(kr: i32) -> bool {
+    kr == 1 || kr == 2
+}
+
+/// Decide the outcome of a read from the kern_return_t `mach_vm_read_overwrite` gave. Any failure is still a plain
+/// failure (callers answer EFAULT, or the JIT interprets), but one that does not mean a bad address -- KERN_DENIED from
+/// a policy that refuses the Mach call itself, say -- is reported, since otherwise it looks exactly like a bad guest
+/// pointer, even under MACLATOR_TRACE.
+pub(crate) fn finish_read(kr: i32, addr: u64, len: usize) -> bool {
+    if kr == 0 {
+        return true;
+    }
+    if !bad_address(kr) {
+        note_refused_read(kr, addr, len);
+    }
+    false
+}
+
+/// Refused reads of this process so far. The 1st, 2nd, 4th, 8th ... are reported, each with its number, so a refusal
+/// on a hot path cannot flood the guest's stderr (a process gets at most 64 lines) and one that goes on stays visible.
+/// `REFUSED_READS_PID` is the process they were counted in: a forked child starts again at 1, so its first refusal is
+/// reported too.
+static REFUSED_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REFUSED_READS_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The number of this refusal in process `pid`: `count` starts again when `owner` names another process.
+fn next_refusal(count: &std::sync::atomic::AtomicU64, owner: &std::sync::atomic::AtomicU32, pid: u32) -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    if owner.swap(pid, Relaxed) != pid {
+        count.store(0, Relaxed);
+    }
+    count.fetch_add(1, Relaxed) + 1
+}
+
+/// The line for the `n`th refused read of this process, if it is reported.
+fn refused_read_line(n: u64, kr: i32, addr: u64, len: usize) -> Option<String> {
+    n.is_power_of_two().then(|| format!("[maclator] warning: refused read #{n} (reported at #1, 2, 4, 8, ...): reading {len} bytes of guest memory at {addr:#x} answered kern_return_t {kr}, which is not a bad address; treated as unreadable"))
+}
+
+fn note_refused_read(kr: i32, addr: u64, len: usize) {
+    #[cfg(test)]
+    REFUSALS_NOTED.with(|c| c.set(c.get() + 1));
+    let n = next_refusal(&REFUSED_READS, &REFUSED_READS_PID, std::process::id());
+    if let Some(line) = refused_read_line(n, kr, addr, len) {
+        eprintln!("{line}");
+    }
+}
+
+/// Refused reads noted on THIS THREAD, so a test can see a report without reading stderr. Test builds only.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static REFUSALS_NOTED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// [lo, hi): a read on THIS THREAD overlapping it is answered KERN_DENIED without the Mach call, as a policy that
+    /// refuses mach_vm_read_overwrite would answer it. Test builds only, so the shipped binary has no seam.
+    pub(crate) static REFUSE_READS_IN: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+fn test_refusal(addr: u64, len: usize) -> Option<i32> {
+    let (lo, hi) = REFUSE_READS_IN.with(|c| c.get());
+    (addr < hi && addr.saturating_add(len.max(1) as u64) > lo).then_some(KERN_DENIED)
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn test_refusal(_addr: u64, _len: usize) -> Option<i32> {
+    None
 }
 
 /// `mach_vm_write` answering KERN_DENIED: the sandbox policy refuses the Mach call itself and says
@@ -104,6 +182,95 @@ pub fn read_u64(addr: u64) -> Option<u64> {
 pub fn write_u64(addr: u64, v: u64) -> bool {
     write(addr, &v.to_le_bytes())
 }
+#[cfg(test)]
+mod refused_read_tests {
+    //! guestmem::read's report of a refusal that is not a bad address.
+    use super::{finish_read, next_refusal, read, refused_read_line, REFUSALS_NOTED, REFUSE_READS_IN};
+
+    fn noted() -> u64 {
+        REFUSALS_NOTED.with(|c| c.get())
+    }
+
+    fn page() -> usize {
+        unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
+    }
+
+    #[test]
+    fn a_refusal_that_is_not_a_bad_address_is_reported() {
+        let before = noted();
+        assert!(!finish_read(53, 0x1000, 8), "kern_denied is still a failure");
+        assert!(noted() == before + 1, "kern_denied must be reported, since it is not a bad address");
+        assert!(!finish_read(4, 0x1000, 8), "kern_invalid_argument is still a failure");
+        assert!(noted() == before + 2, "any kern_return_t but a bad address is reported");
+    }
+
+    #[test]
+    fn a_bad_address_or_a_success_is_not_reported() {
+        let before = noted();
+        assert!(!finish_read(1, 0, 8), "kern_invalid_address is a failure");
+        assert!(!finish_read(2, 0, 8), "kern_protection_failure is a failure");
+        assert!(finish_read(0, 0x1000, 8), "kr 0 is a success");
+        assert!(noted() == before, "a bad address and a success are not reported");
+    }
+
+    #[test]
+    fn the_kernels_answers_for_bad_addresses_are_not_reported() {
+        // The real kernel, so the classification matches what it answers. A PROT_NONE page and an unmapped one held
+        // by this test, NULL, a read straddling into the PROT_NONE page, and a range that wraps.
+        let ps = page();
+        let base = unsafe { libc::mmap(std::ptr::null_mut(), ps * 2, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0) };
+        assert!(base != libc::MAP_FAILED, "the test could not map its own memory");
+        let base = base as u64;
+        assert!(unsafe { libc::mprotect((base + ps as u64) as *mut libc::c_void, ps, libc::PROT_NONE) } == 0, "control: mprotect");
+        let mut b = [0u8; 8];
+        assert!(read(base, &mut b), "control: a readable page reads");
+        let before = noted();
+        for (what, at) in [("null", 0u64), ("prot_none", base + ps as u64), ("straddle", base + ps as u64 - 4), ("wraps", u64::MAX - 3)] {
+            assert!(!read(at, &mut b), "{what}: a bad address must not read");
+        }
+        assert!(noted() == before, "the kernel's answers for bad addresses were reported as refusals");
+        unsafe { libc::munmap(base as *mut libc::c_void, ps * 2) };
+    }
+
+    #[test]
+    fn a_refused_read_of_a_readable_page_is_reported_and_fails() {
+        let ps = page();
+        let p = unsafe { libc::mmap(std::ptr::null_mut(), ps, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0) };
+        assert!(p != libc::MAP_FAILED, "the test could not map its own memory");
+        let p = p as u64;
+        let mut b = [0u8; 8];
+        assert!(read(p, &mut b), "control: the page reads");
+        let before = noted();
+        REFUSE_READS_IN.with(|c| c.set((p, p + ps as u64)));
+        let got = read(p, &mut b);
+        REFUSE_READS_IN.with(|c| c.set((0, 0)));
+        assert!(!got, "a refused read is still a failure");
+        assert!(noted() == before + 1, "a refused read of a readable page must be reported");
+        unsafe { libc::munmap(p as *mut libc::c_void, ps) };
+    }
+
+    #[test]
+    fn a_forked_child_numbers_its_refusals_from_one() {
+        use std::sync::atomic::{AtomicU32, AtomicU64};
+        // The counter and its owner as a fork leaves them: the parent (pid 100) had 5 refusals.
+        let (count, owner) = (AtomicU64::new(0), AtomicU32::new(0));
+        let parent: Vec<u64> = (0..5).map(|_| next_refusal(&count, &owner, 100)).collect();
+        assert!(parent == [1, 2, 3, 4, 5], "control: the parent counts from 1: {parent:?}");
+        let child: Vec<u64> = (0..3).map(|_| next_refusal(&count, &owner, 200)).collect();
+        assert!(child == [1, 2, 3], "a forked child must number its own refusals from 1, so its first is reported: {child:?}");
+    }
+
+    #[test]
+    fn refusals_are_reported_at_powers_of_two_with_their_number() {
+        let first = refused_read_line(1, 53, 0x1234, 4).expect("the first refusal is reported");
+        assert!(first.contains("kern_return_t 53") && first.contains("0x1234") && first.contains("4 bytes") && first.contains("#1 "), "the line names the number, the kr, the address and the length: {first}");
+        let reported: Vec<u64> = (1..=1100u64).filter(|&n| refused_read_line(n, 53, 0, 4).is_some()).collect();
+        assert!(reported == [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024], "refusals must be reported at powers of two only: {reported:?}");
+        let late = refused_read_line(1 << 40, 53, 0, 4).expect("a late power of two is still reported");
+        assert!(late.contains(&format!("#{} ", 1u64 << 40)), "a late report carries its number: {late}");
+    }
+}
+
 #[cfg(test)]
 mod patch_y_copy_copyout_tests {
     //! The mach_vm_copy fallback. These drive finish_write with an INJECTED kern_return_t, so the
