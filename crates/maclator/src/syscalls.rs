@@ -2414,6 +2414,11 @@ fn bsd_inner(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
             if unread && TRACE.load(Ordering::Relaxed) {
                 eprintln!("[sysctl] #{n} {:#x} mib unreadable: passed through", args[0]);
             }
+            // name2oid, which libc's sysctlbyname() and sysctlnametomib() call first
+            if mib.as_deref() == Some(&[0, 3][..]) {
+                sysctl_name2oid(cpu, n, &args);
+                return;
+            }
             if let Some(a) = mib.as_deref().and_then(|m| sysctl_mib_answer(m, host_oid2name)) {
                 if TRACE.load(Ordering::Relaxed) {
                     eprintln!("[sysctl] #{n} mib {:?} overridden: {a:?}", mib.as_deref().unwrap_or_default());
@@ -2650,8 +2655,58 @@ fn sysctl_mib_answer(mib: &[i32], oid2name: impl FnOnce(&[i32]) -> Option<String
         [6, 7] => sysctl_override("hw.pagesize_compat"),
         [0, m, ..] if *m <= 5 => None,
         [0 | 2 | 6, ..] if mib.len() as u64 <= CTL_MAXNAME - 2 => oid2name(mib).as_deref().and_then(sysctl_override),
+        [f, ..] if *f <= -2 => synthetic_name(mib).as_deref().and_then(sysctl_override),
         _ => None,
     }
+}
+
+/// Names in `sysctl_override` that the
+/// host kernel has no MIB for, in the order the guest first looked them up. The i-th is answered at
+/// a synthetic MIB with one entry per component of its name, each -2 - i. XNU numbers its OIDs from
+/// 0 up (fixed numbers, and OID_AUTO ones from 100), so no host MIB starts with a negative number and
+/// these cannot hide a real one. Valid in the process that looked the name up and in its forks. A
+/// forksync lock in hold_all, as every translator lock is; a leaf: nothing else is taken
+/// while it is held.
+pub(crate) static SYNTHETIC_OIDS: crate::forksync::FMutex<Vec<String>> = crate::forksync::FMutex::new(Vec::new());
+
+/// sysctl {0, 3} (name2oid, the name in newp), passed to the host kernel first as every other
+/// call is. Only when the host answers ENOENT for a name that `sysctl_override` answers (and that is
+/// not one that does not exist natively) does the guest get a synthetic MIB, written as XNU writes a
+/// name2oid answer (sysctl_copyout: with no buffer only the size; a buffer too small, nothing, a size
+/// of 0 and ENOMEM). sysctl_mib_answer then answers that MIB from the same table, so libc's route
+/// reaches the overrides on a host without the arm64 names (an x86 kernel).
+fn sysctl_name2oid(cpu: &mut Cpu, n: u64, args: &[u64; 8]) {
+    let r = hostsys::unix(n, args);
+    let enoent = r.carry && r.rax == libc::ENOENT as u64;
+    let name = if enoent { sysctl_name(args[4], args[5], crate::guestmem::read) } else { None };
+    let Some(name) = name.filter(|nm| matches!(sysctl_override(nm), Some(a) if a != SysctlAnswer::Absent)) else {
+        set_res(cpu, r);
+        return;
+    };
+    let mib: Vec<u8> = synthetic_mib(&name).iter().flat_map(|v| v.to_le_bytes()).collect();
+    if TRACE.load(Ordering::Relaxed) {
+        eprintln!("[sysctl] #{n} name2oid {name:?}: the host has none, synthetic MIB {:?}", synthetic_mib(&name));
+    }
+    let size = mib.len() as u64;
+    sysctl_finish(cpu, sysctl_copyout(args[2], args[3], size, |len| (len >= size).then_some(mib)));
+}
+
+/// The synthetic MIB for `name`, made the first time it is asked for.
+fn synthetic_mib(name: &str) -> Vec<i32> {
+    let mut names = SYNTHETIC_OIDS.lock().unwrap();
+    let index = names.iter().position(|n| n == name).unwrap_or_else(|| {
+        names.push(name.to_string());
+        names.len() - 1
+    });
+    vec![-2 - index as i32; name.split('.').count()]
+}
+
+/// The name `mib` was handed out for, if it is one of the synthetic MIBs.
+fn synthetic_name(mib: &[i32]) -> Option<String> {
+    let index = usize::try_from(-2 - i64::from(*mib.first()?)).ok()?;
+    let names = SYNTHETIC_OIDS.lock().unwrap();
+    let name = names.get(index)?;
+    (mib.len() == name.split('.').count() && mib.iter().all(|&x| x == mib[0])).then(|| name.clone())
 }
 
 /// The host kernel's name for MIB `mib` (XNU's oid2name, __sysctl {0, 1, mib...}); None when it
@@ -4589,5 +4644,22 @@ mod tests {
         } else {
             eprintln!("no /System/Volumes/Data spelling of {} here: the measurement half skipped", t.display());
         }
+    }
+
+    #[test]
+    fn synthetic_mibs_name_only_the_name_they_were_made_for() {
+        let lse2 = synthetic_mib("hw.optional.arm.FEAT_LSE2");
+        let arm64 = synthetic_mib("hw.optional.arm64");
+        assert_eq!(synthetic_mib("hw.optional.arm.FEAT_LSE2"), lse2);
+        assert_eq!((lse2.len(), arm64.len()), (4, 3));
+        assert!(lse2.iter().chain(&arm64).all(|&x| x <= -2) && lse2[0] != arm64[0]);
+        assert_eq!(synthetic_name(&lse2).as_deref(), Some("hw.optional.arm.FEAT_LSE2"));
+        assert_eq!(sysctl_mib_answer(&lse2, |_| None), sysctl_override("hw.optional.arm.FEAT_LSE2"));
+        assert_eq!(sysctl_mib_answer(&arm64, |_| None), sysctl_override("hw.optional.arm64"));
+        assert_eq!(synthetic_name(&lse2[..3]), None);
+        assert_eq!(synthetic_name(&[lse2[0], lse2[0], lse2[0], arm64[0]]), None);
+        assert_eq!(synthetic_name(&[i32::MIN; 4]), None);
+        assert_eq!(synthetic_name(&[-1, -1]), None);
+        assert_eq!(synthetic_name(&[6, 1]), None);
     }
 }
