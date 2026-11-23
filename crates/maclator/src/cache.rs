@@ -463,10 +463,12 @@ unsafe fn apply_slide_info(info: &[u8], region: u64, size: u64, slide: u64, unsl
 ///
 /// A slid file is trusted only in a directory owned by our effective uid and writable by no group or other, only if
 /// it is ours and writable by no one else, and only if its record matches: after the slid bytes it records the mapping
-/// it was slid from and a SHA-256 of each chunk, and each process checks the record and some chunks before mapping it.
+/// it was slid from and a SHA-256 of each chunk. The first process in a boot to map a file checks every chunk and
+/// leaves a stamp beside it; later processes in that boot find the stamp and check the record and some chunks.
 /// Anything else is refused, and the mapping is slid privately as before.
 const SLID_FORMAT: u32 = 2;
 const SLID_MAGIC: &[u8; 8] = b"MCLSLID\0";
+const SLID_STAMP_MAGIC: &[u8; 8] = b"MCLSTMP\0";
 /// Pages slid per step while building a slid file, so building costs one chunk of memory, not the mapping.
 const SLID_CHUNK_PAGES: usize = 64;
 /// Bytes per recorded hash. Small, because a process hashes a few of them each time it maps a file: SHA-256 ran at 40 to
@@ -474,8 +476,9 @@ const SLID_CHUNK_PAGES: usize = 64;
 const SLID_HASH_CHUNK: usize = 0x10000;
 /// How long to wait for another process building the same file before sliding privately instead.
 const SLID_LOCK_WAIT_MS: u64 = 30_000;
-/// Chunks a process hashes before mapping a slid file, besides the first: chosen from its pid, so different processes
-/// check different chunks. Hashing every chunk on every start cost 7.6 to 11.8 s for macOS 27's cache in that guest.
+/// Chunks a process that finds a stamp hashes before mapping a slid file, besides the first: chosen from its pid, so
+/// different processes check different chunks. Hashing every chunk on every start cost 7.6 to 11.8 s for macOS 27's
+/// cache in that guest, so only the first process in a boot does it.
 const SLID_CHECK_CHUNKS: usize = 1;
 
 extern "C" {
@@ -542,17 +545,32 @@ enum Slid {
 /// Map `m` (already mapped private from the cache file at `addr`) from its shared slid file, building the file first
 /// if there is none. False means nothing changed and the caller slides in place as before.
 unsafe fn share_slid(fd: i32, m: &MappingSlideNp, info: &[u8], slide: u64, unslid_base: u64, addr: u64) -> bool {
+    static BOOT_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let Some((path, id)) = slid_path(fd, m, info, slide) else { return false };
     let prot = match (m.init_prot & 3) as i32 {
         0 => libc::PROT_NONE,
         p => p,
     };
-    let (size, uid, seed) = (m.size as usize, libc::geteuid(), libc::getpid() as usize);
-    match map_slid(addr, size, prot, &path, &id, uid, seed) {
+    let (size, uid, seed, boot) = (m.size as usize, libc::geteuid(), libc::getpid() as usize, boot_session());
+    if boot.is_none() && !BOOT_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("maclator: kern.bootsessionuuid gave no answer, so every chunk of each slid file is checked at every start");
+    }
+    let boot = boot.as_deref();
+    match map_slid(addr, size, prot, &path, &id, uid, seed, boot, SLID_LOCK_WAIT_MS) {
         Slid::Mapped => true,
         Slid::Refused => false,
-        Slid::Missing => build_slid(fd, m, info, slide, unslid_base, &path, &id, uid, SLID_LOCK_WAIT_MS) && map_slid(addr, size, prot, &path, &id, uid, seed) == Slid::Mapped,
+        Slid::Missing => build_slid(fd, m, info, slide, unslid_base, &path, &id, uid, SLID_LOCK_WAIT_MS) && map_slid(addr, size, prot, &path, &id, uid, seed, boot, SLID_LOCK_WAIT_MS) == Slid::Mapped,
     }
+}
+
+/// This boot's session, `kern.bootsessionuuid`: new at each boot, so a stamp left in an earlier boot never matches.
+/// None if the kernel does not say.
+fn boot_session() -> Option<Vec<u8>> {
+    let mut buf = [0u8; 64];
+    let mut len = buf.len();
+    let r = unsafe { libc::sysctlbyname(c"kern.bootsessionuuid".as_ptr(), buf.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0) };
+    let v = buf[..len.min(buf.len())].split(|&b| b == 0).next().unwrap_or(&[]);
+    (r == 0 && !v.is_empty()).then(|| v.to_vec())
 }
 
 /// The slid file for mapping `m` of the cache file `fd`: keyed by that file's UUID, the mapping's place in it, and the slide.
@@ -574,9 +592,54 @@ fn refuse(path: &std::path::Path, why: &str) -> Slid {
     Slid::Refused
 }
 
+/// What a stamp says: this boot's session, the slid file it vouches for as `fstat` saw it when every chunk was checked
+/// (its inode, size and modification time, which any write through the filesystem moves), and the file's record.
+fn stamp_bytes(boot: &[u8], md: &std::fs::Metadata, sum: &[u8]) -> Vec<u8> {
+    use std::os::unix::fs::MetadataExt;
+    let mut s = SLID_STAMP_MAGIC.to_vec();
+    s.extend_from_slice(&md.ino().to_le_bytes());
+    s.extend_from_slice(&md.size().to_le_bytes());
+    s.extend_from_slice(&md.mtime().to_le_bytes());
+    s.extend_from_slice(&md.mtime_nsec().to_le_bytes());
+    s.extend_from_slice(sum);
+    s.extend_from_slice(boot);
+    s
+}
+
+/// Whether the stamp at `stamp` says exactly `want`, as a regular file of ours that only we can write: opened without
+/// following a symlink or waiting on a FIFO.
+fn stamp_ok(stamp: &std::path::Path, want: &[u8], uid: u32) -> bool {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let Ok(f) = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(stamp) else { return false };
+    let mut got = Vec::new();
+    f.metadata().is_ok_and(|md| md.is_file() && crate::aot::owned(&md, uid) && md.len() == want.len() as u64)
+        && (&f).take(want.len() as u64 + 1).read_to_end(&mut got).is_ok()
+        && got == want
+}
+
+/// Leave `want` as the stamp, written under a temporary name and renamed into place, so no reader sees part of one and
+/// a symlink at its name is replaced, not followed. Called with the file's `BuildLock` held, so no other process is
+/// writing one, and a temporary file left by one that died is ours to replace.
+fn stamp_write(stamp: &std::path::Path, want: &[u8]) -> bool {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = stamp.with_extension("stamp-tmp");
+    let _ = std::fs::remove_file(&tmp);
+    let ok = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp).and_then(|mut f| f.write_all(want)).and_then(|()| std::fs::rename(&tmp, stamp)).is_ok();
+    if !ok {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    ok
+}
+
 /// Map the slid file at `path` over [addr, addr + size), copy-on-write, once it has passed the checks above; `uid` and
-/// `seed` are our effective uid and pid. On anything but `Mapped` the old mapping stays.
-unsafe fn map_slid(addr: u64, size: usize, prot: i32, path: &std::path::Path, id: &SlidId, uid: u32, seed: usize) -> Slid {
+/// `seed` are our effective uid and pid, `boot` this boot's session. Without a stamp of this boot for this file, every
+/// chunk is checked, under the file's `BuildLock` (waited for at most `wait_ms`) so that a process going second finds
+/// the first one's stamp rather than checking again, and a stamp is left if every chunk matches. With no `boot`, every
+/// chunk is checked and no stamp is trusted or left. On anything but `Mapped` the old mapping stays.
+#[allow(clippy::too_many_arguments)]
+unsafe fn map_slid(addr: u64, size: usize, prot: i32, path: &std::path::Path, id: &SlidId, uid: u32, seed: usize, boot: Option<&[u8]>, wait_ms: u64) -> Slid {
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
     static DIR_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -592,21 +655,43 @@ unsafe fn map_slid(addr: u64, size: usize, prot: i32, path: &std::path::Path, id
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Slid::Missing,
         Err(e) => return refuse(path, &e.to_string()),
     };
-    if !f.metadata().is_ok_and(|md| md.is_file() && crate::aot::owned(&md, uid) && md.len() == (size + id.record_len()) as u64) {
-        return refuse(path, "not a file of ours, of the right size, that only we can write");
-    }
+    let md = match f.metadata() {
+        Ok(md) if md.is_file() && crate::aot::owned(&md, uid) && md.len() == (size + id.record_len()) as u64 => md,
+        _ => return refuse(path, "not a file of ours, of the right size, that only we can write"),
+    };
     let n = id.chunks();
     let mut rec = vec![0u8; id.record_len()];
     if !pread_all(f.as_raw_fd(), &mut rec, size as u64) || rec[..64] != id.header() || rec[64 + 32 * n..] != sha256(&rec[..64 + 32 * n]) {
         return refuse(path, "its record is not this mapping's");
     }
+    let stamp = path.with_extension("stamp");
+    let want = boot.map(|b| stamp_bytes(b, &md, &rec[64 + 32 * n..]));
+    let stamped = || want.as_ref().is_some_and(|w| stamp_ok(&stamp, w, uid));
+    let mut lock = None;
+    let mut trusted = stamped();
+    if !trusted && want.is_some() {
+        lock = BuildLock::take(&path.with_extension("lock"), wait_ms);
+        // Whether we got the lock or gave up waiting, the first process may have left its stamp meanwhile.
+        trusted = stamped();
+    }
+    let chunks = if trusted { checked_chunks(n, seed) } else { (0..n).collect() };
     let mut buf = vec![0u8; id.chunk.min(size)];
-    for c in checked_chunks(n, seed) {
+    for c in chunks {
         let (off, len) = (c * id.chunk, (size - c * id.chunk).min(id.chunk));
         if !pread_all(f.as_raw_fd(), &mut buf[..len], off as u64) || sha256(&buf[..len])[..] != rec[64 + 32 * c..96 + 32 * c] {
+            if trusted {
+                // The file changed since its stamp was left: the next process checks every chunk, and refuses it too.
+                let _ = std::fs::remove_file(&stamp);
+            }
             return refuse(path, &format!("chunk {c} does not match its hash"));
         }
     }
+    if let (false, Some(_), Some(w)) = (trusted, &lock, &want) {
+        if !stamp_write(&stamp, w) {
+            eprintln!("maclator: could not leave a stamp beside {}; the next process checks every chunk again", path.display());
+        }
+    }
+    drop(lock);
     let p = libc::mmap(addr as *mut _, size, prot, libc::MAP_PRIVATE | libc::MAP_FIXED, f.as_raw_fd(), 0);
     if p != libc::MAP_FAILED && p as u64 == addr {
         Slid::Mapped
@@ -817,8 +902,14 @@ mod slid_tests {
     const MAP_AT_3: u64 = 0x2400_0000_0000;
     const MAP_AT_4: u64 = 0x2500_0000_0000;
     const MAP_AT_5: u64 = 0x2600_0000_0000;
+    // The stamp tests: STAMP_AT + k * STAMP_STEP for the k-th, one each.
+    const STAMP_AT: u64 = 0x3200_0000_0000;
+    const STAMP_STEP: u64 = 0x10_0000_0000;
     const UNSLID: u64 = 0x1_8000_0000;
     const SLIDE: u64 = 0x4_8000_0000;
+    // Two boots' sessions, as `boot_session` would give them.
+    const BOOT: &[u8] = b"11111111-2222-3333-4444-555555555555";
+    const BOOT_2: &[u8] = b"66666666-7777-8888-9999-000000000000";
 
     fn uid() -> u32 {
         unsafe { libc::geteuid() }
@@ -1006,15 +1097,41 @@ mod slid_tests {
 
     /// Map `path` at `at` (over a fresh anonymous mapping that reads zero) and say what happened; unmaps after.
     fn try_map(at: u64, path: &std::path::Path, id: &SlidId, uid: u32, seed: usize) -> (Slid, u8) {
+        try_map_in(at, path, id, uid, seed, Some(BOOT))
+    }
+
+    /// `try_map` in the boot `boot`, waiting up to 10 s for a process checking the file first.
+    fn try_map_in(at: u64, path: &std::path::Path, id: &SlidId, uid: u32, seed: usize, boot: Option<&[u8]>) -> (Slid, u8) {
+        try_map_waiting(at, path, id, uid, seed, boot, 10_000)
+    }
+
+    /// `try_map_in`, waiting up to `wait_ms` for a process checking the file first.
+    fn try_map_waiting(at: u64, path: &std::path::Path, id: &SlidId, uid: u32, seed: usize, boot: Option<&[u8]>, wait_ms: u64) -> (Slid, u8) {
         let len = id.size as usize;
         unsafe {
             let p = libc::mmap(at as *mut _, len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_FIXED, -1, 0);
             assert_eq!(p as u64, at, "control: the range is ours");
-            let r = map_slid(at, len, libc::PROT_READ, path, id, uid, seed);
+            let r = map_slid(at, len, libc::PROT_READ, path, id, uid, seed, boot, wait_ms);
             let first = *(at as *const u8);
             libc::munmap(at as *mut _, len);
             (r, first)
         }
+    }
+
+    /// Leave the stamp a process would have left in `boot` had it checked every chunk of `path` as the file is now: the
+    /// state after a change below the filesystem, which moves nothing a stamp names.
+    fn stamp_as_is(path: &std::path::Path, id: &SlidId, boot: &[u8]) {
+        let file = std::fs::read(path).unwrap();
+        let sum = &file[file.len() - 32..];
+        assert_eq!(file.len(), id.size as usize + id.record_len(), "control: the file is whole");
+        assert!(stamp_write(&path.with_extension("stamp"), &stamp_bytes(boot, &std::fs::metadata(path).unwrap(), sum)));
+    }
+
+    /// `(inode, size, mtime, mtime_nsec)` of `path`.
+    fn named(path: &std::path::Path) -> (u64, u64, i64, i64) {
+        use std::os::unix::fs::MetadataExt;
+        let md = std::fs::metadata(path).unwrap();
+        (md.ino(), md.size(), md.mtime(), md.mtime_nsec())
     }
 
     fn flip(path: &std::path::Path, at: u64) {
@@ -1062,7 +1179,7 @@ mod slid_tests {
         unsafe {
             let p = libc::mmap(MAP_AT as *mut _, want.len(), libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0);
             assert_eq!(p as u64, MAP_AT, "control: the range starts free");
-            assert_eq!(map_slid(MAP_AT, want.len(), libc::PROT_READ | libc::PROT_WRITE, &path, &id, uid(), 0), Slid::Mapped);
+            assert_eq!(map_slid(MAP_AT, want.len(), libc::PROT_READ | libc::PROT_WRITE, &path, &id, uid(), 0, Some(BOOT), 1000), Slid::Mapped);
             assert_eq!(std::slice::from_raw_parts(MAP_AT as *const u8, want.len()), &want[..]);
             // Copy-on-write: a write by the process stays its own.
             *(MAP_AT as *mut u8) ^= 0xff;
@@ -1121,7 +1238,7 @@ mod slid_tests {
             let p = libc::mmap(MAP_AT_3 as *mut _, LEN, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0);
             assert_eq!(p as u64, MAP_AT_3, "control: the range starts free");
             let before = footprint();
-            assert_eq!(map_slid(MAP_AT_3, LEN, libc::PROT_READ, &path, &id, uid(), 7), Slid::Mapped);
+            assert_eq!(map_slid(MAP_AT_3, LEN, libc::PROT_READ, &path, &id, uid(), 7, Some(BOOT), 1000), Slid::Mapped);
             read_all(MAP_AT_3, LEN);
             let shared = footprint().saturating_sub(before);
             assert!(shared < (LEN as u64) / 4, "checking, mapping and reading the slid file cost {shared} bytes of footprint");
@@ -1180,18 +1297,19 @@ mod slid_tests {
 
     #[test]
     fn content_that_does_not_match_its_hash_is_refused() {
-        // Seed c checks chunk c (and chunk 0): a byte changed in a checked chunk is refused.
+        // Seed c checks chunk c (and chunk 0): a byte changed in a checked chunk is refused, even with a stamp.
         assert_eq!(checked_chunks(PAGES, 2), vec![0, 2], "with SLID_CHECK_CHUNKS = 1, seed 2 checks chunks 0 and 2");
         for (c, at) in [(0usize, 0x30u64), (1, PAGE as u64 + 9), (2, 2 * PAGE as u64 + 100)] {
             let (_d, path, id, want) = built(&format!("hash{c}"));
             assert_eq!(try_map(MAP_AT_5, &path, &id, uid(), c), (Slid::Mapped, want[0]), "control: sound");
             flip(&path, at);
+            stamp_as_is(&path, &id, BOOT);
             assert_eq!(try_map(MAP_AT_5, &path, &id, uid(), c), (Slid::Refused, 0), "a byte changed in chunk {c}");
         }
-        // The limit of a sample: a change in a chunk this process does not check is not seen by it.
-        let (_d, path, id, want) = built("hash-unchecked");
+        // With no stamp every chunk is checked, so a change in a chunk the sample skips is seen too.
+        let (_d, path, id, _) = built("hash-unchecked");
         flip(&path, PAGE as u64 + 9);
-        assert_eq!(try_map(MAP_AT_5, &path, &id, uid(), 2), (Slid::Mapped, want[0]), "chunk 1, which seed 2 does not check");
+        assert_eq!(try_map(MAP_AT_5, &path, &id, uid(), 2), (Slid::Refused, 0), "with no stamp every chunk is checked: chunk 1, which seed 2's sample skips");
     }
 
     #[test]
@@ -1541,6 +1659,231 @@ mod slid_tests {
         let zf = std::fs::File::open(&zero).unwrap();
         assert!(slid_path(zf.as_raw_fd(), &m, &info, 0x10).is_none(), "no UUID, no shared file");
         assert!(slid_path(-1, &m, &info, 0x10).is_none());
+    }
+
+    /// The stamp tests change chunk 1, which the sample of seed 2 (chunks 0 and 2) skips.
+    const UNSAMPLED: u64 = PAGE as u64 + 9;
+
+    #[test]
+    fn a_file_whose_every_chunk_matches_gets_a_stamp() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_d, path, id, want) = built("stamp-left");
+        let stamp = path.with_extension("stamp");
+        assert!(!stamp.exists(), "control: building leaves no stamp");
+        assert_eq!(try_map(STAMP_AT, &path, &id, uid(), 2), (Slid::Mapped, want[0]), "control: sound");
+        let md = std::fs::symlink_metadata(&stamp).expect("a file whose every chunk matches gets a stamp");
+        assert!(md.is_file() && md.permissions().mode() & 0o777 == 0o600, "the stamp is a file only we can read or write: {:o}", md.permissions().mode());
+        let file = std::fs::read(&path).unwrap();
+        assert_eq!(std::fs::read(&stamp).unwrap(), stamp_bytes(BOOT, &std::fs::metadata(&path).unwrap(), &file[file.len() - 32..]), "it names the boot, the file and its record");
+        assert!(!path.with_extension("stamp-tmp").exists(), "the temporary file is renamed, not left");
+    }
+
+    #[test]
+    fn a_stamp_that_matches_is_trusted_and_only_the_sample_is_checked() {
+        let at = STAMP_AT + STAMP_STEP;
+        let (_d, path, id, want) = built("stamp-trusted");
+        flip(&path, UNSAMPLED);
+        stamp_as_is(&path, &id, BOOT);
+        // The limit, by design: a change that moves nothing the stamp names, in a chunk the sample skips.
+        assert_eq!(try_map(at, &path, &id, uid(), 2), (Slid::Mapped, want[0]), "a stamp that matches is trusted: only the sample is checked");
+        assert_eq!(try_map(at, &path, &id, uid(), 1).0, Slid::Refused, "control: a sample holding chunk 1 sees the change");
+    }
+
+    #[test]
+    fn a_stamp_left_in_another_boot_is_not_trusted() {
+        let at = STAMP_AT + 2 * STAMP_STEP;
+        let (_d, path, id, want) = built("stamp-boot");
+        flip(&path, UNSAMPLED);
+        stamp_as_is(&path, &id, BOOT);
+        assert_eq!(try_map_in(at, &path, &id, uid(), 2, Some(BOOT)), (Slid::Mapped, want[0]), "control: in its own boot the stamp is trusted");
+        assert_eq!(try_map_in(at, &path, &id, uid(), 2, Some(BOOT_2)), (Slid::Refused, 0), "a stamp left in another boot is not trusted: every chunk is checked");
+    }
+
+    #[test]
+    fn with_no_boot_session_every_chunk_is_checked_and_no_stamp_is_left() {
+        let at = STAMP_AT + 3 * STAMP_STEP;
+        let (_d, path, id, want) = built("stamp-noboot");
+        assert_eq!(try_map_in(at, &path, &id, uid(), 2, None), (Slid::Mapped, want[0]), "control: sound");
+        assert!(!path.with_extension("stamp").exists(), "with no boot session no stamp is left");
+        flip(&path, UNSAMPLED);
+        assert_eq!(try_map_in(at, &path, &id, uid(), 2, None), (Slid::Refused, 0), "with no boot session every chunk is checked");
+    }
+
+    #[test]
+    fn a_file_replaced_by_one_of_the_same_size_and_mtime_is_checked_whole() {
+        let at = STAMP_AT + 4 * STAMP_STEP;
+        let (d, path, id, want) = built("stamp-replaced");
+        assert_eq!(try_map(at, &path, &id, uid(), 2), (Slid::Mapped, want[0]), "control: sound, and stamped");
+        let before = named(&path);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[UNSAMPLED as usize] ^= 0x5a;
+        let new = d.join("x.new");
+        std::fs::write(&new, &bytes).unwrap();
+        chmod(&new, 0o644);
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::File::options().write(true).open(&new).unwrap().set_modified(mtime).unwrap();
+        std::fs::rename(&new, &path).unwrap();
+        let after = named(&path);
+        assert!(after.0 != before.0 && (after.1, after.2, after.3) == (before.1, before.2, before.3), "control: another inode, the same size and mtime: {before:?} {after:?}");
+        assert_eq!(try_map(at, &path, &id, uid(), 2), (Slid::Refused, 0), "a file replaced by one of the same size and mtime: every chunk is checked");
+    }
+
+    #[test]
+    fn a_file_written_in_place_is_checked_whole() {
+        let at = STAMP_AT + 5 * STAMP_STEP;
+        let (_d, path, id, want) = built("stamp-written");
+        assert_eq!(try_map(at, &path, &id, uid(), 2), (Slid::Mapped, want[0]), "control: sound, and stamped");
+        let before = named(&path);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        flip(&path, UNSAMPLED);
+        let after = named(&path);
+        assert!((after.0, after.1) == (before.0, before.1) && (after.2, after.3) != (before.2, before.3), "control: the same inode and size, a new mtime: {before:?} {after:?}");
+        assert_eq!(try_map(at, &path, &id, uid(), 2), (Slid::Refused, 0), "a file written in place since its stamp: every chunk is checked");
+    }
+
+    #[test]
+    fn a_record_rewritten_in_place_with_its_mtime_kept_is_checked_whole() {
+        use std::os::unix::fs::FileExt;
+        let at = STAMP_AT + 6 * STAMP_STEP;
+        let (_d, path, id, want) = built("stamp-record");
+        assert_eq!(try_map(at, &path, &id, uid(), 2), (Slid::Mapped, want[0]), "control: sound, and stamped");
+        let before = named(&path);
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        // A record whole in itself, whose hash for chunk 1 no longer matches chunk 1.
+        let n = id.chunks();
+        let mut rec = std::fs::read(&path).unwrap()[want.len()..].to_vec();
+        rec[64 + 32] ^= 0x5a;
+        let sum = sha256(&rec[..64 + 32 * n]);
+        rec[64 + 32 * n..].copy_from_slice(&sum);
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.write_all_at(&rec, want.len() as u64).unwrap();
+        f.set_modified(mtime).unwrap();
+        drop(f);
+        assert_eq!(named(&path), before, "control: the inode, size and mtime the stamp names");
+        assert_eq!(try_map(at, &path, &id, uid(), 2), (Slid::Refused, 0), "a record rewritten with its mtime kept: every chunk is checked");
+    }
+
+    #[test]
+    fn a_stamp_only_we_can_write_is_trusted_and_no_other() {
+        let at = STAMP_AT + 7 * STAMP_STEP;
+        let (d, path, id, want) = built("stamp-owner");
+        let stamp = path.with_extension("stamp");
+        flip(&path, UNSAMPLED);
+        stamp_as_is(&path, &id, BOOT);
+        assert_eq!(try_map(at, &path, &id, uid(), 2), (Slid::Mapped, want[0]), "control: a stamp of ours that only we can write is trusted");
+        for (mode, what) in [(0o620, "a group-writable stamp"), (0o602, "an other-writable stamp")] {
+            chmod(&stamp, mode);
+            assert_eq!(try_map(at, &path, &id, uid(), 2), (Slid::Refused, 0), "{what} is not trusted");
+        }
+        stamp_as_is(&path, &id, BOOT);
+        let real = d.join("elsewhere");
+        std::fs::rename(&stamp, &real).unwrap();
+        std::os::unix::fs::symlink(&real, &stamp).unwrap();
+        assert_eq!(try_map(at, &path, &id, uid(), 2), (Slid::Refused, 0), "a symlink to a stamp that matches is not trusted");
+    }
+
+    #[test]
+    fn processes_racing_to_check_first_check_once_and_the_second_trusts_the_first_ones_stamp() {
+        let at = STAMP_AT + 8 * STAMP_STEP;
+        let (_d, path, id, want) = built("stamp-race");
+        flip(&path, UNSAMPLED);
+        // The first process, checking every chunk: it holds the file's lock. Waited for, as `becomes_free` does: the
+        // builder has just let it go, and a release can land a few milliseconds late.
+        let lock = path.with_extension("lock");
+        let first = BuildLock::take(&lock, 2_000).expect("free once the builder let it go");
+        let p = path.clone();
+        let second = std::thread::spawn(move || try_map(at, &p, &id, uid(), 2));
+        let waiting = goes_for_the_lock(&lock) && !second.is_finished();
+        // What the first process leaves once every chunk matched (here as if the change came after its check).
+        stamp_as_is(&path, &id, BOOT);
+        drop(first);
+        let got = second.join().unwrap();
+        assert!(waiting, "a process going second waits for the first one's check rather than checking at the same time");
+        assert_eq!(got, (Slid::Mapped, want[0]), "and then trusts the stamp the first one left, checking only the sample");
+    }
+
+    #[test]
+    fn a_process_that_gives_up_waiting_still_trusts_a_stamp_left_meanwhile() {
+        let at = STAMP_AT + 12 * STAMP_STEP;
+        let (_d, path, id, want) = built("stamp-gave-up");
+        flip(&path, UNSAMPLED);
+        let lock = path.with_extension("lock");
+        let first = BuildLock::take(&lock, 2_000).expect("free once the builder let it go");
+        let p = path.clone();
+        // It waits 2 s, and the first process holds the lock longer than that.
+        let second = std::thread::spawn(move || try_map_waiting(at, &p, &id, uid(), 2, Some(BOOT), 2_000));
+        let went = goes_for_the_lock(&lock);
+        stamp_as_is(&path, &id, BOOT);
+        let got = second.join().unwrap();
+        drop(first);
+        assert!(went, "control: it found no stamp and went for the lock");
+        assert_eq!(got, (Slid::Mapped, want[0]), "a process that gives up waiting still trusts a stamp left meanwhile");
+    }
+
+    /// Whether a second descriptor of `lock` opens in this process within 10 s, beside the one the test holds: a
+    /// process that finds no stamp goes for the file's lock, and that is its descriptor. F_GETPATH answers with the
+    /// real path, and $TMPDIR reaches /var through a symlink.
+    fn goes_for_the_lock(lock: &std::path::Path) -> bool {
+        use std::os::unix::ffi::OsStrExt;
+        let want = std::ffi::CString::new(std::fs::canonicalize(lock).unwrap().as_os_str().as_bytes()).unwrap();
+        let open = || {
+            (0..unsafe { libc::getdtablesize() })
+                .filter(|&fd| {
+                    let mut buf = [0i8; 1024];
+                    unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) == 0 && libc::strcmp(buf.as_ptr(), want.as_ptr()) == 0 }
+                })
+                .count()
+        };
+        let t0 = std::time::Instant::now();
+        while open() < 2 {
+            if t0.elapsed() > std::time::Duration::from_secs(10) {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        true
+    }
+
+    #[test]
+    fn a_stamp_is_renamed_into_place_and_a_symlink_at_its_name_is_not_followed() {
+        let at = STAMP_AT + 9 * STAMP_STEP;
+        let (d, path, id, want) = built("stamp-rename");
+        let stamp = path.with_extension("stamp");
+        let target = d.join("target");
+        std::fs::write(&target, b"keep").unwrap();
+        std::os::unix::fs::symlink(&target, &stamp).unwrap();
+        assert_eq!(try_map(at, &path, &id, uid(), 2), (Slid::Mapped, want[0]), "control: sound");
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep", "a symlink at the stamp's name is not followed");
+        assert!(std::fs::symlink_metadata(&stamp).unwrap().is_file(), "it is replaced by the stamp");
+        assert!(!path.with_extension("stamp-tmp").exists(), "the temporary file is renamed, not left");
+    }
+
+    #[test]
+    fn a_change_the_sample_finds_removes_the_stamp() {
+        let at = STAMP_AT + 10 * STAMP_STEP;
+        let (_d, path, id, _) = built("stamp-removed");
+        flip(&path, UNSAMPLED);
+        stamp_as_is(&path, &id, BOOT);
+        assert_eq!(try_map(at, &path, &id, uid(), 1), (Slid::Refused, 0), "control: the sample of seed 1 holds chunk 1");
+        assert!(!path.with_extension("stamp").exists(), "a change the sample finds removes the stamp");
+        assert_eq!(try_map(at, &path, &id, uid(), 2), (Slid::Refused, 0), "so a process whose sample skips the change checks every chunk, and refuses too");
+    }
+
+    #[test]
+    fn a_file_with_a_chunk_that_does_not_match_gets_no_stamp() {
+        let at = STAMP_AT + 11 * STAMP_STEP;
+        let (_d, path, id, _) = built("stamp-none");
+        flip(&path, UNSAMPLED);
+        assert_eq!(try_map(at, &path, &id, uid(), 2), (Slid::Refused, 0), "control: with no stamp every chunk is checked");
+        assert!(!path.with_extension("stamp").exists(), "a file with a chunk that does not match gets no stamp");
+    }
+
+    #[test]
+    fn the_boot_session_is_this_boots() {
+        let a = boot_session().expect("the kernel says which boot this is");
+        assert_eq!(boot_session().as_deref(), Some(&a[..]), "control: it does not change within a boot");
+        let out = std::process::Command::new("/usr/sbin/sysctl").args(["-n", "kern.bootsessionuuid"]).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim().as_bytes(), &a[..], "the same as sysctl(8) says");
     }
 }
 
