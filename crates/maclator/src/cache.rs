@@ -457,12 +457,13 @@ unsafe fn apply_slide_info(info: &[u8], region: u64, size: u64, slide: u64, unsl
 
 /// Sliding a mapping in place writes into nearly every page of the cache's data mappings, so each translated process
 /// held its own private copy of them (about 390 MiB on macOS 27 with 4 KiB host pages), where the kernel shares one
-/// slid copy among native processes. Instead the slid bytes are kept once in a file beside the AOT files and mapped
+/// slid copy among native processes. Instead the slid bytes are kept once in a file (in root's shared store when there
+/// is one, `SHARED_STORE`, else beside the AOT files) and mapped
 /// from it copy-on-write: pages the guest only reads are shared clean file pages, and only pages it writes become
 /// its own, as with the kernel's shared region. `MACLATOR_PRIVATE_SLIDE` set keeps the old in-place slide.
 ///
-/// A slid file is trusted only in a directory owned by our effective uid and writable by no group or other, only if
-/// it is ours and writable by no one else, and only if its record matches: after the slid bytes it records the mapping
+/// A slid file is trusted only in a directory of its store's owner (our effective uid, or root for the shared store)
+/// that no group or other can write, only if the file is that owner's and no one else can write it, and only if its record matches: after the slid bytes it records the mapping
 /// it was slid from and a SHA-256 of each chunk. The first process in a boot to map a file checks every chunk and
 /// leaves a stamp beside it; later processes in that boot find the stamp and check the record and some chunks.
 /// Anything else is refused, and the mapping is slid privately as before.
@@ -547,16 +548,77 @@ enum Slid {
     Refused,
 }
 
+/// Where root keeps one slid copy of each shared cache mapping for every process of the system, as Rosetta 2 keeps its
+/// translations once, in `/var/db/oah`, for every user. A per-user store sits under `HOME`, and a sandbox container
+/// gives each app a `HOME` of its own, so without this every container and every daemon's home held its own copy of the
+/// same slid bytes: 16 stores and 8,946 MiB of identical files in one macOS 27 login boot, until the volume filled.
+///
+/// Used only when it is a real directory (not a symlink) owned by root that no group or other can write. Then only root
+/// builds slid files there; every process maps root's files and checks them as it checks its own; and a process that
+/// finds no file there, or may not read one (a sandbox), slides privately and writes no copy of its own. Without it
+/// the per-user store is used as before, except by a process denied even the lookup of it (a sandbox), which slides privately. `MACLATOR_SHARED_STORE` names another such directory; empty, it turns it off.
+const SHARED_STORE: &str = "/private/var/db/maclator";
+
+/// The directory the shared store would be, from `MACLATOR_SHARED_STORE` as `var` gives it.
+fn shared_store_path(var: Option<std::ffi::OsString>) -> Option<std::path::PathBuf> {
+    match var {
+        None => Some(SHARED_STORE.into()),
+        Some(v) if v.is_empty() => None,
+        Some(v) => Some(v.into()),
+    }
+}
+
+/// Where this process's slid files are: the directory, the uid whose files (and directory) it trusts there, and
+/// whether it may build a missing one.
+#[derive(Debug, PartialEq)]
+struct SlidStore {
+    dir: std::path::PathBuf,
+    owner: u32,
+    build: bool,
+}
+
+/// The shared store `shared` if it is a real directory owned by `shared_owner` that no group or other can write, else
+/// the per-user store `home` (owned by `euid`, which may build in it). Only the shared store's owner builds in it.
+///
+/// A shared store this process may not even look at (a sandbox denies it) is still the store, with no building: the
+/// mapping then fails its own check and the cache is slid privately, rather than copied into this process's `HOME`.
+/// Only a shared store that does not exist, or that is not safe to trust, leaves the per-user store in use.
+fn slid_store_in(shared: Option<&std::path::Path>, shared_owner: u32, home: std::path::PathBuf, euid: u32) -> SlidStore {
+    static UNSAFE_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if let Some(dir) = shared {
+        match std::fs::symlink_metadata(dir) {
+            Ok(md) if md.is_dir() && crate::aot::owned(&md, shared_owner) => {
+                return SlidStore { dir: dir.to_path_buf(), owner: shared_owner, build: euid == shared_owner };
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                return SlidStore { dir: dir.to_path_buf(), owner: shared_owner, build: false };
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            _ if UNSAFE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) => {}
+            _ => eprintln!("maclator: not using the shared slid store {}: not a directory of uid {shared_owner} that only it can write; using {}", dir.display(), home.display()),
+        }
+    }
+    SlidStore { dir: home, owner: euid, build: true }
+}
+
 /// Map `m` (already mapped private from the cache file at `addr`) from its shared slid file, building the file first
-/// if there is none. False means nothing changed and the caller slides in place as before.
+/// if there is none and this process may. False means nothing changed and the caller slides in place as before.
 unsafe fn share_slid(fd: i32, m: &MappingSlideNp, info: &[u8], slide: u64, unslid_base: u64, addr: u64) -> bool {
+    let shared = shared_store_path(std::env::var_os("MACLATOR_SHARED_STORE"));
+    let store = slid_store_in(shared.as_deref(), 0, crate::aot::cache_dir(), libc::geteuid());
+    share_slid_in(&store, fd, m, info, slide, unslid_base, addr)
+}
+
+/// `share_slid` in the store `store`, so a test can give its own.
+unsafe fn share_slid_in(store: &SlidStore, fd: i32, m: &MappingSlideNp, info: &[u8], slide: u64, unslid_base: u64, addr: u64) -> bool {
     static BOOT_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    let Some((path, id)) = slid_path(fd, m, info, slide) else { return false };
+    static MISSING_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let Some((path, id)) = slid_path(&store.dir, fd, m, info, slide) else { return false };
     let prot = match (m.init_prot & 3) as i32 {
         0 => libc::PROT_NONE,
         p => p,
     };
-    let (size, uid, seed, boot) = (m.size as usize, libc::geteuid(), libc::getpid() as usize, boot_session());
+    let (size, uid, seed, boot) = (m.size as usize, store.owner, libc::getpid() as usize, boot_session());
     if boot.is_none() && !BOOT_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         eprintln!("maclator: kern.bootsessionuuid gave no answer, so every chunk of each slid file is checked at every start");
     }
@@ -564,7 +626,13 @@ unsafe fn share_slid(fd: i32, m: &MappingSlideNp, info: &[u8], slide: u64, unsli
     match map_slid(addr, size, prot, &path, &id, uid, seed, boot, SLID_LOCK_WAIT_MS) {
         Slid::Mapped => true,
         Slid::Refused => false,
-        Slid::Missing => build_slid(fd, m, info, slide, unslid_base, &path, &id, uid, SLID_LOCK_WAIT_MS) && map_slid(addr, size, prot, &path, &id, uid, seed, boot, SLID_LOCK_WAIT_MS) == Slid::Mapped,
+        Slid::Missing if store.build => build_slid(fd, m, info, slide, unslid_base, &path, &id, uid, SLID_LOCK_WAIT_MS) && map_slid(addr, size, prot, &path, &id, uid, seed, boot, SLID_LOCK_WAIT_MS) == Slid::Mapped,
+        Slid::Missing => {
+            if !MISSING_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("maclator: {} is not in the shared store yet (only uid {uid} builds there); sliding privately", path.display());
+            }
+            false
+        }
     }
 }
 
@@ -578,8 +646,9 @@ fn boot_session() -> Option<Vec<u8>> {
     (r == 0 && !v.is_empty()).then(|| v.to_vec())
 }
 
-/// The slid file for mapping `m` of the cache file `fd`: keyed by that file's UUID, the mapping's place in it, and the slide.
-fn slid_path(fd: i32, m: &MappingSlideNp, info: &[u8], slide: u64) -> Option<(std::path::PathBuf, SlidId)> {
+/// The slid file in `dir` for mapping `m` of the cache file `fd`: keyed by that file's UUID, the mapping's place in it,
+/// and the slide, so every process that maps the same cache at the same slide names the same file.
+fn slid_path(dir: &std::path::Path, fd: i32, m: &MappingSlideNp, info: &[u8], slide: u64) -> Option<(std::path::PathBuf, SlidId)> {
     if fd < 0 || info.len() < 24 || rd32(info, 4) == 0 || std::env::var_os("MACLATOR_PRIVATE_SLIDE").is_some() {
         return None;
     }
@@ -588,7 +657,7 @@ fn slid_path(fd: i32, m: &MappingSlideNp, info: &[u8], slide: u64) -> Option<(st
         return None;
     }
     let hex: String = uuid.iter().map(|b| format!("{b:02x}")).collect();
-    let path = crate::aot::cache_dir().join(format!("dsc-slid{SLID_FORMAT}-{hex}-{:x}-{:x}-{slide:x}.data", m.file_offset, m.size));
+    let path = dir.join(format!("dsc-slid{SLID_FORMAT}-{hex}-{:x}-{:x}-{slide:x}.data", m.file_offset, m.size));
     Some((path, SlidId { uuid, file_offset: m.file_offset, size: m.size, slide, chunk: SLID_HASH_CHUNK }))
 }
 
@@ -631,7 +700,16 @@ fn stamp_write(stamp: &std::path::Path, want: &[u8]) -> bool {
     use std::os::unix::fs::OpenOptionsExt;
     let tmp = stamp.with_extension("stamp-tmp");
     let _ = std::fs::remove_file(&tmp);
-    let ok = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp).and_then(|mut f| f.write_all(want)).and_then(|()| std::fs::rename(&tmp, stamp)).is_ok();
+    // Readable by all, writable by its owner alone (set past the umask): in root's shared store every uid reads root's
+    // stamp, or it would check every chunk at every start. A per-user store's directory is made 0700 when created.
+    let ok = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .open(&tmp)
+        .and_then(|mut f| f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o644)).and_then(|()| f.write_all(want)))
+        .and_then(|()| std::fs::rename(&tmp, stamp))
+        .is_ok();
     if !ok {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -639,7 +717,7 @@ fn stamp_write(stamp: &std::path::Path, want: &[u8]) -> bool {
 }
 
 /// Map the slid file at `path` over [addr, addr + size), copy-on-write, once it has passed the checks above; `uid` and
-/// `seed` are our effective uid and pid, `boot` this boot's session. Without a stamp of this boot for this file, every
+/// `seed` are the uid whose files are trusted (ours, or the shared store's owner) and our pid, `boot` this boot's session. Without a stamp of this boot for this file, every
 /// chunk is checked, under the file's `BuildLock` (waited for at most `wait_ms`) so that a process going second finds
 /// the first one's stamp rather than checking again, and a stamp is left if every chunk matches. With no `boot`, every
 /// chunk is checked and no stamp is trusted or left. A refusal of this boot for this file, left when every chunk was
@@ -874,6 +952,8 @@ unsafe fn build_slid(fd: i32, m: &MappingSlideNp, info: &[u8], slide: u64, unsli
     let tmp = path.with_extension("tmp");
     let built = (|| -> Option<()> {
         let mut out = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o644).open(&tmp).ok()?;
+        // 0644 past the umask: in root's shared store every uid must be able to read it.
+        out.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o644)).ok()?;
         let page = rd32(info, 4) as usize;
         let count = rd32(info, 8) as usize;
         let size = m.size as usize;
@@ -1688,16 +1768,249 @@ mod slid_tests {
         f.write_all(&[0xab; 16]).unwrap();
         let f = std::fs::File::open(&p).unwrap();
         let m = MappingSlideNp { address: 0, size: 0x8000, file_offset: 0x4000, slide_size: 1, slide_start: 0, max_prot: 3, init_prot: 3 };
-        let (a, id) = slid_path(f.as_raw_fd(), &m, &info, 0x10).unwrap();
+        let (a, id) = slid_path(&d, f.as_raw_fd(), &m, &info, 0x10).unwrap();
         let name = a.file_name().unwrap().to_str().unwrap().to_string();
         assert!(name.starts_with("dsc-slid2-") && name.contains(&"ab".repeat(16)) && name.contains("-4000-8000-10."), "{name}");
         assert_eq!((id.uuid, id.file_offset, id.size, id.slide, id.chunk), ([0xab; 16], 0x4000, 0x8000, 0x10, SLID_HASH_CHUNK));
-        assert_ne!(Some(a), slid_path(f.as_raw_fd(), &m, &info, 0x20).map(|x| x.0));
+        assert_ne!(Some(a), slid_path(&d, f.as_raw_fd(), &m, &info, 0x20).map(|x| x.0));
         let zero = d.join("zero");
         std::fs::write(&zero, [0u8; 0x80]).unwrap();
         let zf = std::fs::File::open(&zero).unwrap();
-        assert!(slid_path(zf.as_raw_fd(), &m, &info, 0x10).is_none(), "no UUID, no shared file");
-        assert!(slid_path(-1, &m, &info, 0x10).is_none());
+        assert!(slid_path(&d, zf.as_raw_fd(), &m, &info, 0x10).is_none(), "no UUID, no shared file");
+        assert!(slid_path(&d, -1, &m, &info, 0x10).is_none());
+        assert_eq!(slid_path(&d.join("s"), f.as_raw_fd(), &m, &info, 0x10).unwrap().0.parent(), Some(d.join("s").as_path()), "the file is in the store it is given");
+    }
+
+    // The shared store tests: one address each, SHARE_AT + k * SHARE_STEP for the k-th.
+    const SHARE_AT: u64 = 0x3400_0000_0000;
+    const SHARE_STEP: u64 = 0x10_0000_0000;
+
+    /// The fixture's cache file with a UUID in its header, as `slid_path` needs: the mapping one page in, as `source`.
+    fn source_with_uuid(d: &std::path::Path, data: &[u8]) -> (std::fs::File, MappingSlideNp) {
+        use std::io::Write;
+        let p = d.join("cache-uuid");
+        let mut f = std::fs::File::create(&p).unwrap();
+        let mut head = vec![0u8; PAGE];
+        head[0x58..0x68].copy_from_slice(&[0xcd; 16]);
+        f.write_all(&head).unwrap();
+        f.write_all(data).unwrap();
+        let m = MappingSlideNp { address: UNSLID, size: data.len() as u64, file_offset: PAGE as u64, slide_size: 1, slide_start: 0, max_prot: 3, init_prot: 3 };
+        (std::fs::File::open(&p).unwrap(), m)
+    }
+
+    /// `share_slid_in` over a fresh anonymous mapping at `at` that reads zero: (what it said, the mapping's first 16
+    /// bytes); unmaps after. The fixture's first slid byte differs from 0, so a mapping that took reads non-zero.
+    fn try_share(at: u64, store: &SlidStore, f: &std::fs::File, m: &MappingSlideNp, info: &[u8]) -> (bool, Vec<u8>) {
+        use std::os::unix::io::AsRawFd;
+        let len = m.size as usize;
+        unsafe {
+            let p = libc::mmap(at as *mut _, len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_FIXED, -1, 0);
+            assert_eq!(p as u64, at, "control: the range is ours");
+            let r = share_slid_in(store, f.as_raw_fd(), m, info, SLIDE, UNSLID, at);
+            let first = std::slice::from_raw_parts(at as *const u8, 16).to_vec();
+            libc::munmap(at as *mut _, len);
+            (r, first)
+        }
+    }
+
+    /// The `.data` files under `d`, at any depth.
+    fn slid_files(d: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let mut todo = vec![d.to_path_buf()];
+        while let Some(x) = todo.pop() {
+            for e in std::fs::read_dir(&x).into_iter().flatten().flatten() {
+                let p = e.path();
+                if e.file_type().is_ok_and(|t| t.is_dir()) {
+                    todo.push(p);
+                } else if p.extension().is_some_and(|x| x == "data") {
+                    out.push(p);
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Every entry directly in `d`, by name.
+    fn names(d: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(d).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        v.sort();
+        v
+    }
+
+    /// Puts a directory's mode back when the test ends, a panic included, so `dir`'s cleanup can remove it.
+    struct Mode(std::path::PathBuf, u32);
+
+    impl Drop for Mode {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
+        }
+    }
+
+    #[test]
+    fn the_shared_store_is_named_by_the_environment_or_turned_off_by_it() {
+        assert_eq!(shared_store_path(None), Some(std::path::PathBuf::from(SHARED_STORE)));
+        assert_eq!(shared_store_path(Some("".into())), None, "empty turns it off");
+        assert_eq!(shared_store_path(Some("/x/y".into())), Some(std::path::PathBuf::from("/x/y")));
+    }
+
+    /// Which store a process uses: the shared one only when it is a real directory of its owner that no one else can
+    /// write; then only the owner builds there. A missing or untrustworthy one leaves the per-user store as before.
+    #[test]
+    fn the_shared_store_is_used_only_when_its_owner_alone_can_write_it() {
+        let me = uid();
+        let d = dir("store-pick");
+        let home = d.join("home");
+        let shared = d.join("shared");
+        let old = SlidStore { dir: home.clone(), owner: me, build: true };
+        assert_eq!(slid_store_in(None, me, home.clone(), me), old, "no shared store: the per-user store, as before");
+        assert_eq!(slid_store_in(Some(&shared), me, home.clone(), me), old, "a shared store that does not exist: the same");
+        std::fs::create_dir(&shared).unwrap();
+        chmod(&shared, 0o755);
+        assert_eq!(slid_store_in(Some(&shared), me, home.clone(), me), SlidStore { dir: shared.clone(), owner: me, build: true }, "its owner builds there");
+        assert_eq!(slid_store_in(Some(&shared), me, home.clone(), me + 1), SlidStore { dir: shared.clone(), owner: me, build: false }, "anyone else only reads");
+        chmod(&shared, 0o555);
+        assert_eq!(slid_store_in(Some(&shared), me, home.clone(), me + 1).dir, shared, "read-only to its owner too: still the store");
+        for (what, mode) in [("group-writable", 0o775), ("other-writable", 0o757)] {
+            chmod(&shared, mode);
+            assert_eq!(slid_store_in(Some(&shared), me, home.clone(), me), old, "{what}: not trusted");
+            assert_eq!(slid_store_in(Some(&shared), me, home.clone(), me + 1), SlidStore { dir: home.clone(), owner: me + 1, build: true }, "{what}: not trusted by another uid either");
+        }
+        chmod(&shared, 0o755);
+        assert_eq!(slid_store_in(Some(&shared), me + 1, home.clone(), me), old, "owned by someone else than the owner named: not trusted");
+        let link = d.join("link");
+        std::os::unix::fs::symlink(&shared, &link).unwrap();
+        assert_eq!(slid_store_in(Some(&link), me, home.clone(), me), old, "reached through a symlink: not trusted");
+        let file = d.join("file");
+        std::fs::write(&file, b"x").unwrap();
+        assert_eq!(slid_store_in(Some(&file), me, home.clone(), me), old, "not a directory: not trusted");
+    }
+
+    /// ⭐ What this change is for. The control: with no shared store, two processes of one uid with two HOMEs (two
+    /// sandbox containers) each keep a slid copy of the same mapping. With one, its owner builds the copy once, a process
+    /// that may not build maps that copy, and neither writes a slid copy under its own HOME.
+    #[test]
+    fn with_a_shared_store_one_slid_copy_serves_every_home_and_none_is_written_there() {
+        let me = uid();
+        let (data, info) = fixture();
+        let want = slid_in_place(&data, &info);
+        let d = dir("share");
+        let (f, m) = source_with_uuid(&d, &data);
+        let homes: Vec<std::path::PathBuf> = (1..=4).map(|i| d.join(format!("home{i}/Library/Caches/Maclator/aot"))).collect();
+        // The control, the old behaviour: no shared store.
+        for (k, h) in homes[..2].iter().enumerate() {
+            let s = slid_store_in(None, 0, h.clone(), me);
+            assert_eq!(try_share(SHARE_AT + k as u64 * SHARE_STEP, &s, &f, &m, &info), (true, want[..16].to_vec()), "control: home {k} maps");
+        }
+        let copies = slid_files(&d);
+        assert_eq!(copies.len(), 2, "control: one copy per HOME without a shared store: {copies:?}");
+        assert_eq!(std::fs::read(&copies[0]).unwrap(), std::fs::read(&copies[1]).unwrap(), "control: and the two are the same bytes");
+        // The change: a shared store, built by its owner.
+        let shared = d.join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        chmod(&shared, 0o755);
+        let owner = slid_store_in(Some(&shared), me, homes[2].clone(), me);
+        assert!(owner.build && owner.dir == shared, "control: the owner builds in the shared store");
+        assert_eq!(try_share(SHARE_AT + 2 * SHARE_STEP, &owner, &f, &m, &info), (true, want[..16].to_vec()), "the owner builds and maps");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let modes: Vec<(String, u32)> = names(&shared).into_iter().filter(|n| n.ends_with(".data") || n.ends_with(".stamp")).map(|n| { let md = std::fs::metadata(shared.join(&n)).unwrap(); (n, md.permissions().mode() & 0o777) }).collect();
+            assert_eq!(modes.len(), 2, "the owner's copy and its stamp: {modes:?}");
+            assert!(modes.iter().all(|(_, md)| *md == 0o644), "both readable by every uid, writable by the owner alone, whatever the umask: {modes:?}");
+        }
+        // Another process: the store read-only to it, as root's is to every other uid, and no stamp to trust.
+        let _back = Mode(shared.clone(), 0o755);
+        for n in names(&shared) {
+            if n.ends_with(".stamp") {
+                std::fs::remove_file(shared.join(n)).unwrap();
+            }
+        }
+        chmod(&shared, 0o555);
+        let before = names(&shared);
+        let reader = slid_store_in(Some(&shared), me, homes[3].clone(), me + 1);
+        assert!(!reader.build && reader.dir == shared, "control: the other process only reads");
+        assert_eq!(try_share(SHARE_AT + 3 * SHARE_STEP, &reader, &f, &m, &info), (true, want[..16].to_vec()), "it maps the owner's copy");
+        assert_eq!(names(&shared), before, "it wrote nothing in the shared store (no lock, stamp or file)");
+        assert!(!d.join("home3").exists() && !d.join("home4").exists(), "and nothing under either HOME");
+        let all = slid_files(&d);
+        assert_eq!(all.len(), 3, "the two control copies and the one shared copy, no more: {all:?}");
+        assert_eq!(all.iter().filter(|p| p.starts_with(&shared)).count(), 1, "one copy in the shared store");
+    }
+
+    /// A builder whose umask is 077 (a daemon's may be) still leaves the slid file and its stamp readable by every uid,
+    /// or root's shared copy would serve root alone. The umask is the process's, so the build runs in a child of its own.
+    #[test]
+    fn the_shared_copy_and_its_stamp_are_readable_by_all_whatever_the_umask() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        if std::env::var_os("MCL_SLID_UMASK").is_some() {
+            unsafe { libc::umask(0o077) };
+            let (data, info) = fixture();
+            let d = dir("umask");
+            let (f, m) = source_with_uuid(&d, &data);
+            let shared = d.join("shared");
+            std::fs::create_dir(&shared).unwrap();
+            chmod(&shared, 0o755);
+            let owner = slid_store_in(Some(&shared), uid(), d.join("home"), uid());
+            assert!(try_share(SHARE_AT + 8 * SHARE_STEP, &owner, &f, &m, &info).0, "the owner builds and maps");
+            let probe = d.join("probe");
+            std::fs::OpenOptions::new().write(true).create_new(true).mode(0o644).open(&probe).unwrap();
+            assert_eq!(std::fs::metadata(&probe).unwrap().permissions().mode() & 0o777, 0o600, "control: the umask applies here");
+            for n in names(&shared).into_iter().filter(|n| n.ends_with(".data") || n.ends_with(".stamp")) {
+                let md = std::fs::metadata(shared.join(&n)).unwrap().permissions().mode() & 0o777;
+                assert_eq!(md, 0o644, "{n}");
+            }
+            assert_eq!(slid_files(&shared).len(), 1, "control: one copy was built");
+            return;
+        }
+        let me = std::env::current_exe().unwrap();
+        let st = std::process::Command::new(&me)
+            .args(["--exact", "cache::slid_tests::the_shared_copy_and_its_stamp_are_readable_by_all_whatever_the_umask", "--test-threads=1"])
+            .env("MCL_SLID_UMASK", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(st.success(), "the child under umask 077: {st}");
+    }
+
+    /// A process that may not build, finding no file in the shared store or not allowed to read it (as a sandbox
+    /// refuses), slides privately: false, and nothing written anywhere, the shared store or its HOME.
+    #[test]
+    fn a_reader_that_finds_no_file_or_may_not_read_it_slides_privately_and_writes_nothing() {
+        let me = uid();
+        let (data, info) = fixture();
+        let want = slid_in_place(&data, &info);
+        let d = dir("share-deny");
+        let (f, m) = source_with_uuid(&d, &data);
+        let shared = d.join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        chmod(&shared, 0o755);
+        let home = d.join("home/Library/Caches/Maclator/aot");
+        let reader = slid_store_in(Some(&shared), me, home.clone(), me + 1);
+        assert!(!reader.build, "control: a reader");
+        assert_eq!(try_share(SHARE_AT + 4 * SHARE_STEP, &reader, &f, &m, &info), (false, vec![0u8; 16]), "missing: slid privately, the mapping untouched");
+        assert!(names(&shared).is_empty() && !d.join("home").exists(), "and nothing written: {:?}", names(&shared));
+        let owner = slid_store_in(Some(&shared), me, home.clone(), me);
+        assert_eq!(try_share(SHARE_AT + 5 * SHARE_STEP, &owner, &f, &m, &info), (true, want[..16].to_vec()), "control: the owner builds it");
+        let file = slid_files(&shared).pop().expect("the owner's copy");
+        if me == 0 {
+            eprintln!("as root a mode-0 file is still readable, so the refused-read half is not tested here");
+            return;
+        }
+        let _back = Mode(file.clone(), 0o644);
+        chmod(&file, 0o000);
+        let before = names(&shared);
+        assert_eq!(try_share(SHARE_AT + 6 * SHARE_STEP, &reader, &f, &m, &info), (false, vec![0u8; 16]), "not readable: slid privately");
+        assert_eq!(names(&shared), before, "nothing added to the shared store");
+        assert!(!d.join("home").exists(), "and no copy under its HOME");
+        // A shared store whose directory this process may not look at at all (a sandbox's EPERM): still the store.
+        let _back_dir = Mode(shared.clone(), 0o755);
+        chmod(&shared, 0o000);
+        let blind = slid_store_in(Some(&shared.join("sub")), me, home.clone(), me + 1);
+        assert_eq!(blind, SlidStore { dir: shared.join("sub"), owner: me, build: false }, "a store it may not look at is not swapped for its HOME");
+        assert_eq!(try_share(SHARE_AT + 7 * SHARE_STEP, &blind, &f, &m, &info), (false, vec![0u8; 16]), "and it slides privately");
+        assert!(!d.join("home").exists(), "with no copy under its HOME");
     }
 
     /// The stamp tests change chunk 1, which the sample of seed 2 (chunks 0 and 2) skips.
@@ -1711,7 +2024,7 @@ mod slid_tests {
         assert!(!stamp.exists(), "control: building leaves no stamp");
         assert_eq!(try_map(STAMP_AT, &path, &id, uid(), 2), (Slid::Mapped, want[0]), "control: sound");
         let md = std::fs::symlink_metadata(&stamp).expect("a file whose every chunk matches gets a stamp");
-        assert!(md.is_file() && md.permissions().mode() & 0o777 == 0o600, "the stamp is a file only we can read or write: {:o}", md.permissions().mode());
+        assert!(md.is_file() && md.permissions().mode() & 0o777 == 0o644, "the stamp is a file all can read and only we can write: {:o}", md.permissions().mode());
         let file = std::fs::read(&path).unwrap();
         assert_eq!(std::fs::read(&stamp).unwrap(), stamp_bytes(BOOT, &std::fs::metadata(&path).unwrap(), &file[file.len() - 32..]), "it names the boot, the file and its record");
         assert!(!path.with_extension("stamp-tmp").exists(), "the temporary file is renamed, not left");
@@ -1842,7 +2155,7 @@ mod slid_tests {
         flip(&path, UNSAMPLED);
         assert_eq!(try_map(at, &path, &id, uid(), 2), (Slid::Refused, 0), "control: with no stamp every chunk is checked");
         let md = std::fs::symlink_metadata(&refusal).expect("a file refused when every chunk was checked gets a refusal");
-        assert!(md.is_file() && md.permissions().mode() & 0o777 == 0o600, "the refusal is a file only we can read or write: {:o}", md.permissions().mode());
+        assert!(md.is_file() && md.permissions().mode() & 0o777 == 0o644, "the refusal is a file all can read and only we can write: {:o}", md.permissions().mode());
         assert_eq!(std::fs::read(&refusal).unwrap(), refusal_as_is(&path, BOOT), "it names the boot, the file and its record");
         // Another process holds the file's lock now, longer than this one waits: without the refusal this start would
         // wait the whole 2 s for it and then check every chunk again.
