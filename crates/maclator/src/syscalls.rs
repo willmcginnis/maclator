@@ -2562,8 +2562,18 @@ fn mmap_16k(args: &[u64; 8]) -> hostsys::SysResult {
     a[0] = aligned;
     a[1] = len16;
     a[3] = flags | MAP_FIXED;
-    let _ = fd;
-    let r = hostsys::unix(SYS_MMAP, &a);
+    let mut r = hostsys::unix(SYS_MMAP, &a);
+    // A shared-memory object (or other descriptor) shorter than the 16 KiB-rounded length: the
+    // Intel kernel refuses a mapping that runs past the object's last 4 KiB page with EINVAL
+    // (xnu bsd/kern/posix_shm.c, pshm_mmap: `user_size > pshm_size`), where an arm64 kernel rounds
+    // the object to its own 16 KiB page and accepts. libnotify maps notifyd's one-page object this
+    // way (shm_attach), so every notify_register_check failed. Map it with the guest's own length
+    // at the same aligned base, as the host kernel would; the rest of the 16 KiB window stays
+    // reserved, so nothing else is placed in the guest's page.
+    if r.carry && r.rax == libc::EINVAL as u64 && flags & MAP_ANON == 0 && fd >= 0 && len < len16 {
+        a[1] = len;
+        r = hostsys::unix(SYS_MMAP, &a);
+    }
     if r.carry {
         hostsys::unix(SYS_MUNMAP, &[base, len16 + PAGE, 0, 0, 0, 0, 0, 0]);
         return r;
@@ -4661,5 +4671,101 @@ mod tests {
         assert_eq!(synthetic_name(&[i32::MIN; 4]), None);
         assert_eq!(synthetic_name(&[-1, -1]), None);
         assert_eq!(synthetic_name(&[6, 1]), None);
+    }
+
+    /// A POSIX shared-memory object of `size` bytes, made and unlinked here; its fd (open).
+    fn shm_object(tag: &str, size: i64) -> i32 {
+        let name = std::ffi::CString::new(format!("/mcl-{}-{}", tag, std::process::id())).unwrap();
+        unsafe {
+            libc::shm_unlink(name.as_ptr());
+            let fd = libc::shm_open(name.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, 0o600 as libc::c_uint);
+            assert!(fd >= 0, "shm_open: {}", std::io::Error::last_os_error());
+            libc::shm_unlink(name.as_ptr());
+            assert_eq!(libc::ftruncate(fd, size), 0, "ftruncate: {}", std::io::Error::last_os_error());
+            fd
+        }
+    }
+
+    /// The host page size the object was rounded to (4 KiB on the Intel kernel and under Rosetta 2).
+    fn host_page() -> u64 {
+        unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
+    }
+
+    #[test]
+    fn mmap_16k_maps_a_shared_memory_object_shorter_than_16k() {
+        // notifyd's object is one host page; libnotify maps it MAP_SHARED with that length.
+        let pg = host_page();
+        if pg >= 0x4000 {
+            eprintln!("host page {pg}: an object this short cannot exist here, so the case is not reachable");
+            return;
+        }
+        let fd = shm_object("t1", pg as i64);
+        // Put a value in it through a native mapping, then read it through the guest's mapping.
+        let w = unsafe { libc::mmap(std::ptr::null_mut(), pg as usize, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0) };
+        assert_ne!(w, libc::MAP_FAILED, "native mapping: {}", std::io::Error::last_os_error());
+        unsafe { *(w as *mut u32) = 0x5eed_1234 };
+        let a = [0, pg, libc::PROT_READ as u64, libc::MAP_SHARED as u64, fd as u64, 0, 0, 0];
+        let r = mmap_16k(&a);
+        assert!(!r.carry, "mmap_16k refused the object: errno {}", r.rax);
+        assert_eq!(r.rax & 0x3fff, 0, "not 16 KiB aligned: {:#x}", r.rax);
+        assert_eq!(unsafe { *(r.rax as *const u32) }, 0x5eed_1234);
+        // The rest of the guest's 16 KiB page stays reserved: a hinted mapping there is placed elsewhere.
+        let h = unsafe { libc::mmap((r.rax + pg) as *mut libc::c_void, pg as usize, libc::PROT_READ, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0) };
+        assert_ne!(h, libc::MAP_FAILED);
+        assert!((h as u64) < r.rax || h as u64 >= r.rax + 0x4000, "something was placed in the guest's page at {:#x}", h as u64);
+        unsafe {
+            libc::munmap(h, pg as usize);
+            libc::munmap(r.rax as *mut libc::c_void, 0x4000);
+            libc::munmap(w, pg as usize);
+            libc::close(fd);
+        }
+    }
+
+    #[test]
+    fn mmap_16k_still_maps_16k_of_an_object_that_long() {
+        // An object of a full 16 KiB keeps the rounded mapping: the whole page is the object's.
+        let fd = shm_object("t2", 0x4000);
+        let a = [0, 100, libc::PROT_READ as u64, libc::MAP_SHARED as u64, fd as u64, 0, 0, 0];
+        let r = mmap_16k(&a);
+        assert!(!r.carry, "errno {}", r.rax);
+        assert_eq!(r.rax & 0x3fff, 0);
+        // Byte 0x3fff is inside the mapping (it would fault if only the asked 100 bytes' page were mapped).
+        assert_eq!(unsafe { *((r.rax + 0x3fff) as *const u8) }, 0);
+        unsafe {
+            libc::munmap(r.rax as *mut libc::c_void, 0x4000);
+            libc::close(fd);
+        }
+    }
+
+    #[test]
+    fn mmap_16k_refuses_what_the_host_refuses_for_a_short_object() {
+        // A length past the object's own end is still refused, as the host kernel refuses it: only the
+        // 16 KiB rounding added by mmap_16k is taken back, never the guest's own length.
+        let pg = host_page();
+        let fd = shm_object("t3", pg as i64);
+        let a = [0, pg * 2, libc::PROT_READ as u64, libc::MAP_SHARED as u64, fd as u64, 0, 0, 0];
+        let r = mmap_16k(&a);
+        let native = unsafe { libc::mmap(std::ptr::null_mut(), (pg * 2) as usize, libc::PROT_READ, libc::MAP_SHARED, fd, 0) };
+        if native == libc::MAP_FAILED {
+            assert!(r.carry, "mapped {:#x}, where the host refuses", r.rax);
+            assert_eq!(r.rax, libc::EINVAL as u64);
+        } else {
+            unsafe { libc::munmap(native, (pg * 2) as usize) };
+            eprintln!("the host maps past this object's end: nothing to compare");
+            if !r.carry {
+                unsafe { libc::munmap(r.rax as *mut libc::c_void, 0x8000) };
+            }
+        }
+        unsafe { libc::close(fd) };
+    }
+
+    #[test]
+    fn mmap_16k_anonymous_mappings_are_unchanged() {
+        let a = [0, 100, (libc::PROT_READ | libc::PROT_WRITE) as u64, (libc::MAP_ANON | libc::MAP_PRIVATE) as u64, u64::MAX, 0, 0, 0];
+        let r = mmap_16k(&a);
+        assert!(!r.carry);
+        assert_eq!(r.rax & 0x3fff, 0);
+        unsafe { *((r.rax + 0x3fff) as *mut u8) = 7 };
+        unsafe { libc::munmap(r.rax as *mut libc::c_void, 0x4000) };
     }
 }
