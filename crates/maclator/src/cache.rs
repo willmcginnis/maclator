@@ -555,8 +555,10 @@ enum Slid {
 ///
 /// Used only when it is a real directory (not a symlink) owned by root that no group or other can write. Then only root
 /// builds slid files there; every process maps root's files and checks them as it checks its own; and a process that
-/// finds no file there, or may not read one (a sandbox), slides privately and writes no copy of its own. Without it
-/// the per-user store is used as before, except by a process denied even the lookup of it (a sandbox), which slides privately. `MACLATOR_SHARED_STORE` names another such directory; empty, it turns it off.
+/// finds no file there, or may not read one (a sandbox), slides privately and writes no copy of its own. Where it does
+/// not exist, the per-user store is used as before -- except by a process that may not even look for it (its lookup
+/// is denied, as a sandbox may): that one slides privately too, so no denial ever turns into a copy under its `HOME`.
+/// `MACLATOR_SHARED_STORE` names another such directory; empty, it turns the shared store off.
 const SHARED_STORE: &str = "/private/var/db/maclator";
 
 /// The directory the shared store would be, from `MACLATOR_SHARED_STORE` as `var` gives it.
@@ -738,6 +740,15 @@ unsafe fn map_slid(addr: u64, size: usize, prot: i32, path: &std::path::Path, id
     let f = match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Slid::Missing,
+        // Not allowed to read it (a sandbox, or a store we may not build in): said once per process, not once per
+        // mapping, and without "remove it to rebuild", which such a process cannot do.
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            static OPEN_DENIED_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !OPEN_DENIED_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("maclator: may not read {} ({e}); sliding privately", path.display());
+            }
+            return Slid::Refused;
+        }
         Err(e) => return refuse(path, &e.to_string()),
     };
     let md = match f.metadata() {
@@ -1893,6 +1904,10 @@ mod slid_tests {
     #[test]
     fn with_a_shared_store_one_slid_copy_serves_every_home_and_none_is_written_there() {
         let me = uid();
+        if me == 0 {
+            eprintln!("as root the reader's writes are not refused by modes, so this is not tested here");
+            return;
+        }
         let (data, info) = fixture();
         let want = slid_in_place(&data, &info);
         let d = dir("share");
@@ -1926,11 +1941,19 @@ mod slid_tests {
                 std::fs::remove_file(shared.join(n)).unwrap();
             }
         }
+        // Root's lock is 0644 to another uid, so its O_RDWR open fails: 0444 makes the owner's fail the same way.
+        let locks: Vec<String> = names(&shared).into_iter().filter(|n| n.ends_with(".lock")).collect();
+        assert_eq!(locks.len(), 1, "control: the owner left its build lock: {locks:?}");
+        let _lock_back = Mode(shared.join(&locks[0]), 0o644);
+        chmod(&shared.join(&locks[0]), 0o444);
+        assert!(BuildLock::take(&shared.join(&locks[0]), 0).is_none(), "control: the reader cannot take the lock");
         chmod(&shared, 0o555);
         let before = names(&shared);
         let reader = slid_store_in(Some(&shared), me, homes[3].clone(), me + 1);
         assert!(!reader.build && reader.dir == shared, "control: the other process only reads");
+        let t0 = std::time::Instant::now();
         assert_eq!(try_share(SHARE_AT + 3 * SHARE_STEP, &reader, &f, &m, &info), (true, want[..16].to_vec()), "it maps the owner's copy");
+        assert!(t0.elapsed() < std::time::Duration::from_millis(SLID_LOCK_WAIT_MS / 3), "with no lock to take it does not wait for one: {:?}", t0.elapsed());
         assert_eq!(names(&shared), before, "it wrote nothing in the shared store (no lock, stamp or file)");
         assert!(!d.join("home3").exists() && !d.join("home4").exists(), "and nothing under either HOME");
         let all = slid_files(&d);
@@ -1961,17 +1984,25 @@ mod slid_tests {
                 assert_eq!(md, 0o644, "{n}");
             }
             assert_eq!(slid_files(&shared).len(), 1, "control: one copy was built");
+            if boot_session().is_some() {
+                assert!(names(&shared).iter().any(|n| n.ends_with(".stamp")), "a stamp was left, so its mode was checked");
+            }
+            let marker = std::env::var_os("MCL_SLID_UMASK").unwrap();
+            std::fs::write(&marker, b"ran").unwrap();
             return;
         }
         let me = std::env::current_exe().unwrap();
+        // The child says it ran its checks: libtest exits 0 having run nothing if the name stops matching.
+        let marker = dir("umask-marker").join("ran");
         let st = std::process::Command::new(&me)
             .args(["--exact", "cache::slid_tests::the_shared_copy_and_its_stamp_are_readable_by_all_whatever_the_umask", "--test-threads=1"])
-            .env("MCL_SLID_UMASK", "1")
+            .env("MCL_SLID_UMASK", &marker)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
             .unwrap();
         assert!(st.success(), "the child under umask 077: {st}");
+        assert_eq!(std::fs::read(&marker).ok().as_deref(), Some(&b"ran"[..]), "the child ran its checks");
     }
 
     /// A process that may not build, finding no file in the shared store or not allowed to read it (as a sandbox
