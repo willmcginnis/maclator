@@ -536,27 +536,41 @@ pub fn save_profile() {
     }
     // With MACLATOR_AOT_DONE_FILE set, the builder
     // says it finished, and how each image went, in that file (written whole, by rename) as its
-    // last act: "aot-build pid=<pid> images=<n> ok=<k> failed=<f>". A test can then tell a builder
+    // last act: "aot-build pid=<pid> images=<n> ok=<k> skipped=<s> failed=<f>", where ok counts images whose
+    // file was published and skipped those with no block to translate. A test can then tell a builder
     // that finished from one still running or killed, which a count of .aot files cannot.
     let done = std::env::var_os("MACLATOR_AOT_DONE_FILE");
-    let (mut ok, mut failed) = (0usize, 0usize);
+    let (mut ok, mut skipped, mut failed) = (0usize, 0usize, 0usize);
     let images = rebuild.len();
     for (img, prof) in rebuild {
         match build(&img, &prof) {
-            Ok(()) => ok += 1,
+            Ok(true) => ok += 1,
+            Ok(false) => skipped += 1,
             Err(_) => failed += 1,
         }
     }
     if let Some(done) = done {
-        let done = std::path::PathBuf::from(done);
-        let tmp = done.with_extension("tmp");
-        let line = format!("aot-build pid={} images={images} ok={ok} failed={failed}\n", std::process::id());
-        if std::fs::write(&tmp, line).is_ok() {
-            let _ = std::fs::rename(&tmp, &done);
-        }
+        let pid = std::process::id();
+        write_done(std::path::Path::new(&done), pid, &format!("aot-build pid={pid} images={images} ok={ok} skipped={skipped} failed={failed}\n"));
     }
     if !sync {
         unsafe { libc::_exit(0) };
+    }
+}
+
+/// The temporary file a builder writes its done line to, beside `done`. Builders inheriting one
+/// MACLATOR_AOT_DONE_FILE each need their own, or one could rename another's half-written line into place.
+fn done_tmp(done: &std::path::Path, pid: u32) -> std::path::PathBuf {
+    let mut t = done.as_os_str().to_owned();
+    t.push(format!(".{pid}.tmp"));
+    t.into()
+}
+
+/// Write `line` to `done` whole: to this builder's temporary file, then by rename.
+fn write_done(done: &std::path::Path, pid: u32, line: &str) {
+    let tmp = done_tmp(done, pid);
+    if std::fs::write(&tmp, line).is_err() || std::fs::rename(&tmp, done).is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -617,7 +631,8 @@ fn create_private(p: &std::path::Path) -> std::io::Result<std::fs::File> {
     Ok(f)
 }
 
-fn build(img: &Image, profile: &BTreeSet<u64>) -> std::io::Result<()> {
+/// Translate `img` and publish its AOT file. `Ok(false)`: no block could be read, so nothing was published.
+fn build(img: &Image, profile: &BTreeSet<u64>) -> std::io::Result<bool> {
     let read = crate::jit::guest_reader();
     let mut blocks: BTreeSet<u64> = profile.clone();
     if !img.entries.is_empty() {
@@ -628,7 +643,7 @@ fn build(img: &Image, profile: &BTreeSet<u64>) -> std::io::Result<()> {
     blocks.extend(discover(&hot, img.start, img.end, &read, profile.len() * 4 + 1000));
     let blocks: Vec<u64> = blocks.into_iter().filter(|&pc| read(pc).is_some()).collect();
     if blocks.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     // Translate in chunks so a single assembler run stays manageable.
     let mut code: Vec<u8> = Vec::new();
@@ -683,7 +698,7 @@ fn build(img: &Image, profile: &BTreeSet<u64>) -> std::io::Result<()> {
     // This image is now cached for the base it is loaded at; anything cached for a base it will never be at
     // again is dead weight. Without this the store grows by one entry per slid exec, for ever.
     retire_superseded(&cache_dir(), &img.key, "build");
-    Ok(())
+    Ok(true)
 }
 
 /// `maclator --aot <exe>`: translate the main executable ahead of time
@@ -785,6 +800,68 @@ mod tests {
         assert_eq!(cache_layout(&different_features, expected_len), None);
     }
 
+    /// An image with no block that can be read publishes nothing, and build says so.
+    #[test]
+    fn a_build_with_nothing_to_translate_reports_nothing_published() {
+        // Low guest addresses are never mapped in this process, so no block there can be read.
+        let img = Image { name: "x".into(), key: format!("skip-{}", std::process::id()), start: 0x1000, end: 0x2000, entries: vec![], loaded: false, cached: false };
+        assert_eq!(build(&img, &BTreeSet::from([0x1000u64])).unwrap(), false, "nothing could be read, so nothing was published");
+        assert!(!file_for(&img, "aot").exists(), "and no file was written");
+    }
+
+    /// The done line counts an image whose file was published as ok and one with nothing to translate as skipped.
+    /// Run in a child: save_profile saves once per process, and reads its settings from the environment.
+    #[test]
+    fn the_done_line_counts_published_images_ok_and_empty_ones_skipped() {
+        if let Some(marker) = std::env::var_os("MCL_AOT_DONE") {
+            let code = super::owner_tests::rets();
+            let (start, end) = (code.as_ptr() as u64, code.as_ptr() as u64 + 4 * code.len() as u64);
+            register_main("/bin/readable", [4u8; 16], start, end, vec![start]);
+            // Low guest addresses are never mapped in this process, so no block there can be read.
+            register_main("/bin/unreadable", [5u8; 16], 0x1000, 0x2000, vec![0x1000]);
+            save_profile();
+            let line = std::fs::read_to_string(std::env::var_os("MACLATOR_AOT_DONE_FILE").unwrap()).unwrap();
+            assert_eq!(line, format!("aot-build pid={} images=2 ok=1 skipped=1 failed=0\n", std::process::id()));
+            std::fs::write(&marker, b"ran").unwrap();
+            return;
+        }
+        let d = std::env::temp_dir().join(format!("maclator-aot-done-line-{}", std::process::id()));
+        let cache = d.join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::set_permissions(&cache, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        let marker = d.join("ran");
+        let st = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "aot::tests::the_done_line_counts_published_images_ok_and_empty_ones_skipped", "--test-threads=1"])
+            .env("MCL_AOT_DONE", &marker)
+            .env("MACLATOR_CACHE", &cache)
+            .env("MACLATOR_AOT_SYNC", "1")
+            .env_remove("MACLATOR_NO_AOT_BUILD")
+            .env("MACLATOR_AOT_DONE_FILE", d.join("aot-build.done"))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        let ran = std::fs::read(&marker).ok();
+        std::fs::remove_dir_all(&d).ok();
+        assert!(st.success(), "the child: {st}");
+        assert_eq!(ran.as_deref(), Some(&b"ran"[..]), "the child ran its checks");
+    }
+
+    /// Builders sharing one done file write it through temporary files of their own, beside it.
+    #[test]
+    fn each_builder_writes_its_done_line_through_its_own_temporary_file() {
+        let d = std::env::temp_dir().join(format!("maclator-aot-done-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let done = d.join("aot-build.done");
+        assert_ne!(done_tmp(&done, 1), done_tmp(&done, 2), "two builders, one temporary file");
+        assert_eq!(done_tmp(&done, 1).parent(), Some(d.as_path()), "the temporary file is beside the done file");
+        assert_ne!(done_tmp(&done, 1), done, "and is not the done file itself");
+        write_done(&done, 7, "aot-build pid=7 images=1 ok=1 skipped=0 failed=0\n");
+        assert_eq!(std::fs::read_to_string(&done).unwrap(), "aot-build pid=7 images=1 ok=1 skipped=0 failed=0\n");
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 1, "the temporary file was renamed into place");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
     #[test]
     fn load_rejects_invalid_index_before_publishing_code() {
         let p = std::env::temp_dir().join(format!("maclator-invalid-aot-{}", std::process::id()));
@@ -842,7 +919,7 @@ mod owner_tests {
             let code = rets();
             let (start, end) = (code.as_ptr() as u64, code.as_ptr() as u64 + 4 * code.len() as u64);
             let img = Image { name: "t".into(), key: "umask-test".into(), start, end, entries: vec![], loaded: false, cached: false };
-            build(&img, &BTreeSet::from([start])).unwrap();
+            assert!(build(&img, &BTreeSet::from([start])).unwrap(), "build published a file");
             let p = file_for(&img, "aot");
             assert_eq!(mode(&p), 0o600, "the published file is ours alone");
             assert!(load_file(&p, start, end).unwrap() >= 1, "and it is loaded");
