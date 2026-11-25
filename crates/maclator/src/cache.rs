@@ -559,9 +559,11 @@ enum Slid {
 ///
 /// Used only when it is a real directory (not a symlink) owned by root that no group or other can write. Then only root
 /// builds slid files there; every process maps root's files and checks them as it checks its own; and a process that
-/// finds no file there, or may not read one (a sandbox), slides privately and writes no copy of its own. Where it does
-/// not exist, the per-user store is used as before -- except by a process that may not even look for it (its lookup
-/// is denied, as a sandbox may): that one slides privately too, so no denial ever turns into a copy under its `HOME`.
+/// finds no file there, or may not read one, slides privately and writes no copy of its own. Where it does not exist,
+/// the per-user store is used as before -- except by a process that may not even look for it (its lookup is denied):
+/// that one slides privately too, so no denial ever turns into a copy under its `HOME`. A sandboxed process asks its
+/// sandbox before it reads a slid file here (not before it looks up the directory) and uses no per-user store
+/// (`share_slid`).
 /// `MACLATOR_SHARED_STORE` names another such directory; empty, it turns the shared store off.
 const SHARED_STORE: &str = "/private/var/db/maclator";
 
@@ -588,7 +590,7 @@ struct SlidStore {
 /// The shared store `shared` if it is a real directory owned by `shared_owner` that no group or other can write, else
 /// the per-user store `home` (owned by `euid`, which may build in it). Only the shared store's owner builds in it.
 ///
-/// A shared store this process may not even look at (a sandbox denies it) is still the store, with no building: the
+/// A shared store this process may not even look at (its lookup is denied) is still the store, with no building: the
 /// mapping then fails its own check and the cache is slid privately, rather than copied into this process's `HOME`.
 /// Only a shared store that does not exist, or that is not safe to trust, leaves the per-user store in use.
 fn slid_store_in(shared: Option<&std::path::Path>, shared_owner: u32, home: std::path::PathBuf, euid: u32) -> SlidStore {
@@ -691,9 +693,9 @@ fn refuse(path: &std::path::Path, why: &str) -> Slid {
     Slid::Refused
 }
 
-/// Not allowed to look at or read `path` (a sandbox, or a store we may not build in): said once per process, not once
-/// per mapping, and without "remove it to rebuild": a process denied the lookup cannot remove it, and one denied the
-/// read usually may not either.
+/// Not allowed to look at or read `path` (by its permissions, or by a sandbox that let the process read a slid file but
+/// not look up its directory): said once per process, not once per mapping, and without "remove it to rebuild": a
+/// process denied the lookup cannot remove it, and one denied the read usually may not either.
 fn may_not_read(path: &std::path::Path, e: &std::io::Error) -> Slid {
     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -2337,7 +2339,7 @@ mod slid_tests {
         assert_eq!(try_share(SHARE_AT + 6 * SHARE_STEP, &reader, &f, &m, &info), (false, vec![0u8; 16]), "not readable: slid privately");
         assert_eq!(names(&shared), before, "nothing added to the shared store");
         assert!(!d.join("home").exists(), "and no copy under its HOME");
-        // A shared store whose directory this process may not look at at all (a sandbox's EPERM): still the store.
+        // A shared store whose directory this process may not look at at all: still the store.
         let _back_dir = Mode(shared.clone(), 0o755);
         chmod(&shared, 0o000);
         let blind = slid_store_in(Some(&shared.join("sub")), me, home.clone(), me + 1);
