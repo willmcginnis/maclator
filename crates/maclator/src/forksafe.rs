@@ -374,9 +374,21 @@ mod tests {
         assert_eq!(sorted_named, sorted_order, "HOLD_ORDER and the named list differ");
     }
 
-    /// While one thread holds hold_all(), every named lock is busy; after, every one is free.
+    /// While one thread holds hold_all(), every named lock is busy; after, every one is free. Run
+    /// in a fresh copy of this test binary, where no other test takes the locks: here, tests that
+    /// fork or look up blocks in a loop can keep a lock busy for seconds after hold_all let go.
     #[test]
     fn hold_all_takes_every_named_lock() {
+        let out = run_scenario("scenario_hold_all").unwrap();
+        assert!(out.contains("HOLD-ALL free while held [] busy after []"), "{out}");
+    }
+
+    #[test]
+    #[ignore]
+    fn scenario_hold_all() {
+        if !scenario("scenario_hold_all") {
+            return;
+        }
         let (held_tx, held_rx) = std::sync::mpsc::channel();
         let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
         let h = std::thread::spawn(move || {
@@ -389,15 +401,9 @@ mod tests {
         let free: Vec<&str> = named().iter().filter(|(_, t)| t()).map(|(n, _)| *n).collect();
         go_tx.send(()).unwrap();
         h.join().unwrap();
-        assert!(free.is_empty(), "free while hold_all held: {free:?}");
-        // Other tests in this binary take the locks too, so a lock may be busy for a moment.
-        for (n, t) in named() {
-            let t0 = std::time::Instant::now();
-            while !t() {
-                assert!(t0.elapsed() < std::time::Duration::from_secs(5), "{n} still held 5 s after release");
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-        }
+        let busy: Vec<&str> = named().iter().filter(|(_, t)| !t()).map(|(n, _)| *n).collect();
+        say(&format!("HOLD-ALL free while held {free:?} busy after {busy:?}\n"));
+        unsafe { libc::_exit(0) };
     }
 
     /// The exit status of a child: 0 when every named lock was free in it (exit 10 + i names the
