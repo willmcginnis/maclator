@@ -706,6 +706,28 @@ fn schedule(st: &mut WlState, wl_id: u64) {
     start_job(w, Job { flags, kevent_list: list, nevents: n, stack_top: data_buf + avail, wl: Some(wl_id) });
 }
 
+/// The workloop state word at the guest's `addr` (EV_EXTIDX_WL_ADDR), or the errno to answer.
+///
+/// The kernel (filt_wlupdate) loads it with copyin_atomic64 and answers EFAULT only when that load faults, after
+/// retrying: EFAULT means the guest's pointer is bad, and libdispatch treats it as a fatal bug. So EFAULT is answered
+/// only when our reader says the address is bad. When the reader was refused for a reason that says nothing about
+/// the address (guestmem has reported it), the kernel would still have loaded the word, so load it here: it is in
+/// this address space, in the guest's own queue, which the guest has just handed us. An aligned word is loaded
+/// atomically, as copyin_atomic64 loads it.
+fn wl_state_word(addr: u64) -> Result<u64, i64> {
+    match crate::guestmem::read_u64_or_why(addr) {
+        Ok(v) => Ok(v),
+        Err(crate::guestmem::Unread::BadAddress) => Err(libc::EFAULT as i64),
+        Err(crate::guestmem::Unread::Refused) => Ok(unsafe {
+            if addr & 7 == 0 {
+                (*(addr as *const std::sync::atomic::AtomicU64)).load(Ordering::SeqCst)
+            } else {
+                std::ptr::read_unaligned(addr as *const u64)
+            }
+        }),
+    }
+}
+
 /// Apply a single change to a workloop. Returns an errno (0 on success).
 fn wl_apply(st: &mut WlState, wl_id: u64, ke: &Kev) -> i64 {
     if ke.filter != EVFILT_WORKLOOP {
@@ -752,9 +774,9 @@ fn wl_apply(st: &mut WlState, wl_id: u64, ke: &Kev) -> i64 {
     let mut err: i64 = 0;
     let mut new_owner = wl.owner;
     if addr != 0 {
-        match crate::guestmem::read_u64(addr) {
-            None => return libc::EFAULT as i64,
-            Some(cur) => {
+        match wl_state_word(addr) {
+            Err(e) => return e,
+            Ok(cur) => {
                 if cur & mask != value & mask {
                     err = libc::ESTALE as i64;
                 } else if ff & NOTE_WL_DISCOVER_OWNER != 0 {
@@ -1011,6 +1033,85 @@ mod tests {
         for count in [0, u32::MAX as u64] {
             assert_eq!(requested_thread_count(&[WQOPS_QUEUE_REQTHREADS, 0, count, 0, 0, 0, 0, 0]), Err(libc::EINVAL as u64));
         }
+    }
+
+    /// One NOTE_WL_SYNC_WAKE change whose state check loads the word at `addr` and compares it with `value` under
+    /// `mask`, on a workloop of its own: the errno wl_apply answers. SYNC_WAKE requests no servicer, so nothing is
+    /// scheduled.
+    fn state_check(addr: u64, mask: u64, value: u64) -> i64 {
+        let mut st = WlState { loops: HashMap::new(), sync: HashMap::new(), by_fd: HashMap::new() };
+        let ke = Kev { ident: 0x1234, filter: EVFILT_WORKLOOP, flags: EV_ADD, fflags: NOTE_WL_SYNC_WAKE, ext: [0, addr, mask, value], ..Default::default() };
+        wl_apply(&mut st, 0x77, &ke)
+    }
+
+    fn page() -> usize {
+        unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
+    }
+
+    fn map(prot: i32) -> u64 {
+        let p = unsafe { libc::mmap(std::ptr::null_mut(), page(), prot, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0) };
+        assert!(p != libc::MAP_FAILED, "the test could not map its own page");
+        p as u64
+    }
+
+    const STATE: u64 = 0x0000_0123_4000_0001;
+
+    #[test]
+    fn a_readable_state_word_is_compared_with_the_value() {
+        let p = map(libc::PROT_READ | libc::PROT_WRITE);
+        let w = p + 64;
+        unsafe { *(w as *mut u64) = STATE };
+        assert!(state_check(w, !0, STATE) == 0, "a matching state word must apply");
+        assert!(state_check(w, !0, STATE + 1) == libc::ESTALE as i64, "a state word that differs must answer ESTALE");
+        assert!(state_check(w, 0xff, STATE + 0x100) == 0, "only the masked bits are compared");
+        unsafe { libc::munmap(p as *mut libc::c_void, page()) };
+    }
+
+    #[test]
+    fn a_state_word_at_a_bad_address_is_efault() {
+        // As the kernel's copyin_atomic64 answers it. A PROT_NONE page this test holds, not a freed one, which a
+        // parallel test thread could map again.
+        let p = map(libc::PROT_NONE);
+        assert!(state_check(p + 64, !0, STATE) == libc::EFAULT as i64, "an unreadable state word must answer EFAULT");
+        unsafe { libc::munmap(p as *mut libc::c_void, page()) };
+    }
+
+    #[test]
+    fn a_state_word_our_reader_was_refused_is_still_checked() {
+        // The reader refused for a reason that says nothing about the address, as a policy refusing
+        // mach_vm_read_overwrite would answer: the guest's word is readable, so the kernel would have compared it,
+        // and EFAULT (which libdispatch treats as fatal) would be wrong.
+        let p = map(libc::PROT_READ | libc::PROT_WRITE);
+        let w = p + 64;
+        unsafe { *(w as *mut u64) = STATE };
+        let noted = || crate::guestmem::REFUSALS_NOTED.with(|c| c.get());
+        let before = noted();
+        crate::guestmem::REFUSE_READS_IN.with(|c| c.set((p, p + page() as u64)));
+        let matching = state_check(w, !0, STATE);
+        let differing = state_check(w, !0, STATE + 1);
+        crate::guestmem::REFUSE_READS_IN.with(|c| c.set((0, 0)));
+        assert!(noted() == before + 2, "control: both reads must have been refused and reported");
+        assert!(matching == 0, "a refused read of a matching state word answered {matching}, not 0");
+        assert!(differing == libc::ESTALE as i64, "a refused read of a differing state word answered {differing}, not ESTALE");
+        unsafe { libc::munmap(p as *mut libc::c_void, page()) };
+    }
+
+    #[test]
+    fn a_refused_read_of_an_unaligned_word_compares_what_a_read_would() {
+        // The kernel answers EINVAL for an unaligned address (copyin_atomic64); the state check has always read an
+        // unaligned word instead (the reader copies bytes). After a refusal it must still answer what the read
+        // answers. (It cannot see a misaligned atomic load in place of read_unaligned: x86 performs one.)
+        let p = map(libc::PROT_READ | libc::PROT_WRITE);
+        let w = p + 64;
+        unsafe { *(w as *mut u64) = STATE };
+        let (mask, value) = (0xffff_ffffu64, STATE >> 32); // bytes 4..12: the word's high half, then zeros
+        let read = (state_check(w + 4, mask, value), state_check(w + 4, mask, value + 1));
+        crate::guestmem::REFUSE_READS_IN.with(|c| c.set((p, p + page() as u64)));
+        let refused = (state_check(w + 4, mask, value), state_check(w + 4, mask, value + 1));
+        crate::guestmem::REFUSE_READS_IN.with(|c| c.set((0, 0)));
+        assert!(read == (0, libc::ESTALE as i64), "control: an unaligned word read normally answered {read:?}");
+        assert!(refused == read, "after a refusal an unaligned word answered {refused:?}, where the read answered {read:?}");
+        unsafe { libc::munmap(p as *mut libc::c_void, page()) };
     }
 }
 

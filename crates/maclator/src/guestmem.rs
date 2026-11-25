@@ -27,12 +27,40 @@ fn task() -> u32 {
 }
 
 pub fn read(addr: u64, buf: &mut [u8]) -> bool {
+    let kr = read_kr(addr, buf);
+    finish_read(kr, addr, buf.len())
+}
+
+/// The kern_return_t of one read of `buf.len()` bytes at `addr` into `buf`.
+fn read_kr(addr: u64, buf: &mut [u8]) -> i32 {
     let mut out = 0u64;
-    let kr = match test_refusal(addr, buf.len()) {
+    match test_refusal(addr, buf.len()) {
         Some(kr) => kr,
         None => unsafe { mach_vm_read_overwrite(task(), addr, buf.len() as u64, buf.as_mut_ptr() as u64, &mut out) },
-    };
-    finish_read(kr, addr, buf.len())
+    }
+}
+
+/// Why a read of guest memory failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unread {
+    /// The kernel answered that nothing readable is at the address: the guest's pointer is bad.
+    BadAddress,
+    /// The read was refused for a reason that says nothing about the address (already reported, as for `read`).
+    Refused,
+}
+
+/// `read_u64`, saying why it failed, for a caller whose answer to the guest depends on whether the guest's pointer
+/// was bad or only our read of it failed.
+pub fn read_u64_or_why(addr: u64) -> Result<u64, Unread> {
+    let mut b = [0u8; 8];
+    let kr = read_kr(addr, &mut b);
+    if finish_read(kr, addr, b.len()) {
+        Ok(u64::from_le_bytes(b))
+    } else if bad_address(kr) {
+        Err(Unread::BadAddress)
+    } else {
+        Err(Unread::Refused)
+    }
 }
 
 /// The kern_return_t values that mean the guest's address is bad: nothing readable is mapped there. Measured on macOS
@@ -45,9 +73,9 @@ fn bad_address(kr: i32) -> bool {
 }
 
 /// Decide the outcome of a read from the kern_return_t `mach_vm_read_overwrite` gave. Any failure is still a plain
-/// failure (callers answer EFAULT, or the JIT interprets), but one that does not mean a bad address -- KERN_DENIED from
-/// a policy that refuses the Mach call itself, say -- is reported, since otherwise it looks exactly like a bad guest
-/// pointer, even under MACLATOR_TRACE.
+/// failure (callers answer EFAULT, or the JIT interprets; read_u64_or_why's caller decides for itself), but one that
+/// does not mean a bad address -- KERN_DENIED from a policy that refuses the Mach call itself, say -- is reported,
+/// since otherwise it looks exactly like a bad guest pointer, even under MACLATOR_TRACE.
 pub(crate) fn finish_read(kr: i32, addr: u64, len: usize) -> bool {
     if kr == 0 {
         return true;
@@ -76,7 +104,7 @@ fn next_refusal(count: &std::sync::atomic::AtomicU64, owner: &std::sync::atomic:
 
 /// The line for the `n`th refused read of this process, if it is reported.
 fn refused_read_line(n: u64, kr: i32, addr: u64, len: usize) -> Option<String> {
-    n.is_power_of_two().then(|| format!("[maclator] warning: refused read #{n} (reported at #1, 2, 4, 8, ...): reading {len} bytes of guest memory at {addr:#x} answered kern_return_t {kr}, which is not a bad address; treated as unreadable"))
+    n.is_power_of_two().then(|| format!("[maclator] warning: refused read #{n} (reported at #1, 2, 4, 8, ...): reading {len} bytes of guest memory at {addr:#x} answered kern_return_t {kr}, which is not a bad address"))
 }
 
 fn note_refused_read(kr: i32, addr: u64, len: usize) {
