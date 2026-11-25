@@ -5,8 +5,14 @@
 //! count against that limit too.
 //!
 //! Counted: JIT code cache in use (`jit::code_committed`) and the translator's own heap (the
-//! counting global allocator below); not the guest's memory, which the guest maps itself. Each
-//! time the total passes another MiB, the limit is raised by the MiBs passed. Increase only, as
+//! counting global allocator below); not the guest's memory, which the guest maps itself. Until the
+//! guest starts, each time the total passes another MiB, the limit is raised by the MiBs passed. As
+//! the guest starts (`guest_starts`), the limit is raised once more, to cover what the translator will
+//! add while the program runs, and the call is never made again: every call comes before the
+//! program's own code runs, as dyld's come while it loads the program. A program may apply a sandbox
+//! that lists the system calls it may make, and most that do (Apple's WindowManager among them) do not
+//! list memorystatus_control, so a call after that would be refused, and the refusal logged, in every
+//! such process. (A process started in such a sandbox is refused its first call, once.) Increase only, as
 //! the kernel's call is: memory freed later is not given back. Kernels that do not accept the call
 //! (Apple compiles it into DEVELOPMENT kernels only) refuse it; the first refusal turns this off,
 //! and nothing changes.
@@ -19,6 +25,10 @@ const STEP: u64 = 1 << 20;
 const MAX_STEPS_PER_CALL: u64 = i32::MAX as u64 / STEP;
 /// MEMORYSTATUS_CMD_INCREASE_JETSAM_TASK_LIMIT, bsd/sys/kern_memorystatus.h.
 const CMD_INCREASE_JETSAM_TASK_LIMIT: u32 = 22;
+/// What the limit is raised to cover as the guest starts, at least: the translator's memory for the rest of the run,
+/// which it cannot ask for later. 64 MiB is several times the translator's own state in a small daemon (about 16 MiB);
+/// a kernel that caps these increases lower answers ENOMEM, and less is asked for.
+const UPFRONT: u64 = 64 << 20;
 
 extern "C" {
     fn memorystatus_control(command: u32, pid: i32, flags: u32, buffer: *mut libc::c_void, buffersize: usize) -> i32;
@@ -93,8 +103,8 @@ impl Tracker {
     }
 
     /// `total` bytes are now counted: add the whole MiBs not yet added, through `increase`, which
-    /// is given a byte count and says whether the kernel accepted it.
-    pub fn note(&self, total: u64, increase: impl FnOnce(u32) -> bool) {
+    /// is given a byte count and answers the kernel's errno if it refused.
+    pub fn note(&self, total: u64, increase: impl FnOnce(u32) -> Result<(), i32>) {
         if self.off.load(Relaxed) {
             return;
         }
@@ -104,7 +114,7 @@ impl Tracker {
             let add = (want - have).min(MAX_STEPS_PER_CALL);
             match self.reported.compare_exchange_weak(have, have + add, Relaxed, Relaxed) {
                 Ok(_) => {
-                    if !increase((add * STEP) as u32) {
+                    if increase((add * STEP) as u32).is_err() {
                         self.off.store(true, Relaxed);
                     }
                     return;
@@ -114,7 +124,29 @@ impl Tracker {
         }
     }
 
-    /// A forked child is a new process to the kernel, whose increase starts at zero.
+    /// The guest starts, and `total` bytes are counted: raise the limit to cover `total`, or `UPFRONT` if that is more,
+    /// in one call (halved while the kernel answers ENOMEM, its answer at its cap), then never call again.
+    pub fn guest_starts(&self, total: u64, mut increase: impl FnMut(u32) -> Result<(), i32>) -> u64 {
+        if self.off.swap(true, Relaxed) {
+            return 0;
+        }
+        let have = self.reported.load(Relaxed);
+        let mut add = (total.max(UPFRONT) / STEP).saturating_sub(have).min(MAX_STEPS_PER_CALL);
+        while add > 0 {
+            match increase((add * STEP) as u32) {
+                Ok(()) => {
+                    self.reported.fetch_add(add, Relaxed);
+                    return add * STEP;
+                }
+                Err(libc::ENOMEM) => add /= 2,
+                Err(_) => return 0,
+            }
+        }
+        0
+    }
+
+    /// A forked child is a new process to the kernel, whose increase starts at zero (and after the guest started, it
+    /// makes no call).
     fn forked(&self) {
         self.reported.store(0, Relaxed);
     }
@@ -125,8 +157,20 @@ pub fn check() {
     TRACKER.note(HEAP_LIVE.load(Relaxed) + crate::jit::code_committed(), increase_limit);
 }
 
-fn increase_limit(bytes: u32) -> bool {
-    unsafe { memorystatus_control(CMD_INCREASE_JETSAM_TASK_LIMIT, libc::getpid(), bytes, std::ptr::null_mut(), 0) == 0 }
+fn increase_limit(bytes: u32) -> Result<(), i32> {
+    if unsafe { memorystatus_control(CMD_INCREASE_JETSAM_TASK_LIMIT, libc::getpid(), bytes, std::ptr::null_mut(), 0) } == 0 {
+        Ok(())
+    } else {
+        Err(unsafe { *libc::__error() })
+    }
+}
+
+/// Just before the guest's first instruction: the last raise of the limit (see the module comment).
+pub fn guest_starts() {
+    let raised = TRACKER.guest_starts(HEAP_LIVE.load(Relaxed) + crate::jit::code_committed(), increase_limit);
+    if crate::syscalls::TRACE.load(Relaxed) {
+        eprintln!("[memlimit] raised by {} MiB as the program starts; no call after this", raised >> 20);
+    }
 }
 
 /// Once, at start-up: a forked child counts from zero again.
@@ -149,7 +193,11 @@ mod tests {
     fn run(t: &Tracker, total: u64, ok: bool, calls: &Mutex<Vec<u32>>) {
         t.note(total, |b| {
             calls.lock().unwrap().push(b);
-            ok
+            if ok {
+                Ok(())
+            } else {
+                Err(libc::EPERM)
+            }
         });
     }
 
@@ -223,7 +271,7 @@ mod tests {
                     for i in 0..20000u64 {
                         t.note(i * MIB / 4, |b| {
                             sum.fetch_add(b as u64, Relaxed);
-                            true
+                            Ok(())
                         });
                     }
                 });
@@ -231,6 +279,57 @@ mod tests {
         });
         // The largest total noted is 19999 / 4 MiB = 4999.75 MiB.
         assert_eq!(sum.load(Relaxed), 4999 * MIB);
+    }
+
+    #[test]
+    fn as_the_guest_starts_one_call_covers_the_run_and_none_follows() {
+        let (t, c) = (Tracker::new(), Mutex::new(vec![]));
+        run(&t, 3 * MIB, true, &c);
+        let raised = t.guest_starts(5 * MIB, |b| {
+            c.lock().unwrap().push(b);
+            Ok(())
+        });
+        run(&t, 100 * MIB, true, &c);
+        run(&t, 200 * MIB, true, &c);
+        assert_eq!(*c.lock().unwrap(), vec![3 * MIB as u32, (UPFRONT - 3 * MIB) as u32], "before, at and after the start");
+        assert_eq!(raised, UPFRONT - 3 * MIB);
+        // More than UPFRONT counted already: that is what is covered.
+        let (t2, c2) = (Tracker::new(), Mutex::new(vec![]));
+        t2.guest_starts(UPFRONT + 7 * MIB, |b| {
+            c2.lock().unwrap().push(b);
+            Ok(())
+        });
+        assert_eq!(*c2.lock().unwrap(), vec![(UPFRONT + 7 * MIB) as u32]);
+    }
+
+    #[test]
+    fn at_the_start_a_raise_the_kernel_caps_is_tried_smaller_and_a_refusal_ends_it() {
+        // ENOMEM above 16 MiB (a kernel whose cap is lower): 64, 32, then 16 accepted.
+        let (t, c) = (Tracker::new(), Mutex::new(vec![]));
+        let raised = t.guest_starts(0, |b| {
+            c.lock().unwrap().push(b);
+            if b as u64 > 16 * MIB {
+                Err(libc::ENOMEM)
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!((c.lock().unwrap().clone(), raised), (vec![64 * MIB as u32, 32 * MIB as u32, 16 * MIB as u32], 16 * MIB));
+        // Any other answer is a kernel that does not take the call: one try.
+        let (t2, c2) = (Tracker::new(), Mutex::new(vec![]));
+        t2.guest_starts(0, |b| {
+            c2.lock().unwrap().push(b);
+            Err(libc::EPERM)
+        });
+        assert_eq!(c2.lock().unwrap().len(), 1);
+        // A tracker already off (refused before the start) makes no call at the start.
+        let (t3, c3) = (Tracker::new(), Mutex::new(vec![]));
+        run(&t3, MIB, false, &c3);
+        t3.guest_starts(0, |b| {
+            c3.lock().unwrap().push(b);
+            Ok(())
+        });
+        assert_eq!(c3.lock().unwrap().len(), 1, "only the refused call before the start");
     }
 
     #[test]
