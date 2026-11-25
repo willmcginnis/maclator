@@ -39,6 +39,7 @@ mod loader;
 mod macho;
 mod memlimit;
 mod paths;
+mod sandboxcheck;
 mod signals;
 mod slices;
 mod spawn;
@@ -394,13 +395,7 @@ fn main() {
         eprintln!("maclator: GPU bridge: libmclmetal.dylib not found (looked next to maclator, in ./gpu, ~/.maclator/gpu, $MACLATOR_GPU_DIR)");
     }
     if std::env::var_os("MACLATOR_TRACE_FILE").is_some() {
-        unsafe {
-            let path = format!("/tmp/maclator-trace-{}.log\0", libc::getpid());
-            let fd = libc::open(path.as_ptr() as *const libc::c_char, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC, 0o644);
-            if fd >= 0 {
-                libc::dup2(fd, 2);
-            }
-        }
+        trace_to_file(unsafe { libc::getpid() });
     }
     if gpu_active {
         // The host frameworks must be initialised before the guest runs: CoreFoundation's
@@ -444,6 +439,24 @@ fn main() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     std::process::exit(0);
+}
+
+/// Send stderr to /tmp/maclator-trace-<pid>.log (helper processes have no usable stderr), or leave it where it is if
+/// the file cannot be made (a process started in a sandbox that refuses it: tracing only, once per process). The
+/// file's own descriptor is closed once stderr is it, so the guest is not left one it never opened.
+fn trace_to_file(pid: i32) -> bool {
+    let path = format!("/tmp/maclator-trace-{pid}.log\0");
+    unsafe {
+        let fd = libc::open(path.as_ptr() as *const libc::c_char, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC, 0o644);
+        if fd < 0 {
+            return false;
+        }
+        let ok = libc::dup2(fd, 2) == 2;
+        if fd != 2 {
+            libc::close(fd);
+        }
+        ok
+    }
 }
 
 fn resolve_path(p: &str) -> String {
@@ -523,4 +536,62 @@ fn resolve_target(arg: &str) -> Result<Target, String> {
         });
     }
     Ok(Target::Executable(path))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::sandboxcheck::tests::{apply, in_child};
+
+    fn open_fds() -> usize {
+        (0..1024).filter(|&fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } != -1).count()
+    }
+
+    fn ino(fd: i32) -> (i32, u64) {
+        let mut s: libc::stat = unsafe { std::mem::zeroed() };
+        unsafe { libc::fstat(fd, &mut s) };
+        (s.st_dev, s.st_ino)
+    }
+
+    #[test]
+    fn the_trace_file_takes_stderr_and_leaves_no_descriptor_behind() {
+        let code = in_child(|| {
+            let pid = unsafe { libc::getpid() };
+            let path = format!("/private/tmp/maclator-trace-{pid}.log");
+            let before = open_fds();
+            let ok = super::trace_to_file(pid);
+            let after = open_fds();
+            let same = std::fs::metadata(&path).is_ok_and(|m| {
+                use std::os::unix::fs::MetadataExt;
+                (m.dev() as i32, m.ino()) == ino(2)
+            });
+            let _ = std::fs::remove_file(&path);
+            match (ok, same, after == before) {
+                (true, true, true) => 0,
+                (false, ..) => 3,
+                (_, false, _) => 4,
+                (.., false) => 5,
+            }
+        });
+        assert_eq!(code, 0, "3 not opened, 4 stderr is not the file, 5 a descriptor left behind");
+    }
+
+    #[test]
+    fn a_process_whose_sandbox_refuses_the_trace_file_keeps_stderr() {
+        let code = in_child(|| {
+            let pid = unsafe { libc::getpid() };
+            // A file left by an earlier process of this pid would be opened, not made.
+            let _ = std::fs::remove_file(format!("/private/tmp/maclator-trace-{pid}.log"));
+            if !apply("(version 2)(allow default)(deny file-write-create (regex #\"^/private/tmp/maclator-trace-\"))") {
+                return 20;
+            }
+            let before = ino(2);
+            let ok = super::trace_to_file(pid);
+            let made = std::path::Path::new(&format!("/private/tmp/maclator-trace-{pid}.log")).exists();
+            match (ok, ino(2) == before, made) {
+                (false, true, false) => 0,
+                _ => 3,
+            }
+        });
+        assert_eq!(code, 0, "20 the sandbox was not applied, 3 stderr moved or the file made");
+    }
 }

@@ -71,10 +71,13 @@ pub(crate) fn owned(md: &std::fs::Metadata, uid: u32) -> bool {
     md.uid() == uid && md.mode() & 0o022 == 0
 }
 
-/// `dir`, made first if missing (mode 0700), is a real directory (not a symlink) that is `owned` by `uid`.
+/// `dir`, made first if missing (mode 0700, not in a sandboxed process), is a real directory (not a symlink) that is
+/// `owned` by `uid`.
 pub(crate) fn owned_dir(dir: &std::path::Path, uid: u32) -> bool {
     use std::os::unix::fs::DirBuilderExt;
-    let _ = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir);
+    if !crate::sandboxcheck::sandboxed() {
+        let _ = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir);
+    }
     std::fs::symlink_metadata(dir).is_ok_and(|md| md.is_dir() && owned(&md, uid))
 }
 
@@ -433,6 +436,11 @@ fn cache_layout(head: &[u8; 32], file_len: u64) -> Option<(usize, usize, usize)>
 }
 
 fn load_file(path: &std::path::Path, start: u64, end: u64) -> std::io::Result<usize> {
+    // A sandboxed process reads the store only where its sandbox lets it, asked first so a refusal is never logged.
+    if !crate::sandboxcheck::may_read(path) {
+        crate::sandboxcheck::note_left_alone("not reading saved translations its sandbox does not let it read");
+        return Ok(0);
+    }
     let mut f = std::fs::File::open(path)?;
     // The code is run as it is, so only a file of ours in a directory of ours, both writable by no one else.
     let uid = unsafe { libc::geteuid() };
@@ -486,6 +494,12 @@ fn read_profile(path: &std::path::Path) -> BTreeSet<u64> {
 /// a background (forked) process.
 pub fn save_profile() {
     if !ENABLED.load(Ordering::Relaxed) || SAVED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    // A sandboxed process writes nothing to the store, and so reads no profile and builds nothing, as Rosetta's
+    // translations are made by a service of their own and never by the sandboxed program.
+    if crate::sandboxcheck::sandboxed() {
+        crate::sandboxcheck::note_left_alone("not saving translations");
         return;
     }
     flush_pending();
@@ -1003,6 +1017,46 @@ mod image_key_tests {
         let u = [9u8; 16];
         assert_ne!(cache_key(&u, 0x6_0000_0000), cache_key(&u, 0x6_0000_4000), "two bases, one cache key");
         assert_eq!(cache_key(&u, 0x6_0000_0000), cache_key(&u, 0x6_0000_0000), "one base, one cache key");
+    }
+
+    /// The same run twice, each in a child: unsandboxed it writes the image's profile (the control); under a sandbox
+    /// that allows everything it writes nothing, so what is tested is the translator's own choice, not a refusal.
+    #[test]
+    fn a_sandboxed_process_saves_no_translations() {
+        // In a process of its own (the test binary run again for this test alone): save_profile saves once per process
+        // and reads the store from the environment, which a fork child of the threaded test harness must not change
+        // (a parent thread reading it as the fork came leaves its lock held in the child).
+        if let Some(sbx) = std::env::var_os("MCL_AOT_SBX") {
+            let d = std::path::PathBuf::from(std::env::var_os("MACLATOR_CACHE").unwrap());
+            ENABLED.store(true, Ordering::SeqCst);
+            SAVED.store(false, Ordering::SeqCst);
+            if sbx == "1" && !crate::sandboxcheck::tests::apply("(version 2)(allow default)") {
+                std::process::exit(20);
+            }
+            register_main("/x/mcl-sbx-save", [7; 16], 0x1_0000_0000, 0x1_0000_4000, vec![]);
+            note_translated(0x1_0000_0000);
+            save_profile();
+            std::process::exit(std::fs::read_dir(&d).map(|r| r.count()).unwrap_or(0).min(19) as i32);
+        }
+        let run = |sandbox: bool| {
+            // The store exists (0700, ours), so making it is not what keeps a sandboxed process out.
+            let d = std::env::temp_dir().join(format!("mcl-sbx-save-{sandbox}-{}", std::process::id()));
+            assert!(owned_dir(&d, unsafe { libc::geteuid() }), "control: the store is made");
+            let st = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "aot::image_key_tests::a_sandboxed_process_saves_no_translations", "--test-threads=1"])
+                .env("MCL_AOT_SBX", if sandbox { "1" } else { "0" })
+                .env("MACLATOR_CACHE", &d)
+                .env("MACLATOR_NO_AOT_BUILD", "1")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            let _ = std::fs::remove_dir_all(&d);
+            st.code().unwrap_or(1000)
+        };
+        let control = run(false);
+        assert!((1..20).contains(&control), "control: unsandboxed, the profile is written (got {control})");
+        assert_eq!(run(true), 0, "sandboxed: nothing is written (20: the sandbox was not applied)");
     }
 }
 

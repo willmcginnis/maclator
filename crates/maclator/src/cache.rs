@@ -171,6 +171,9 @@ fn read_boot_base(dir: &std::path::Path, boot: &str, span: u64) -> Option<u64> {
         return None;
     }
     let path = boot_base_path(dir, boot, span);
+    if !crate::sandboxcheck::may_read(&path) {
+        return None;
+    }
     let md = std::fs::symlink_metadata(&path).ok()?;
     if !(md.is_file() && crate::aot::owned(&md, uid) && md.len() < 256) {
         return None;
@@ -190,7 +193,8 @@ fn write_boot_base(dir: &std::path::Path, boot: &str, span: u64, base: u64) {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let uid = unsafe { libc::geteuid() };
-    if !crate::aot::owned_dir(dir, uid) {
+    // A sandboxed process writes nothing in a store (share_slid).
+    if crate::sandboxcheck::sandboxed() || !crate::aot::owned_dir(dir, uid) {
         return;
     }
     let path = boot_base_path(dir, boot, span);
@@ -608,8 +612,21 @@ fn slid_store_in(shared: Option<&std::path::Path>, shared_owner: u32, home: std:
 
 /// Map `m` (already mapped private from the cache file at `addr`) from its shared slid file, building the file first
 /// if there is none and this process may. False means nothing changed and the caller slides in place as before.
+///
+/// A sandboxed process (one started in its parent's sandbox) builds and writes nothing, here or in its own store, and
+/// maps root's shared file only if its sandbox lets it read it, asked first so a refusal is never logged; otherwise it
+/// slides privately, saying so once with tracing.
 unsafe fn share_slid(fd: i32, m: &MappingSlideNp, info: &[u8], slide: u64, unslid_base: u64, addr: u64) -> bool {
     let shared = shared_store_path(std::env::var_os("MACLATOR_SHARED_STORE"));
+    if crate::sandboxcheck::sandboxed() {
+        let readable = shared.as_ref().and_then(|d| slid_path(d, fd, m, info, slide)).is_some_and(|(p, _)| crate::sandboxcheck::may_read(&p));
+        if !readable {
+            crate::sandboxcheck::note_left_alone("not using the shared slid store");
+            return false;
+        }
+        let store = SlidStore { dir: shared.unwrap(), owner: 0, build: false, own: None };
+        return share_slid_in(&store, fd, m, info, slide, unslid_base, addr);
+    }
     let store = slid_store_in(shared.as_deref(), 0, crate::aot::cache_dir(), libc::geteuid());
     share_slid_in(&store, fd, m, info, slide, unslid_base, addr)
 }
@@ -634,7 +651,9 @@ unsafe fn share_slid_in(store: &SlidStore, fd: i32, m: &MappingSlideNp, info: &[
         Slid::Refused => false,
         Slid::Missing if store.build => build_slid(fd, m, info, slide, unslid_base, &path, &id, uid, SLID_LOCK_WAIT_MS) && map_slid(addr, size, prot, &path, &id, uid, seed, boot, SLID_LOCK_WAIT_MS) == Slid::Mapped,
         Slid::Missing => {
-            if !MISSING_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            if crate::sandboxcheck::sandboxed() {
+                crate::sandboxcheck::note_left_alone("a slid file is not in the shared store yet");
+            } else if !MISSING_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 eprintln!("maclator: {} is not in the shared store yet (only uid {uid} builds there); sliding privately", path.display());
             }
             false
@@ -702,6 +721,9 @@ fn stamp_bytes(boot: &[u8], md: &std::fs::Metadata, sum: &[u8]) -> Vec<u8> {
 fn stamp_ok(stamp: &std::path::Path, want: &[u8], uid: u32) -> bool {
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
+    if !crate::sandboxcheck::may_read(stamp) {
+        return false;
+    }
     let Ok(f) = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(stamp) else { return false };
     let mut got = Vec::new();
     f.metadata().is_ok_and(|md| md.is_file() && crate::aot::owned(&md, uid) && md.len() == want.len() as u64)
@@ -717,6 +739,10 @@ fn stamp_ok(stamp: &std::path::Path, want: &[u8], uid: u32) -> bool {
 fn stamp_write(stamp: &std::path::Path, want: &[u8]) -> bool {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
+    // A sandboxed process writes nothing in a store (share_slid).
+    if crate::sandboxcheck::sandboxed() {
+        return false;
+    }
     let mut tmp = stamp.as_os_str().to_owned();
     tmp.push("-tmp");
     let tmp = std::path::PathBuf::from(tmp);
@@ -823,7 +849,10 @@ unsafe fn map_slid_side(addr: u64, size: usize, prot: i32, path: &std::path::Pat
         if !read || sha256(&buf[..len])[..] != rec[64 + 32 * c..96 + 32 * c] {
             if trusted {
                 // The file changed since its stamp was left: the next process checks every chunk, and refuses it too.
-                let _ = std::fs::remove_file(&stamp);
+                // (Not a sandboxed process, which writes nothing in a store.)
+                if !crate::sandboxcheck::sandboxed() {
+                    let _ = std::fs::remove_file(&stamp);
+                }
                 // We cannot remove the owner's stamp, which our later processes would trust again: leave them a refusal.
                 // Under our own lock: the one we hold already (taken before a stamp appeared meanwhile), else a new one.
                 if let (true, true, Some(r)) = (read, mine, &refusal) {
@@ -953,7 +982,8 @@ impl BuildLock {
         use std::os::unix::ffi::OsStrExt;
         use std::sync::atomic::Ordering;
         let c = std::ffi::CString::new(lock_path.as_os_str().as_bytes()).ok()?;
-        if !slid_lock_registered() {
+        // A lock is a file made in the store: a sandboxed process takes none (share_slid), as if it gave up waiting.
+        if !slid_lock_registered() || crate::sandboxcheck::sandboxed() {
             return None;
         }
         slid_gate_take();
@@ -1255,6 +1285,55 @@ mod slid_tests {
     /// Map `path` at `at` (over a fresh anonymous mapping that reads zero) and say what happened; unmaps after.
     fn try_map(at: u64, path: &std::path::Path, id: &SlidId, uid: u32, seed: usize) -> (Slid, u8) {
         try_map_in(at, path, id, uid, seed, Some(BOOT))
+    }
+
+    /// Mapping a file of ours with no stamp yet, in a child: unsandboxed it checks every chunk under the file's lock and
+    /// leaves the lock file and a stamp (the control); under a sandbox that allows everything it checks every chunk
+    /// and leaves nothing, so what is tested is the translator's own choice, not a refusal.
+    #[test]
+    fn a_sandboxed_process_takes_no_lock_and_leaves_no_stamp() {
+        let run = |sandbox: bool, name: &'static str| {
+            crate::sandboxcheck::tests::in_child(move || {
+                let (d, path, id, want) = built(name);
+                // Building left the lock file; mapping must make it again to leave it.
+                let _ = std::fs::remove_file(path.with_extension("lock"));
+                if sandbox && !crate::sandboxcheck::tests::apply("(version 2)(allow default)") {
+                    return 20;
+                }
+                let (r, first) = try_map(STAMP_AT + 40 * STAMP_STEP, &path, &id, uid(), 0);
+                let left = ["lock", "stamp"].iter().filter(|e| path.with_extension(e).exists()).count();
+                let _ = std::fs::remove_dir_all(&d);
+                if r == Slid::Mapped && first == want[0] {
+                    left as i32
+                } else {
+                    10
+                }
+            })
+        };
+        assert_eq!(run(false, "sbx-stamp-c"), 2, "control: unsandboxed, the lock file and the stamp are left (10: not mapped)");
+        assert_eq!(run(true, "sbx-stamp"), 0, "sandboxed: nothing is left (10: not mapped, 20: the sandbox was not applied)");
+    }
+
+    #[test]
+    fn a_sandboxed_process_records_no_boot_base() {
+        let run = |sandbox: bool| {
+            let d = std::env::temp_dir().join(format!("mcl-sbx-base-{sandbox}-{}", std::process::id()));
+            crate::sandboxcheck::tests::in_child(move || {
+                if std::fs::create_dir_all(&d).is_err() {
+                    return 21;
+                }
+                let d = std::fs::canonicalize(&d).unwrap();
+                if sandbox && !crate::sandboxcheck::tests::apply("(version 2)(allow default)") {
+                    return 20;
+                }
+                write_boot_base(&d, "b00t", 0x4000, 0x7000_0000_0000);
+                let made = boot_base_path(&d, "b00t", 0x4000).exists();
+                let _ = std::fs::remove_dir_all(&d);
+                made as i32
+            })
+        };
+        assert_eq!(run(false), 1, "control: unsandboxed, the boot's base is recorded (21: no directory)");
+        assert_eq!(run(true), 0, "sandboxed: nothing is recorded (20: the sandbox was not applied)");
     }
 
     /// `try_map` in the boot `boot`, waiting up to 10 s for a process checking the file first.

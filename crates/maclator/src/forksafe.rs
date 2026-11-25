@@ -260,6 +260,7 @@ mod tests {
         ("memlimit", "maclator/src/memlimit.rs", include_str!("memlimit.rs")),
         ("main", "maclator/src/main.rs", include_str!("main.rs")),
         ("paths", "maclator/src/paths.rs", include_str!("paths.rs")),
+        ("sandboxcheck", "maclator/src/sandboxcheck.rs", include_str!("sandboxcheck.rs")),
         ("signals", "maclator/src/signals.rs", include_str!("signals.rs")),
         ("slices", "maclator/src/slices.rs", include_str!("slices.rs")),
         ("spawn", "maclator/src/spawn.rs", include_str!("spawn.rs")),
