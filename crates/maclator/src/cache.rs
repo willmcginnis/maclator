@@ -739,8 +739,9 @@ unsafe fn map_slid(addr: u64, size: usize, prot: i32, path: &std::path::Path, id
 /// stamp or a refusal beside it, so it keeps its own, under the file's name, in its own store: its stamp vouches for
 /// root's file to its later processes, so they check a sample instead of every chunk; its refusal, left when any chunk
 /// it checked does not match, refuses the file to its later processes at once, whatever root's stamp says, as a removed
-/// stamp and a refusal do in a store of one's own. Root's stamp and refusal are trusted as well. A stamp or refusal is
-/// left in its own store only when it checked every chunk or found one that does not match.
+/// stamp and a refusal do in a store of one's own. Root's stamp and refusal are trusted as well. Its own files are named
+/// `<file>.shared-stamp`, `.shared-refused` and `.shared-lock`. Nothing is made in its own store (not even the store
+/// directory) while a stamp it trusts says the file is sound and its sample agrees.
 #[allow(clippy::too_many_arguments)]
 unsafe fn map_slid_side(addr: u64, size: usize, prot: i32, path: &std::path::Path, id: &SlidId, uid: u32, seed: usize, boot: Option<&[u8]>, wait_ms: u64, own: Option<(&std::path::Path, u32)>) -> Slid {
     use std::os::unix::fs::OpenOptionsExt;
@@ -778,27 +779,30 @@ unsafe fn map_slid_side(addr: u64, size: usize, prot: i32, path: &std::path::Pat
     }
     let want = boot.map(|b| stamp_bytes(b, &md, &rec[64 + 32 * n..]));
     let refusal = want.as_ref().map(|w| [&SLID_REFUSED_MAGIC[..], &w[SLID_STAMP_MAGIC.len()..]].concat());
-    // This process's own stamp, refusal and lock: beside the file, or, with `own`, under its name in our own store.
-    let (side, side_uid) = match (own, path.file_name()) {
-        (Some((d, u)), Some(name)) => (d.join(name), u),
-        _ => (path.to_path_buf(), uid),
+    // This process's own stamp, refusal and lock: beside the file, or, with `own` (another directory), under its name in
+    // our own store, with names of their own, so they never meet the stamp of a slid file built in that store.
+    let own_side = match (own, path.file_name()) {
+        (Some((d, u)), Some(name)) if d.join(name) != path => Some((d.join(name), u)),
+        _ => None,
     };
-    let mine = side != path;
-    let (stamp, refusal_at) = (side.with_extension("stamp"), side.with_extension("refused"));
+    let mine = own_side.is_some();
+    let (side, side_uid) = own_side.unwrap_or_else(|| (path.to_path_buf(), uid));
+    let ext = |e: &'static str| if mine { side.with_extension(format!("shared-{e}")) } else { side.with_extension(e) };
+    let (stamp, refusal_at, lock_at) = (ext("stamp"), ext("refused"), ext("lock"));
     let owner_says = |ext: &str, b: &Option<Vec<u8>>| mine && b.as_ref().is_some_and(|b| stamp_ok(&path.with_extension(ext), b, uid));
     let stamped = || want.as_ref().is_some_and(|w| stamp_ok(&stamp, w, side_uid)) || owner_says("stamp", &want);
     let refused = || refusal.as_ref().is_some_and(|r| stamp_ok(&refusal_at, r, side_uid)) || owner_says("refused", &refusal);
-    // Our own store, made (0700) only when we come to write in it.
-    let own_dir = || own.is_some_and(|(d, u)| crate::aot::owned_dir(d, u));
+    // Our own store, made (0700) only when we come to check every chunk or to leave a refusal.
+    let own_dir = || mine && own.is_some_and(|(d, u)| crate::aot::owned_dir(d, u));
     if refused() {
-        return refuse(path, "every chunk was checked earlier in this boot and one did not match");
+        return refuse(path, "it was refused earlier in this boot: a chunk did not match");
     }
     let mut lock = None;
     let mut trusted = stamped();
     if !trusted && want.is_some() && (!mine || own_dir()) {
-        lock = BuildLock::take(&side.with_extension("lock"), wait_ms);
+        lock = BuildLock::take(&lock_at, wait_ms);
         if refused() {
-            return refuse(path, "every chunk was checked earlier in this boot and one did not match");
+            return refuse(path, "it was refused earlier in this boot: a chunk did not match");
         }
         // Whether we got the lock or gave up waiting, the first process may have left its stamp meanwhile.
         trusted = stamped();
@@ -813,9 +817,10 @@ unsafe fn map_slid_side(addr: u64, size: usize, prot: i32, path: &std::path::Pat
                 // The file changed since its stamp was left: the next process checks every chunk, and refuses it too.
                 let _ = std::fs::remove_file(&stamp);
                 // We cannot remove the owner's stamp, which our later processes would trust again: leave them a refusal.
+                // Under our own lock: the one we hold already (taken before a stamp appeared meanwhile), else a new one.
                 if let (true, true, Some(r)) = (read, mine, &refusal) {
-                    if own_dir() {
-                        if let Some(_l) = BuildLock::take(&side.with_extension("lock"), wait_ms) {
+                    if lock.is_some() || own_dir() {
+                        if let Some(_l) = lock.take().or_else(|| BuildLock::take(&lock_at, wait_ms)) {
                             let _ = stamp_write(&refusal_at, r);
                         }
                     }
@@ -830,7 +835,7 @@ unsafe fn map_slid_side(addr: u64, size: usize, prot: i32, path: &std::path::Pat
     }
     if let (false, Some(_), Some(w)) = (trusted, &lock, &want) {
         if !stamp_write(&stamp, w) {
-            eprintln!("maclator: could not leave a stamp beside {}; the next process checks every chunk again", path.display());
+            eprintln!("maclator: could not leave the stamp {}; the next process checks every chunk again", stamp.display());
         }
     }
     drop(lock);
@@ -1987,13 +1992,13 @@ mod slid_tests {
         reader.own = Some((homes[3].clone(), me)); // a test cannot be uid me + 1: its own store is ours
         let t0 = std::time::Instant::now();
         assert_eq!(try_share(SHARE_AT + 3 * SHARE_STEP, &reader, &f, &m, &info), (true, want[..16].to_vec()), "it maps the owner's copy");
-        assert!(t0.elapsed() < std::time::Duration::from_millis(SLID_LOCK_WAIT_MS / 3), "with no lock to take it does not wait for one: {:?}", t0.elapsed());
+        assert!(t0.elapsed() < std::time::Duration::from_millis(SLID_LOCK_WAIT_MS / 3), "it does not wait for root's lock, which it cannot take: {:?}", t0.elapsed());
         assert_eq!(names(&shared), before, "it wrote nothing in the shared store (no lock, stamp or file)");
         assert!(!d.join("home3").exists(), "the owner wrote nothing under its HOME");
         // Having checked every chunk, it vouches for the owner's file to its own later processes: a stamp and its
         // lock in its own store, and no copy.
         let own: Vec<String> = names(&homes[3]).into_iter().map(|n| n.rsplit_once('.').map(|x| x.1.to_string()).unwrap_or_default()).collect();
-        assert_eq!(own, vec!["lock".to_string(), "stamp".to_string()], "the reader's own store holds its stamp and lock only: {:?}", names(&homes[3]));
+        assert_eq!(own, vec!["shared-lock".to_string(), "shared-stamp".to_string()], "the reader's own store holds its stamp and lock only: {:?}", names(&homes[3]));
         let all = slid_files(&d);
         assert_eq!(all.len(), 3, "the two control copies and the one shared copy, no more: {all:?}");
         assert_eq!(all.iter().filter(|p| p.starts_with(&shared)).count(), 1, "one copy in the shared store");
@@ -2028,6 +2033,7 @@ mod slid_tests {
     #[test]
     fn a_reader_that_finds_a_changed_chunk_refuses_it_to_its_own_later_processes() {
         if uid() == 0 {
+            eprintln!("as root the owner's store is writable to the reader, so this is not tested here");
             return;
         }
         let (d, path, id, want) = built("own-refusal");
@@ -2038,9 +2044,9 @@ mod slid_tests {
         MADE.with(|m| m.0.borrow_mut().extend([mine.clone(), theirs.clone()]));
         assert_eq!(try_map(SHARE_AT + 9 * SHARE_STEP, &path, &id, uid(), 2), (Slid::Mapped, want[0]), "control: the owner's stamp is trusted and seed 2's sample misses chunk 1");
         assert_eq!(try_map_own(SHARE_AT + 9 * SHARE_STEP, &path, &id, 1, &mine).0, Slid::Refused, "a sample holding chunk 1 sees the change");
-        let refusal = mine.join("x.refused");
+        let refusal = mine.join("x.shared-refused");
         assert_eq!(std::fs::read(&refusal).ok(), Some(refusal_as_is(&path, BOOT)), "and leaves a refusal of the file as it is in its own store");
-        assert!(!mine.join("x.stamp").exists(), "and no stamp");
+        assert!(!mine.join("x.shared-stamp").exists(), "and no stamp");
         let t0 = std::time::Instant::now();
         assert_eq!(try_map_own(SHARE_AT + 10 * SHARE_STEP, &path, &id, 2, &mine), (Slid::Refused, 0), "a later process of its uid refuses it, though its sample would miss the change");
         assert!(t0.elapsed() < std::time::Duration::from_millis(1_000), "at once: {:?}", t0.elapsed());
@@ -2053,6 +2059,7 @@ mod slid_tests {
     #[test]
     fn a_reader_that_checked_every_chunk_vouches_for_the_file_to_its_own_later_processes() {
         if uid() == 0 {
+            eprintln!("as root the owner's store is writable to the reader, so this is not tested here");
             return;
         }
         let (d, path, id, want) = built("own-stamp");
@@ -2062,7 +2069,7 @@ mod slid_tests {
         MADE.with(|m| m.0.borrow_mut().extend([mine.clone(), theirs.clone(), quiet.clone()]));
         assert_eq!(try_map_own(SHARE_AT + 12 * SHARE_STEP, &path, &id, 2, &mine), (Slid::Mapped, want[0]), "every chunk checked, mapped");
         let file = std::fs::read(&path).unwrap();
-        let stamp = mine.join("x.stamp");
+        let stamp = mine.join("x.shared-stamp");
         assert_eq!(std::fs::read(&stamp).ok(), Some(stamp_bytes(BOOT, &std::fs::metadata(&path).unwrap(), &file[file.len() - 32..])), "it left a stamp of the owner's file in its own store");
         {
             use std::os::unix::fs::PermissionsExt;
@@ -2080,6 +2087,93 @@ mod slid_tests {
         chmod(&d, 0o555);
         assert_eq!(try_map_own(SHARE_AT + 15 * SHARE_STEP, &path, &id, 2, &quiet).0, Slid::Mapped, "the owner's stamp is trusted");
         assert!(!quiet.exists(), "and a reader that trusted it made nothing in its own store");
+    }
+
+    /// `try_map_own` for a reader of euid `euid` (its own store's owner): what a test can be is only its own uid, so
+    /// another euid names a store whose files the test made and the reader must not trust.
+    fn try_map_own_as(at: u64, path: &std::path::Path, id: &SlidId, seed: usize, own: &std::path::Path, euid: u32) -> Slid {
+        let len = id.size as usize;
+        unsafe {
+            let p = libc::mmap(at as *mut _, len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_FIXED, -1, 0);
+            assert_eq!(p as u64, at, "control: the range is ours");
+            let r = map_slid_side(at, len, libc::PROT_READ, path, id, uid(), seed, Some(BOOT), 2_000, Some((own, euid)));
+            libc::munmap(at as *mut _, len);
+            r
+        }
+    }
+
+    /// The reader trusts its own stamps and refusals only as its own euid's, and the owner's only as
+    /// the owner's. Here the reader's euid is not ours, so the stamp and refusal we plant in its store are not its own.
+    #[test]
+    fn a_reader_trusts_its_own_stamps_as_its_euids_and_the_owners_as_the_owners() {
+        if uid() == 0 {
+            eprintln!("as root a planted file's owner check is not the reader's, so this is not tested here");
+            return;
+        }
+        let (d, path, id, want) = built("own-uid");
+        let _back = read_only_to_readers(&d, &path);
+        let o = d.with_extension("own6");
+        MADE.with(|m| m.0.borrow_mut().push(o.clone()));
+        std::fs::create_dir(&o).unwrap();
+        chmod(&o, 0o700);
+        let other = uid() + 1;
+        // A refusal of the sound file, planted as ours: not the reader's, so it checks every chunk and maps it.
+        assert!(stamp_write(&o.join("x.shared-refused"), &refusal_as_is(&path, BOOT)));
+        assert_eq!(try_map_own_as(SHARE_AT + 16 * SHARE_STEP, &path, &id, 2, &o, other), Slid::Mapped, "a refusal not of its euid is not trusted");
+        assert_eq!(try_map_own(SHARE_AT + 16 * SHARE_STEP, &path, &id, 2, &o).0, Slid::Refused, "control: the same refusal, its euid ours, is");
+        std::fs::remove_file(o.join("x.shared-refused")).unwrap();
+        // A change below the filesystem in a chunk seed 2 skips, and a stamp of it planted as ours.
+        chmod(&d, 0o755);
+        flip(&path, UNSAMPLED);
+        chmod(&d, 0o555);
+        let now = std::fs::read(&path).unwrap();
+        assert!(stamp_write(&o.join("x.shared-stamp"), &stamp_bytes(BOOT, &std::fs::metadata(&path).unwrap(), &now[now.len() - 32..])));
+        let before = names(&o);
+        assert_eq!(try_map_own_as(SHARE_AT + 17 * SHARE_STEP, &path, &id, 2, &o, other), Slid::Refused, "a stamp not of its euid is not trusted: every chunk is checked");
+        assert_eq!(names(&o), before, "and a store not of its euid gets nothing written");
+        assert_eq!(try_map_own(SHARE_AT + 17 * SHARE_STEP, &path, &id, 2, &o).0, Slid::Mapped, "control: the same stamp, its euid ours, is trusted");
+        // The owner's stamp of the file as it is: trusted as the owner's (our uid), whatever the reader's euid.
+        std::fs::remove_file(o.join("x.shared-stamp")).unwrap();
+        chmod(&d, 0o755);
+        stamp_as_is(&path, &id, BOOT);
+        chmod(&d, 0o555);
+        assert_eq!(try_map_own_as(SHARE_AT + 18 * SHARE_STEP, &path, &id, 2, &o, other), Slid::Mapped, "the owner's stamp is trusted as the owner's");
+        let _ = want;
+    }
+
+    /// A reader that took its own lock (no stamp yet), then found a stamp left meanwhile, and whose sample then finds
+    /// a changed chunk, leaves its refusal at once, not after waiting on itself (it cannot see how long the lock is held).
+    #[test]
+    fn a_reader_holding_its_own_lock_when_a_stamp_appears_still_leaves_its_refusal_at_once() {
+        if uid() == 0 {
+            eprintln!("as root the owner's store is writable to the reader, so this is not tested here");
+            return;
+        }
+        let (d, path, id, _) = built("own-held");
+        let _back = read_only_to_readers(&d, &path);
+        let o = d.with_extension("own7");
+        MADE.with(|m| m.0.borrow_mut().push(o.clone()));
+        assert!(crate::aot::owned_dir(&o, uid()));
+        chmod(&d, 0o755);
+        flip(&path, UNSAMPLED);
+        chmod(&d, 0o555);
+        // A peer of its uid holds its lock; it leaves the owner's stamp of the changed file, then lets the lock go.
+        let held = BuildLock::take(&o.join("x.shared-lock"), 0).expect("free");
+        let (p2, d2, id2) = (path.clone(), d.clone(), id);
+        let peer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            chmod(&d2, 0o755);
+            stamp_as_is(&p2, &id2, BOOT);
+            chmod(&d2, 0o555);
+            drop(held);
+        });
+        let t0 = std::time::Instant::now();
+        let got = try_map_own(SHARE_AT + 19 * SHARE_STEP, &path, &id, 1, &o).0;
+        let took = t0.elapsed();
+        peer.join().unwrap();
+        assert_eq!(got, Slid::Refused, "seed 1's sample holds chunk 1, which changed");
+        assert_eq!(std::fs::read(o.join("x.shared-refused")).ok(), Some(refusal_as_is(&path, BOOT)), "it left its refusal");
+        assert!(took < std::time::Duration::from_millis(1_500), "without waiting on its own lock: {took:?}");
     }
 
     /// A builder whose umask is 077 (a daemon's may be) still leaves the slid file and its stamp readable by every uid,
