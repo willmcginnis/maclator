@@ -1211,6 +1211,10 @@ fn on_fd(kn: &Knote) -> bool {
 
 #[cfg(test)]
 static TAKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Calls of stage() the monitor has finished, whatever became of the event (kept, merged or dropped): a test waits on
+/// it, not on a pause.
+#[cfg(test)]
+static STAGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The monitor: take each event as it fires on the shared kqueue, one at a time (so a message the kernel receives
 /// into the data area is that one event's), keep it with its workloop, and start a servicer if that workloop needs one.
@@ -1245,6 +1249,8 @@ fn wl_monitor() {
         let mut g = WL.lock().unwrap();
         let st = g.get_or_insert_with(WlState::new);
         stage(st, kq, ev, msg);
+        #[cfg(test)]
+        STAGED.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -2584,13 +2590,15 @@ pub(crate) mod tests {
             if wait_staged(w, 1, 3000) != 1 {
                 return 4;
             }
-            // Three of the four bytes read while its event waits: delivered, the knote is armed again with one byte
-            // left, under its mark, so no event comes until there are four again.
+            // Three of the four bytes read while its event waits: the knote is armed again with one byte left, under
+            // its mark, so no event comes until there are four again. The waiting event itself is not what this tests:
+            // natively the kernel checks a level-triggered knote again as it hands its event over and drops one whose
+            // condition has ended, where the emulation hands over the event it took, so either answer is let through.
             let mut b = [0u8; 3];
             if unsafe { libc::read(p[0], b.as_mut_ptr().cast(), 3) } != 3 {
                 return 21;
             }
-            if poll(w, None).len() != 1 {
+            if poll(w, None).len() > 1 {
                 return 5;
             }
             std::thread::sleep(std::time::Duration::from_millis(300));
@@ -2605,7 +2613,7 @@ pub(crate) mod tests {
             }
             0
         });
-        assert_eq!(code, 0, "3 refused, 4 not staged, 5 not delivered, 6 an event for fewer bytes than its mark, 7 none at its mark; 20-22 the test's pipe");
+        assert_eq!(code, 0, "3 refused, 4 not staged, 5 more than one event, 6 an event for fewer bytes than its mark, 7 none at its mark; 20-22 the test's pipe");
     }
 
     #[test]
@@ -2853,16 +2861,18 @@ pub(crate) mod tests {
                     }
                 }
                 if i == 0 {
-                    // Triggered again before its event is delivered.
-                    let before = TAKEN.load(Ordering::SeqCst);
+                    // Triggered again before its event is delivered: wait until the monitor has kept that fire too.
+                    let before = STAGED.load(Ordering::SeqCst);
                     if apply(w, trigger(c)) != 0 {
                         return 4;
                     }
                     let t0 = std::time::Instant::now();
-                    while TAKEN.load(Ordering::SeqCst) == before && t0.elapsed() < std::time::Duration::from_secs(1) {
+                    while STAGED.load(Ordering::SeqCst) == before {
+                        if t0.elapsed() > std::time::Duration::from_secs(3) {
+                            return 22;
+                        }
                         std::thread::sleep(std::time::Duration::from_millis(2));
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
                 }
                 if poll(w, None).len() != 1 {
                     return 5;
@@ -2879,7 +2889,7 @@ pub(crate) mod tests {
             }
             0
         });
-        assert_eq!(code, 0, "3 not staged, 4 refused, 5 not delivered, 6 no event after it was added again, 7 none after disable and enable, 8 a trigger while its event waited came as an event of its own");
+        assert_eq!(code, 0, "3 not staged, 4 refused, 5 not delivered, 6 no event after it was added again, 7 none after disable and enable, 8 a trigger while its event waited came as an event of its own, 22 the monitor took no second fire in 3 s (the host knote not left armed)");
     }
 
     #[test]
@@ -3013,18 +3023,18 @@ pub(crate) mod tests {
             }
             let Some(token) = with_wl(|st| st.by_key.get(&(w, EVFILT_READ, p[0] as u64, None)).copied()) else { return 4 };
             let kq = WL_KQ.load(Ordering::SeqCst);
-            let before = TAKEN.load(Ordering::SeqCst);
+            // Wait until the monitor has done with the event (kept it, or not), so the check below is not made too soon.
+            let before = STAGED.load(Ordering::SeqCst);
             if host_change(kq, &Kev { ident: p[0] as u64, filter: EVFILT_READ, flags: EV_ENABLE, udata: token, ..Default::default() }) != 0 {
                 return 5;
             }
             let t0 = std::time::Instant::now();
-            while TAKEN.load(Ordering::SeqCst) == before {
+            while STAGED.load(Ordering::SeqCst) == before {
                 if t0.elapsed() > std::time::Duration::from_secs(3) {
                     return 22;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
             if staged(w) != 0 {
                 return 6;
             }
@@ -3180,23 +3190,23 @@ pub(crate) mod tests {
             if apply(w, r) != 0 || wait_staged(w, 1, 3000) != 1 {
                 return 3;
             }
-            let before = TAKEN.load(Ordering::SeqCst);
+            // Wait until the monitor has kept the second fire (merged into the waiting event, or not).
+            let before = STAGED.load(Ordering::SeqCst);
             unsafe { libc::close(p[1]) };
             let t0 = std::time::Instant::now();
-            while TAKEN.load(Ordering::SeqCst) == before {
+            while STAGED.load(Ordering::SeqCst) == before {
                 if t0.elapsed() > std::time::Duration::from_secs(3) {
                     return 22;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
             match poll(w, None).as_slice() {
                 [e] if e.flags & EV_EOF != 0 => 0,
                 [_] => 4,
                 _ => 5,
             }
         });
-        assert_eq!(code, 0, "20 no pipe, 22 no reading (the monitor took no second event), 3 not staged, 4 no EV_EOF, 5 not one event");
+        assert_eq!(code, 0, "20 no pipe, 22 no reading (the monitor kept no second event), 3 not staged, 4 no EV_EOF, 5 not one event");
     }
 
     #[test]

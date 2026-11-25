@@ -3308,6 +3308,11 @@ mod tests {
             if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rl) } != 0 {
                 unsafe { libc::_exit(6) };
             }
+            // The dup2's source is a descriptor the test opened, so a dup2 the host were given could not fail on it.
+            let mut src = [-1i32; 2];
+            if unsafe { libc::pipe(src.as_mut_ptr()) } != 0 {
+                unsafe { libc::_exit(4) };
+            }
             let mut code = 0;
             for fd in 3..1024 {
                 if !crate::workq::is_own_kqueue(fd) {
@@ -3315,7 +3320,7 @@ mod tests {
                 }
                 for (n, rewriting) in [(6, false), (399, false), (6, true), (90, false)] {
                     let mut cpu = Cpu::new();
-                    let args = if n == 90 { [0, fd as u64, 0, 0, 0, 0, 0, 0] } else { [fd as u64, 0, 0, 0, 0, 0, 0, 0] };
+                    let args = if n == 90 { [src[0] as u64, fd as u64, 0, 0, 0, 0, 0, 0] } else { [fd as u64, 0, 0, 0, 0, 0, 0, 0] };
                     bsd_gated(&mut cpu, n, args, rewriting);
                     if cpu.cf == 0 || cpu.x[0] != libc::EBADF as u64 || unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
                         code = 3;
