@@ -487,12 +487,16 @@ mod tests {
         }
     }
 
-    /// Four threads of the parent keep starting and ending std threads (std's thread table and its
+    /// Eight threads of the parent keep starting and ending std threads (std's thread table and its
     /// mutex are busy) while this thread forks; each child starts host threads, which must not
-    /// wait on that table. 1,000 forks: the hazard hits about 1 child in a few hundred.
+    /// wait on that table. With four, the control below saw a child fail only when other tests ran
+    /// in the same process: run alone, no child failed in 5 runs of 1,000 forks. With eight, on an
+    /// eight-core machine under Rosetta 2, a child failed within the first few forks in each of 17
+    /// runs alone, each run taking at least the child's 3 s alarm, as a hang would (6 and 12 did as
+    /// well; 16 and 32 less often), so the count is a measured one, not a bound.
     fn churn_and_fork(child: fn() -> i32, forks: usize, stop_at_first_bad: bool) -> usize {
         let stop = Arc::new(AtomicBool::new(false));
-        let churn: Vec<_> = (0..4)
+        let churn: Vec<_> = (0..8)
             .map(|_| {
                 let s = stop.clone();
                 std::thread::spawn(move || {
