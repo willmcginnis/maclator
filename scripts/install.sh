@@ -17,6 +17,8 @@ else
 fi
 gpu/build.sh
 mkdir -p "$PREFIX/gpu"
+# maclator loads it from its own directory (crates/maclator/src/appsandbox.c), so it goes in first
+install -m 755 "$(dirname "$BIN")/libmaclator_appsandbox.dylib" "$PREFIX/"
 install -m 755 "$BIN" "$PREFIX/maclator"
 install -m 755 gpu/out/libmclbridge.dylib gpu/out/libmclmetal.dylib "$PREFIX/gpu/"
 for s in gpu/chromium-gpu scripts/vscode-gpu scripts/etcher-gpu; do install -m 755 "$s" "$PREFIX/$(basename "$s")"; done

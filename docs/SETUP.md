@@ -24,6 +24,7 @@ scripts/install.sh
 ```bash
 cargo build --release                       # on an Intel Mac; add --target x86_64-apple-darwin when cross-compiling
 install -d ~/bin ~/bin/gpu
+install target/release/libmaclator_appsandbox.dylib ~/bin/   # beside the binary (target/x86_64-apple-darwin/release/ when cross-compiling); maclator loads it from its own directory
 install target/release/maclator ~/bin/maclator
 gpu/build.sh                                # builds libmclbridge.dylib (x86-64) + libmclmetal.dylib (arm64 guest shim)
 cp gpu/out/libmclbridge.dylib gpu/out/libmclmetal.dylib ~/bin/gpu/

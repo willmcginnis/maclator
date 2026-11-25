@@ -23,6 +23,7 @@ macro_rules! print {
 }
 
 mod aot;
+mod appsandbox;
 mod bundle;
 mod cache;
 mod commpage;
@@ -434,6 +435,7 @@ fn main() {
         let (lo, hi) = d.vm_range();
         aot::register_dyld(&dyld, d.uuid, lo.wrapping_add(loaded.dyld.slide), hi.wrapping_add(loaded.dyld.slide));
     }
+    appsandbox::guest_starts();
     engine::run_thread(&mut cpu);
     // The main thread ended (pthread_exit on main): wait for other threads.
     while threads::LIVE_THREADS.load(Ordering::SeqCst) > 1 {
