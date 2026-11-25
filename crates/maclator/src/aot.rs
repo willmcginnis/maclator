@@ -64,7 +64,8 @@ pub(crate) fn cache_dir() -> std::path::PathBuf {
     }
 }
 
-/// Owned by `uid` and writable by no group or other: what the cache trusts.
+/// Owned by `uid` and writable by no group or other: what the cache trusts. Only the mode bits are read; an
+/// access control list granting another user write access is not seen here.
 pub(crate) fn owned(md: &std::fs::Metadata, uid: u32) -> bool {
     use std::os::unix::fs::MetadataExt;
     md.uid() == uid && md.mode() & 0o022 == 0
@@ -592,6 +593,16 @@ fn discover(entries: &[u64], start: u64, end: u64, read: &dyn Fn(u64) -> Option<
     out
 }
 
+/// Open `p` for writing as a file only we can write, whatever the umask. `load_file` refuses an AOT file that
+/// group or other can write, so one created 0664 under umask 0002 would be refused at every load and rebuilt at
+/// every exit. A file left at `p` by an earlier process with our pid keeps its old mode, so the mode is set too.
+fn create_private(p: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(p)?;
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(f)
+}
+
 fn build(img: &Image, profile: &BTreeSet<u64>) -> std::io::Result<()> {
     let read = crate::jit::guest_reader();
     let mut blocks: BTreeSet<u64> = profile.clone();
@@ -637,7 +648,7 @@ fn build(img: &Image, profile: &BTreeSet<u64>) -> std::io::Result<()> {
     // Several applications can finish simultaneously. Each builder writes its
     // own temporary file, then atomically replaces the complete cache.
     let tmp = path.with_extension(format!("aot.{}.tmp", std::process::id()));
-    let mut f = std::fs::File::create(&tmp)?;
+    let mut f = create_private(&tmp)?;
     let mut hdr = Vec::new();
     hdr.extend_from_slice(MAGIC);
     hdr.extend_from_slice(&TRANSLATOR_VERSION.to_le_bytes());
@@ -797,6 +808,57 @@ mod owner_tests {
         let p = dir.join("t.aot");
         std::fs::write(&p, b).unwrap();
         p
+    }
+
+    /// A few arm64 `ret`s in this process's own memory: real guest code for build() to translate.
+    pub(super) fn rets() -> Vec<u32> {
+        vec![0xd65f_03c0; 16]
+    }
+
+    #[test]
+    fn an_aot_file_built_under_umask_0002_is_loaded() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        if let Some(marker) = std::env::var_os("MCL_AOT_UMASK") {
+            unsafe { libc::umask(0o002) };
+            let d = cache_dir();
+            let plain = d.join("plain");
+            drop(std::fs::File::create(&plain).unwrap());
+            assert_eq!(mode(&plain), 0o664, "control: the umask applies to a plain create");
+            let code = rets();
+            let (start, end) = (code.as_ptr() as u64, code.as_ptr() as u64 + 4 * code.len() as u64);
+            let img = Image { name: "t".into(), key: "umask-test".into(), start, end, entries: vec![], loaded: false, cached: false };
+            build(&img, &BTreeSet::from([start])).unwrap();
+            let p = file_for(&img, "aot");
+            assert_eq!(mode(&p), 0o600, "the published file is ours alone");
+            assert!(load_file(&p, start, end).unwrap() >= 1, "and it is loaded");
+            // A temporary file left by an earlier process with the same pid.
+            let tmp = d.join("t.aot.1.tmp");
+            std::fs::write(&tmp, b"old").unwrap();
+            chmod(&tmp, 0o666);
+            drop(create_private(&tmp).unwrap());
+            assert_eq!(mode(&tmp), 0o600, "a reused temporary file is made ours alone");
+            std::fs::write(&marker, b"ran").unwrap();
+            return;
+        }
+        let d = std::env::temp_dir().join(format!("mcl-aot-umask-{}", std::process::id()));
+        let cache = d.join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        chmod(&cache, 0o700);
+        let marker = d.join("ran");
+        // The child says it ran its checks: libtest exits 0 having run nothing if the name stops matching.
+        let st = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "aot::owner_tests::an_aot_file_built_under_umask_0002_is_loaded", "--test-threads=1"])
+            .env("MCL_AOT_UMASK", &marker)
+            .env("MACLATOR_CACHE", &cache)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        let ran = std::fs::read(&marker).ok();
+        std::fs::remove_dir_all(&d).ok();
+        assert!(st.success(), "the child under umask 0002: {st}");
+        assert_eq!(ran.as_deref(), Some(&b"ran"[..]), "the child ran its checks");
     }
 
     #[test]
