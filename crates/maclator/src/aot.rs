@@ -115,13 +115,14 @@ fn image_key(kind: &str, uuid: &[u8; 16], path: &str, start: u64) -> String {
 const AOT_KEEP: usize = 1;
 
 /// `key` without its trailing `-<base>`: the part that names the IMAGE rather than the run. Returns `None` when
-/// the key carries no base, and such a key is never retired.
+/// the last field is not hex or what precedes it has no `-` left, and such a key is never retired.
 ///
 /// Every keyed family ends in `-{start:x}` and the hex digits carry no `-`, so the last `-` is the split:
-/// `main-<uuid>-<fnv>-<base>`, `dyld-<uuid>-<fnv>-<base>`, `dsc-<uuid>-<base>`, `lib-<uuid>-<base>`. An
-/// unpatched build's `main-<uuid>-<fnv>` would split into a plausible-looking prefix too -- its fnv is hex as
-/// well -- so the prefix must ITSELF still contain a `-`, which is true of every keyed family above and false of
-/// the two-field unpatched form.
+/// `main-<uuid>-<fnv>-<base>`, `dyld-<uuid>-<fnv>-<base>`, `dsc-<uuid>-<base>`, `lib-<uuid>-<base>`. Keys from
+/// before the base was part of them are not told apart by this split. The shared cache's `dsc-<uuid>` has no `-`
+/// left in its prefix and gets `None`. The main executable's `main-<uuid>-<fnv>` (and dyld's) ends in a hex fnv,
+/// so it splits into `main-<uuid>`; no current key has that prefix, since theirs carry the fnv, so such a file is
+/// never retired either.
 fn identity_prefix(key: &str) -> Option<&str> {
     match key.rsplit_once('-') {
         Some((prefix, base))
@@ -1047,8 +1048,12 @@ mod retire_tests {
             identity_prefix(&format!("lib-{u}-106340000")),
             Some(format!("lib-{u}").as_str())
         );
-        // Two fields only: an unpatched build's key, which names no base and is never retired.
+        // Two fields only: an older build's cache key, which names no base and is never retired.
         assert_eq!(identity_prefix(&format!("dsc-{u}")), None);
+        // An older build's main key splits on its fnv, into a prefix no current key has.
+        let old_main = format!("main-{u}-aabbccddeeff0011");
+        assert_eq!(identity_prefix(&old_main), Some(format!("main-{u}").as_str()));
+        assert_ne!(identity_prefix(&old_main), identity_prefix(&format!("{old_main}-500000000")), "so a current key never retires it");
         // A trailing field that is not hex is not a base.
         assert_eq!(identity_prefix("main-aa-bb-zznothex"), None);
         assert_eq!(identity_prefix("nodashes"), None);
