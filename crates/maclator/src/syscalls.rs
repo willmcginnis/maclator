@@ -2495,6 +2495,21 @@ fn bsd_inner(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
             let r = crate::workq::kevent_redirect(n, &args).unwrap_or_else(|| hostsys::unix(n, &args));
             set_res(cpu, r);
         }
+        // close and close_nocancel of a kqueue of the workqueue emulation's: not the program's descriptor.
+        6 | 399 if crate::workq::is_own_kqueue(args[0] as i32) => set_err(cpu, libc::EBADF as u64),
+        // dup2 onto one of them: the same.
+        90 if crate::workq::is_own_kqueue(args[1] as i32) => set_err(cpu, libc::EBADF as u64),
+        // A closed descriptor's knotes on workloops go with it, as the kernel drops them (dup2 closes its target).
+        6 | 399 | 90 => {
+            let fd = if n == 90 { args[1] } else { args[0] } as i32;
+            let closes = n != 90 || args[0] as i32 != fd;
+            let tokens = if closes { crate::workq::fd_closing(fd) } else { Vec::new() };
+            let r = hostsys::unix(n, &args);
+            if !r.carry {
+                crate::workq::fd_closed(&tokens);
+            }
+            set_res(cpu, r);
+        }
         // bsdthread_ctl(BSDTHREAD_CTL_SET_SELF): thread QoS/priority/voucher. Guest threads are
         // host threads we schedule ourselves, and the host kernel rejects some arm64-era
         // priority combinations with EINVAL (libdispatch then aborts), so just accept it.
@@ -3273,6 +3288,90 @@ pub fn syscall_name(n: u64) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_close_of_a_workqueue_kqueue_is_ebadf_and_the_kqueue_is_kept() {
+        // Natively the workqueue's and the workloops' kqueues are not the program's descriptors: a program that closes
+        // every descriptor it was not given, as it starts, must not close them.
+        let pid = crate::forksafe::fork();
+        assert!(pid >= 0, "fork");
+        if pid == 0 {
+            unsafe { libc::alarm(20) };
+            crate::workq::prepare();
+            // The soft limit raised above the kqueues' numbers, as a program may raise it: there a dup2 the host were
+            // given would succeed, so each answer below is the engine's own.
+            let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } != 0 || rl.rlim_max < 1024 {
+                unsafe { libc::_exit(6) };
+            }
+            rl.rlim_cur = 1024;
+            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rl) } != 0 {
+                unsafe { libc::_exit(6) };
+            }
+            let mut code = 0;
+            for fd in 3..1024 {
+                if !crate::workq::is_own_kqueue(fd) {
+                    continue;
+                }
+                for (n, rewriting) in [(6, false), (399, false), (6, true), (90, false)] {
+                    let mut cpu = Cpu::new();
+                    let args = if n == 90 { [0, fd as u64, 0, 0, 0, 0, 0, 0] } else { [fd as u64, 0, 0, 0, 0, 0, 0, 0] };
+                    bsd_gated(&mut cpu, n, args, rewriting);
+                    if cpu.cf == 0 || cpu.x[0] != libc::EBADF as u64 || unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+                        code = 3;
+                    }
+                }
+                code += 10;
+            }
+            // Control: the program's own descriptor is closed.
+            let mut p = [-1i32; 2];
+            let mut cpu = Cpu::new();
+            if unsafe { libc::pipe(p.as_mut_ptr()) } != 0 {
+                unsafe { libc::_exit(4) };
+            }
+            bsd_gated(&mut cpu, 6, [p[0] as u64, 0, 0, 0, 0, 0, 0, 0], false);
+            if cpu.cf != 0 || unsafe { libc::fcntl(p[0], libc::F_GETFD) } != -1 {
+                code = 5;
+            }
+            unsafe { libc::_exit(code) };
+        }
+        let mut st = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut st, 0) }, pid);
+        assert!(libc::WIFEXITED(st), "killed: {st}");
+        assert_eq!(libc::WEXITSTATUS(st), 20, "20: both kqueues kept and their closes EBADF; 13/23 a close went through or was not EBADF, 10 one kqueue only, 4/5 the control, 6 the soft limit could not be raised (no reading)");
+    }
+
+    #[test]
+    fn a_guest_close_or_dup2_drops_the_descriptors_workloop_knotes() {
+        // Natively the kernel drops a closed descriptor's knotes with their queued events.
+        let pid = crate::forksafe::fork();
+        assert!(pid >= 0, "fork");
+        if pid == 0 {
+            unsafe { libc::alarm(20) };
+            let mut code = 0;
+            for (i, n) in [6u64, 90].into_iter().enumerate() {
+                let mut p = [-1i32; 2];
+                if unsafe { libc::pipe(p.as_mut_ptr()) } != 0 || unsafe { libc::write(p[1], b"x".as_ptr().cast(), 1) } != 1 {
+                    unsafe { libc::_exit(20) };
+                }
+                let wl = 0x7f0e + i as u64;
+                if crate::workq::tests::test_watch_read(wl, p[0]) != 1 {
+                    unsafe { libc::_exit(21) };
+                }
+                let args = if n == 6 { [p[0] as u64, 0, 0, 0, 0, 0, 0, 0] } else { [p[1] as u64, p[0] as u64, 0, 0, 0, 0, 0, 0] };
+                let mut cpu = Cpu::new();
+                bsd_gated(&mut cpu, n, args, false);
+                if cpu.cf != 0 || crate::workq::tests::test_staged(wl) != 0 {
+                    code = 3 + i as i32;
+                }
+            }
+            unsafe { libc::_exit(code) };
+        }
+        let mut st = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut st, 0) }, pid);
+        assert!(libc::WIFEXITED(st), "killed: {st}");
+        assert_eq!(libc::WEXITSTATUS(st), 0, "20/21 no reading (pipe, watch), 3 close left the knote's event, 4 dup2 did");
+    }
 
     /// Guest memory for the tests: `bytes` at address `base`; reads below `limit` succeed.
     fn reader(base: u64, bytes: &[u8], limit: u64) -> impl FnMut(u64, &mut [u8]) -> bool + '_ {

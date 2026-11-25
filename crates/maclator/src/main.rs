@@ -435,6 +435,7 @@ fn main() {
         let (lo, hi) = d.vm_range();
         aot::register_dyld(&dyld, d.uuid, lo.wrapping_add(loaded.dyld.slide), hi.wrapping_add(loaded.dyld.slide));
     }
+    workq::prepare();
     appsandbox::guest_starts();
     engine::run_thread(&mut cpu);
     // The main thread ended (pthread_exit on main): wait for other threads.
