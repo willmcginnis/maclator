@@ -527,14 +527,16 @@ impl SlidId {
     }
 }
 
-/// The chunks a process checks: the first, and `SLID_CHECK_CHUNKS` more spread from `seed`; all of them if that many.
+/// The chunks a process checks: the first, and `SLID_CHECK_CHUNKS` others spread from `seed`; all of them if that many.
+/// The others are taken from chunks 1 to n - 1, so none is chunk 0 again; seed c (0 < c < n) starts at chunk c.
 fn checked_chunks(n: usize, seed: usize) -> Vec<usize> {
     if SLID_CHECK_CHUNKS + 1 >= n {
         return (0..n).collect();
     }
-    let step = (n / SLID_CHECK_CHUNKS).max(1);
+    let rest = n - 1;
+    let step = (rest / SLID_CHECK_CHUNKS).max(1);
     let mut v = vec![0];
-    v.extend((0..SLID_CHECK_CHUNKS).map(|j| (seed + j * step) % n));
+    v.extend((0..SLID_CHECK_CHUNKS).map(|j| 1 + (seed % rest + rest - 1 + j * step) % rest));
     v
 }
 
@@ -1361,6 +1363,24 @@ mod slid_tests {
             seen.extend(v);
         }
         assert_eq!(seen.len(), n, "over many processes every chunk is checked");
+    }
+
+    /// Each process checks as many different chunks as it says, whatever its seed: a seed that is a multiple of the
+    /// chunk count must not check chunk 0 twice.
+    #[test]
+    fn a_sample_never_checks_a_chunk_twice() {
+        for n in [3usize, 4, 5, 64, 100, 1888] {
+            for seed in (0..3 * n).chain([usize::MAX, usize::MAX - 1]) {
+                let v = checked_chunks(n, seed);
+                let set: std::collections::HashSet<_> = v.iter().collect();
+                assert_eq!(set.len(), v.len(), "n {n} seed {seed}: {v:?}");
+                assert!(v.iter().all(|&c| c < n), "n {n} seed {seed}: {v:?}");
+            }
+            // The other tests choose a seed for the chunk it checks: seed c checks chunk c.
+            for c in 1..n {
+                assert_eq!(checked_chunks(n, c)[1], c, "n {n}: seed {c}");
+            }
+        }
     }
 
     #[test]
