@@ -154,6 +154,17 @@ fn host_kqueue() -> Result<i32, i32> {
 /// the errno, and a sandbox that lists the system calls a program may make refuses kqueue with EPERM, which is 1.
 /// Taken as a descriptor, that 1 was duplicated and then closed: the program's standard output.
 fn kqueue_from(r: hostsys::SysResult) -> Result<i32, i32> {
+    kqueue_from_with(r, libc::setrlimit)
+}
+
+/// Said once per process: the soft descriptor limit raised for a kqueue's move could not be put back.
+static SOFT_LIMIT_KEPT_RAISED: AtomicBool = AtomicBool::new(false);
+
+/// `kqueue_from`, with `setrlimit` the call that raises the soft descriptor limit and puts it back.
+fn kqueue_from_with(
+    r: hostsys::SysResult,
+    setrlimit: unsafe extern "C" fn(libc::c_int, *const libc::rlimit) -> libc::c_int,
+) -> Result<i32, i32> {
     if r.carry {
         return Err(r.rax as i32);
     }
@@ -167,11 +178,22 @@ fn kqueue_from(r: hostsys::SysResult) -> Result<i32, i32> {
             // move alone and put back, so the program keeps its limit and never reaches the kqueue's number (natively
             // the kernel's kqueues are no descriptors of the program's).
             let soft = rl.rlim_cur;
-            rl.rlim_cur = rl.rlim_max.min(1024);
-            if libc::setrlimit(libc::RLIMIT_NOFILE, &rl) == 0 {
+            let raised = rl.rlim_max.min(1024);
+            rl.rlim_cur = raised;
+            if setrlimit(libc::RLIMIT_NOFILE, &rl) == 0 {
                 high = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 900);
                 rl.rlim_cur = soft;
-                libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
+                // Lowering the soft limit is always allowed, so this should not fail; if it does, the program keeps
+                // the raised limit, and that is said.
+                if setrlimit(libc::RLIMIT_NOFILE, &rl) != 0 {
+                    let e = *libc::__error();
+                    if !SOFT_LIMIT_KEPT_RAISED.swap(true, Ordering::Relaxed) {
+                        eprintln!(
+                            "maclator: could not put the soft descriptor limit back to {soft} after moving a kqueue \
+                             (errno {e}); it stays at {raised}"
+                        );
+                    }
+                }
             }
         }
         if high >= 0 {
@@ -1792,6 +1814,58 @@ pub(crate) mod tests {
             }
         });
         assert_eq!(code, 0, "20 no reading (limits), 3 the soft limit not put back, 4 kept in the program's range, 5 refused");
+    }
+
+    #[test]
+    fn a_soft_limit_that_could_not_be_put_back_is_said() {
+        // Lowering the soft limit is always allowed, so the restore cannot be made to fail for real: a setrlimit that
+        // takes the raise and refuses the lowering stands in for one that did.
+        unsafe extern "C" fn refuse_lowering(res: libc::c_int, rl: *const libc::rlimit) -> libc::c_int {
+            if (*rl).rlim_cur > 900 {
+                return libc::setrlimit(res, rl);
+            }
+            *libc::__error() = libc::EPERM;
+            -1
+        }
+        let code = in_child(20, || unsafe {
+            let mut rl: libc::rlimit = std::mem::zeroed();
+            libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl);
+            rl.rlim_cur = 256;
+            if rl.rlim_max <= 901 || libc::setrlimit(libc::RLIMIT_NOFILE, &rl) != 0 {
+                return 20;
+            }
+            if SOFT_LIMIT_KEPT_RAISED.load(Ordering::SeqCst) {
+                return 21;
+            }
+            // What it says on standard error, read from a pipe put in its place for the call.
+            let mut e = [-1i32; 2];
+            let saved = libc::dup(2);
+            if libc::pipe(e.as_mut_ptr()) != 0 || saved < 0 || libc::dup2(e[1], 2) != 2 {
+                return 22;
+            }
+            let made = kqueue_from_with(hostsys::unix(SYS_KQUEUE, &[0; 8]), refuse_lowering);
+            libc::dup2(saved, 2);
+            libc::close(e[1]);
+            let mut buf = [0u8; 512];
+            let n = libc::read(e[0], buf.as_mut_ptr().cast(), buf.len());
+            let said = String::from_utf8_lossy(&buf[..n.max(0) as usize]).into_owned();
+            match made {
+                Ok(fd) if fd >= 900 => {}
+                Ok(_) => return 4,
+                Err(_) => return 5,
+            }
+            let raised = rl.rlim_max.min(1024);
+            let mut now: libc::rlimit = std::mem::zeroed();
+            libc::getrlimit(libc::RLIMIT_NOFILE, &mut now);
+            if !said.contains("back to 256") || !said.contains(&format!("it stays at {raised}")) {
+                3
+            } else if now.rlim_cur != raised {
+                6
+            } else {
+                0
+            }
+        });
+        assert_eq!(code, 0, "20/21/22 no reading (limits, said already, or the pipe), 3 the failed restore not said with its limits, 4 kept low, 5 refused, 6 the limit kept is not the raised one");
     }
 
     #[test]
