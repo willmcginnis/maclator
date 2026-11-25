@@ -700,11 +700,15 @@ fn stamp_ok(stamp: &std::path::Path, want: &[u8], uid: u32) -> bool {
 
 /// Leave `want` as the stamp, written under a temporary name and renamed into place, so no reader sees part of one and
 /// a symlink at its name is replaced, not followed. Called with the file's `BuildLock` held, so no other process is
-/// writing one, and a temporary file left by one that died is ours to replace.
+/// writing this one, and a temporary file left by one that died is ours to replace. The temporary name is the stamp's
+/// own name with `-tmp` added: one store can hold a slid file's stamp and refusal beside a reader's own stamp and
+/// refusal of root's file of the same name, which are written under another lock.
 fn stamp_write(stamp: &std::path::Path, want: &[u8]) -> bool {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    let tmp = stamp.with_extension("stamp-tmp");
+    let mut tmp = stamp.as_os_str().to_owned();
+    tmp.push("-tmp");
+    let tmp = std::path::PathBuf::from(tmp);
     let _ = std::fs::remove_file(&tmp);
     // Readable by all, writable by its owner alone (set past the umask): in root's shared store every uid reads root's
     // stamp, or it would check every chunk at every start. A per-user store's directory is made 0700 when created.
@@ -2274,6 +2278,27 @@ mod slid_tests {
         let file = std::fs::read(&path).unwrap();
         assert_eq!(std::fs::read(&stamp).unwrap(), stamp_bytes(BOOT, &std::fs::metadata(&path).unwrap(), &file[file.len() - 32..]), "it names the boot, the file and its record");
         assert!(!path.with_extension("stamp-tmp").exists(), "the temporary file is renamed, not left");
+    }
+
+    /// Each kind of stamp is written under a temporary name of its own: a writer of one kind, under its lock, must
+    /// never remove another kind's temporary file, which a writer under another lock may be writing at that moment.
+    #[test]
+    fn each_kind_of_stamp_has_a_temporary_name_of_its_own() {
+        let d = dir("stamp-tmp");
+        let kinds = ["stamp", "refused", "shared-stamp", "shared-refused"];
+        for k in kinds {
+            let others: Vec<_> = kinds.iter().filter(|&&o| o != k).map(|o| (*o, d.join(format!("x.{o}-tmp")))).collect();
+            for (o, tmp) in &others {
+                std::fs::write(tmp, o).unwrap(); // another writer's, part-way through
+            }
+            assert!(stamp_write(&d.join(format!("x.{k}")), k.as_bytes()), "{k} is written");
+            assert_eq!(std::fs::read(d.join(format!("x.{k}"))).ok().as_deref(), Some(k.as_bytes()), "{k} holds what was written");
+            assert!(!d.join(format!("x.{k}-tmp")).exists(), "{k}'s own temporary file is renamed, not left");
+            for (o, tmp) in &others {
+                assert_eq!(std::fs::read(tmp).ok().as_deref(), Some(o.as_bytes()), "writing {k} left the {o} writer's temporary file alone");
+                std::fs::remove_file(tmp).unwrap();
+            }
+        }
     }
 
     #[test]
