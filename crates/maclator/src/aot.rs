@@ -187,9 +187,20 @@ fn retire_superseded(dir: &std::path::Path, keep_key: &str, site: &str) -> usize
     others.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     let mut retired = 0;
     for (_, stem) in others.into_iter().skip(AOT_KEEP.saturating_sub(1)) {
-        let _ = std::fs::remove_file(dir.join(format!("{stem}.aot")));
-        let _ = std::fs::remove_file(dir.join(format!("{stem}.profile")));
-        retired += 1;
+        // A key counts as retired when a file of it was removed and none is left; a file already gone is not an error.
+        let (mut removed, mut left) = (false, false);
+        for ext in ["aot", "profile"] {
+            let p = dir.join(format!("{stem}.{ext}"));
+            match std::fs::remove_file(&p) {
+                Ok(()) => removed = true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    left = true;
+                    eprintln!("[maclator] aot: could not retire {}: {e}", p.display());
+                }
+            }
+        }
+        retired += (removed && !left) as usize;
     }
     // Say so, in the engine's own shape, and name the call site. Ungated, so a daemon emits it too -- but only
     // when something really went, so a run whose base did not move stays silent. One line per slid exec at most.
@@ -496,8 +507,11 @@ pub fn save_profile() {
             for pc in &prof {
                 buf.extend_from_slice(&pc.to_le_bytes());
             }
-            let _ = std::fs::write(&path, buf);
-            retire_superseded(&cache_dir(), &img.key, "save_profile");
+            // Retire what this image left at other bases only once its new profile is written: under disk pressure
+            // the write can fail, and the old entry is then all there is.
+            if std::fs::write(&path, buf).is_ok() {
+                retire_superseded(&cache_dir(), &img.key, "save_profile");
+            }
             rebuild.push((img.clone(), prof));
         }
     }
@@ -1064,6 +1078,85 @@ mod retire_tests {
         assert_eq!(retire_superseded(&d, &keep, "test"), 0, "the second run has nothing left to do");
         assert_eq!(count(&d), 2);
         std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A key whose files could not be removed is not counted as retired.
+    #[test]
+    fn only_entries_really_removed_are_counted() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: root may unlink in a read-only directory");
+            return;
+        }
+        let d = tmpdir("unlink");
+        let ident = "main-0123456789abcdef0123456789abcdef-aabbccddeeff0011";
+        put(&d, &format!("{ident}-500000000"), 16);
+        let keep = format!("{ident}-500004000");
+        put(&d, &keep, 16);
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let n = retire_superseded(&d, &keep, "test");
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(n, 0, "nothing could be removed, so nothing was retired");
+        assert_eq!(count(&d), 4, "and every file is still there");
+        assert_eq!(retire_superseded(&d, &keep, "test"), 1, "control: in a writable store it is retired");
+        assert_eq!(count(&d), 2);
+        // One of the pair already gone still retires the key: the other file was removed.
+        put(&d, &format!("{ident}-500008000"), 16);
+        std::fs::remove_file(d.join(format!("{ident}-500008000.profile"))).unwrap();
+        assert_eq!(retire_superseded(&d, &keep, "test"), 1, "a key with one file left is retired by removing it");
+        // One file removed and the other refused: the key is not retired, since its .aot is still there.
+        let stuck = format!("{ident}-50000c000");
+        std::fs::create_dir(d.join(format!("{stuck}.aot"))).unwrap();
+        std::fs::write(d.join(format!("{stuck}.aot/x")), b"x").unwrap();
+        std::fs::write(d.join(format!("{stuck}.profile")), [0u8; 8]).unwrap();
+        assert_eq!(retire_superseded(&d, &keep, "test"), 0, "an .aot that could not be removed leaves the key unretired");
+        assert!(d.join(format!("{stuck}.aot")).exists() && !d.join(format!("{stuck}.profile")).exists(), "control: only the profile went");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// When a new profile cannot be written, save_profile retires nothing, so with AOT building off the image's entry
+    /// at its old base is kept. Run in a child, since save_profile saves once per process and reads the cache
+    /// directory from the environment.
+    #[test]
+    fn a_profile_that_could_not_be_written_retires_nothing() {
+        let ident_of = |start: u64| image_key("main", &[3u8; 16], "/bin/x", start);
+        let (old, new) = (ident_of(0x5_0000_0000), ident_of(0x5_0000_4000));
+        if std::env::var_os("MCL_AOT_PROFILE").is_some() {
+            let d = std::path::PathBuf::from(std::env::var_os("MACLATOR_CACHE").unwrap());
+            register_main("/bin/x", [3u8; 16], 0x5_0000_4000, 0x5_0000_8000, vec![0x5_0000_4000]);
+            save_profile();
+            assert!(d.join(format!("{old}.aot")).exists() && d.join(format!("{old}.profile")).exists(), "the old entry is kept");
+            std::fs::write(std::env::var_os("MCL_AOT_PROFILE").unwrap(), b"ran").unwrap();
+            return;
+        }
+        let run = |d: &std::path::Path| {
+            let marker = d.join("ran");
+            let st = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "aot::retire_tests::a_profile_that_could_not_be_written_retires_nothing", "--test-threads=1"])
+                .env("MCL_AOT_PROFILE", &marker)
+                .env("MACLATOR_CACHE", d)
+                .env("MACLATOR_NO_AOT_BUILD", "1")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            (st.success(), std::fs::read(&marker).ok().as_deref() == Some(&b"ran"[..]))
+        };
+        use std::os::unix::fs::PermissionsExt;
+        // The new profile's path is a directory, so its write fails while the store itself stays writable.
+        let d = tmpdir("profile");
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
+        put(&d, &old, 16);
+        std::fs::create_dir(d.join(format!("{new}.profile"))).unwrap();
+        assert_eq!(run(&d), (true, true), "the child kept the old entry and ran its checks");
+        // Control: with the new profile writable, the same run retires the old entry.
+        let c = tmpdir("profile-control");
+        std::fs::set_permissions(&c, std::fs::Permissions::from_mode(0o700)).unwrap();
+        put(&c, &old, 16);
+        assert_eq!(run(&c).0, false, "control: a written profile retires the old entry, so the child's check fails");
+        assert!(c.join(format!("{new}.profile")).exists() && !c.join(format!("{old}.aot")).exists(), "control: retired");
+        std::fs::remove_dir_all(&d).ok();
+        std::fs::remove_dir_all(&c).ok();
     }
 
     /// An empty or missing directory is not an error.
