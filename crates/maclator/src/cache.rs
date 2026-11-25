@@ -672,6 +672,17 @@ fn refuse(path: &std::path::Path, why: &str) -> Slid {
     Slid::Refused
 }
 
+/// Not allowed to look at or read `path` (a sandbox, or a store we may not build in): said once per process, not once
+/// per mapping, and without "remove it to rebuild": a process denied the lookup cannot remove it, and one denied the
+/// read usually may not either.
+fn may_not_read(path: &std::path::Path, e: &std::io::Error) -> Slid {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("maclator: may not read {} ({e}); sliding privately", path.display());
+    }
+    Slid::Refused
+}
+
 /// What a stamp says: this boot's session, the slid file it vouches for as `fstat` saw it when every chunk was checked
 /// (its inode, size and modification time, which any write through the filesystem moves), and the file's record.
 fn stamp_bytes(boot: &[u8], md: &std::fs::Metadata, sum: &[u8]) -> Vec<u8> {
@@ -754,6 +765,7 @@ unsafe fn map_slid_side(addr: u64, size: usize, prot: i32, path: &std::path::Pat
     let Some(dir) = path.parent() else { return Slid::Refused };
     match std::fs::symlink_metadata(dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Slid::Missing,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return may_not_read(dir, &e),
         Ok(md) if md.is_dir() && crate::aot::owned(&md, uid) => {}
         _ if DIR_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) => return Slid::Refused,
         _ => return refuse(dir, "not a directory of ours that only we can write"),
@@ -761,15 +773,7 @@ unsafe fn map_slid_side(addr: u64, size: usize, prot: i32, path: &std::path::Pat
     let f = match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Slid::Missing,
-        // Not allowed to read it (a sandbox, or a store we may not build in): said once per process, not once per
-        // mapping, and without "remove it to rebuild", which such a process cannot do.
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            static OPEN_DENIED_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-            if !OPEN_DENIED_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                eprintln!("maclator: may not read {} ({e}); sliding privately", path.display());
-            }
-            return Slid::Refused;
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return may_not_read(path, &e),
         Err(e) => return refuse(path, &e.to_string()),
     };
     let md = match f.metadata() {
@@ -2261,6 +2265,44 @@ mod slid_tests {
         assert_eq!(blind, SlidStore { dir: shared.join("sub"), owner: me, build: false, own: None }, "a store it may not look at is not swapped for its HOME");
         assert_eq!(try_share(SHARE_AT + 7 * SHARE_STEP, &blind, &f, &m, &info), (false, vec![0u8; 16]), "and it slides privately");
         assert!(!d.join("home").exists(), "with no copy under its HOME");
+    }
+
+    /// A process denied even the lookup of the store's directory says so once, as "may not read", for all its
+    /// mappings, and not "remove it to rebuild", which it cannot do. What a process prints is its own, so the
+    /// mappings run in a child of its own (MCL_SLID_DENIED), whose standard error is read here.
+    #[test]
+    fn a_denied_lookup_of_the_store_is_said_once_as_may_not_read() {
+        if std::env::var_os("MCL_SLID_DENIED").is_some() {
+            let (data, info) = fixture();
+            let d = dir("denied");
+            let (f, m) = source_with_uuid(&d, &data);
+            let shared = d.join("shared");
+            std::fs::create_dir(&shared).unwrap();
+            let _back = Mode(shared.clone(), 0o755);
+            chmod(&shared, 0o000);
+            let blind = slid_store_in(Some(&shared.join("sub")), uid(), d.join("home"), uid() + 1);
+            for k in [20, 21] {
+                assert_eq!(try_share(SHARE_AT + k * SHARE_STEP, &blind, &f, &m, &info), (false, vec![0u8; 16]), "it slides privately");
+            }
+            eprintln!("MCL_SLID_DENIED ran");
+            return;
+        }
+        if uid() == 0 {
+            eprintln!("as root the lookup is not denied, so this is not tested here");
+            return;
+        }
+        let me = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(&me)
+            .args(["--exact", "cache::slid_tests::a_denied_lookup_of_the_store_is_said_once_as_may_not_read", "--nocapture", "--test-threads=1"])
+            .env("MCL_SLID_DENIED", "1")
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "the child: {}\n{err}", out.status);
+        // libtest exits 0 having run nothing if the name stops matching.
+        assert!(err.contains("MCL_SLID_DENIED ran"), "the child ran its mappings:\n{err}");
+        assert_eq!(err.matches("maclator: may not read ").count(), 1, "said once for two mappings:\n{err}");
+        assert!(!err.contains("remove it to rebuild"), "and not as a file to remove:\n{err}");
     }
 
     /// The stamp tests change chunk 1, which the sample of seed 2 (chunks 0 and 2) skips.
