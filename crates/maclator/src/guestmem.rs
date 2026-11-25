@@ -2,7 +2,12 @@
 //! emulation must return EFAULT rather than crash on bad pointers).
 
 extern "C" {
-    fn mach_task_self() -> u32;
+    /// libSystem's name for this task's control port: mach_init sets it from task_self_trap() when the process
+    /// starts, and again in the child of a libc fork (the only fork this runtime makes), so it is declared mut and
+    /// read afresh each time. The kernel pins the send right under this name, so the task cannot give up its last
+    /// reference: mach_port_deallocate, mach_port_mod_refs and mach_port_destroy all answer
+    /// KERN_INVALID_CAPABILITY for it instead.
+    static mut mach_task_self_: u32;
     fn mach_vm_read_overwrite(task: u32, addr: u64, size: u64, data: u64, outsize: *mut u64) -> i32;
     fn mach_vm_write(task: u32, addr: u64, data: u64, cnt: u32) -> i32;
     // The fallback below. mach_vm_copy has the KERNEL copy between two addresses in this task, so a
@@ -10,11 +15,22 @@ extern "C" {
     fn mach_vm_copy(task: u32, src: u64, size: u64, dst: u64) -> i32;
 }
 
+/// The task port every read and write of guest memory goes through: libSystem's cached name, the one native code
+/// uses through the mach_task_self() macro. Not libSystem's mach_task_self() FUNCTION, which is task_self_trap():
+/// that asks the kernel for another send right on every call, adds a user reference each time (so a busy process
+/// pins the count at its ceiling of 65535), and answers whatever the kernel copies out at that moment, so every
+/// access would depend on that copyout succeeding and naming the control port. A process has been seen where it
+/// did not: every read through the function's answer failed with MACH_SEND_INVALID_DEST while reads through this
+/// name, in the same process at the same moment, succeeded.
+fn task() -> u32 {
+    unsafe { std::ptr::addr_of!(mach_task_self_).read_volatile() }
+}
+
 pub fn read(addr: u64, buf: &mut [u8]) -> bool {
     let mut out = 0u64;
     let kr = match test_refusal(addr, buf.len()) {
         Some(kr) => kr,
-        None => unsafe { mach_vm_read_overwrite(mach_task_self(), addr, buf.len() as u64, buf.as_mut_ptr() as u64, &mut out) },
+        None => unsafe { mach_vm_read_overwrite(task(), addr, buf.len() as u64, buf.as_mut_ptr() as u64, &mut out) },
     };
     finish_read(kr, addr, buf.len())
 }
@@ -143,7 +159,7 @@ fn copy_copyout(addr: u64, data: &[u8]) -> bool {
     let len = data.len() as u64;
     let src = data.as_ptr() as u64;
     note_source(src);
-    let kr = unsafe { mach_vm_copy(mach_task_self(), src, len, addr) };
+    let kr = unsafe { mach_vm_copy(task(), src, len, addr) };
     kr == 0 // only a whole copy is a success; a failure may already have written a prefix
 }
 
@@ -170,7 +186,7 @@ pub(crate) fn finish_write(kr: i32, addr: u64, data: &[u8]) -> bool {
 /// is still a plain failure, so a bad out-pointer is still EFAULT from the kernel's own validation and
 /// still never a crash. KERN_DENIED alone takes mach_vm_copy.
 pub fn write(addr: u64, data: &[u8]) -> bool {
-    let kr = unsafe { mach_vm_write(mach_task_self(), addr, data.as_ptr() as u64, data.len() as u32) };
+    let kr = unsafe { mach_vm_write(task(), addr, data.as_ptr() as u64, data.len() as u32) };
     finish_write(kr, addr, data)
 }
 
@@ -558,8 +574,8 @@ mod patch_y_copy_copyout_tests {
         let mut alias = 0u64;
         let (mut cur, mut max) = (0i32, 0i32);
         let kr = unsafe {
-            mach_vm_remap(super::mach_task_self(), &mut alias, n as u64, 0, VM_FLAGS_ANYWHERE,
-                          super::mach_task_self(), d, 0, &mut cur, &mut max, VM_INHERIT_SHARE)
+            mach_vm_remap(super::task(), &mut alias, n as u64, 0, VM_FLAGS_ANYWHERE,
+                          super::task(), d, 0, &mut cur, &mut max, VM_INHERIT_SHARE)
         };
         assert!(kr == 0, "the test could not make a shared alias of its destination (kr {kr})");
         let src = unsafe { std::slice::from_raw_parts(s as *const u8, n) };
@@ -571,5 +587,167 @@ mod patch_y_copy_copyout_tests {
             libc::munmap(d as *mut libc::c_void, n);
             libc::munmap(s as *mut libc::c_void, n);
         }
+    }
+}
+
+#[cfg(test)]
+mod task_port_tests {
+    //! The task port the reader and writer use. The checks that need a process of their own (a fresh count of the
+    //! task name's user references, or a task that has tried to give its name up) re-run this test binary for one
+    //! ignored test, which does its work only when MCL_GUESTMEM_CHILD names it, and the parent checks its marker.
+    use super::{finish_write, read, task, write};
+
+    const MACH_PORT_RIGHT_SEND: u32 = 0;
+    const KERN_INVALID_CAPABILITY: i32 = 20;
+    /// KERN_DENIED, which sends a write through the mach_vm_copy fallback (finish_write).
+    const KERN_DENIED: i32 = 53;
+
+    extern "C" {
+        fn pid_for_task(task: u32, pid: *mut i32) -> i32;
+        fn mach_port_get_refs(task: u32, name: u32, right: u32, refs: *mut u32) -> i32;
+        fn mach_port_deallocate(task: u32, name: u32) -> i32;
+        fn mach_port_mod_refs(task: u32, name: u32, right: u32, delta: i32) -> i32;
+        fn mach_port_destroy(task: u32, name: u32) -> i32;
+    }
+
+    fn send_refs(t: u32) -> u32 {
+        let mut r = 0u32;
+        let kr = unsafe { mach_port_get_refs(t, t, MACH_PORT_RIGHT_SEND, &mut r) };
+        assert!(kr == 0, "control: mach_port_get_refs on the task's own name answered {kr}");
+        r
+    }
+
+    /// Run `name` (an ignored test of this module) alone in a fresh copy of this test binary; its stdout.
+    fn in_a_fresh_process(name: &str) -> String {
+        let exe = std::env::current_exe().expect("the test binary's path");
+        let full = format!("guestmem::task_port_tests::{name}");
+        let out = std::process::Command::new(exe)
+            .args([full.as_str(), "--exact", "--ignored", "--nocapture", "--test-threads=1"])
+            .env("MCL_GUESTMEM_CHILD", name)
+            .output()
+            .expect("the child test process could not be started");
+        let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "the child {name} failed ({}):\n{text}", out.status);
+        assert!(text.contains(&format!("GUESTMEM-CHILD {name} ok")), "the child {name} never reached its end (it did not run?):\n{text}");
+        text
+    }
+
+    fn is_child(name: &str) -> bool {
+        std::env::var("MCL_GUESTMEM_CHILD").map(|v| v == name).unwrap_or(false)
+    }
+
+    #[test]
+    fn reads_and_writes_take_no_new_right_to_the_task() {
+        let out = in_a_fresh_process("child_counts_the_task_names_references");
+        assert!(out.contains("TASK-REFS"), "the child printed no counts:\n{out}");
+    }
+
+    #[test]
+    #[ignore = "run by reads_and_writes_take_no_new_right_to_the_task, in a process of its own"]
+    fn child_counts_the_task_names_references() {
+        if !is_child("child_counts_the_task_names_references") {
+            return;
+        }
+        // libSystem's mach_task_self() function would add one user reference per call (it is task_self_trap), so
+        // 1000 each of reads, writes and mach_vm_copy fallbacks through it would raise the count by about 3000,
+        // which is why the count is read in a fresh process, far from the ceiling of 65535 where the kernel stops
+        // counting.
+        let t = task();
+        let before = send_refs(t);
+        assert!(before < 60000, "precondition: the task name's references ({before}) are too near their ceiling to count");
+        let mut word = 0u64;
+        let p = &mut word as *mut u64 as u64;
+        let mut b = [0u8; 8];
+        // Each round writes two values no earlier step wrote, so a write or a copy that does nothing is seen.
+        for i in 0..1000u64 {
+            let (w, c) = (3 * i + 1, 3 * i + 2);
+            assert!(write(p, &w.to_le_bytes()), "control: write {i} of a stack word failed");
+            assert!(read(p, &mut b) && u64::from_le_bytes(b) == w, "control: read {i} of a stack word did not see the write");
+            assert!(finish_write(KERN_DENIED, p, &c.to_le_bytes()) && word == c, "control: mach_vm_copy fallback {i} failed");
+        }
+        let after = send_refs(t);
+        println!("TASK-REFS before={before} after={after}");
+        assert!(after == before, "1000 reads, writes and copies changed the task name's user references from {before} to {after}: guest memory took or gave up references to the task's name");
+        println!("GUESTMEM-CHILD child_counts_the_task_names_references ok");
+    }
+
+    #[test]
+    fn the_task_cannot_give_up_the_name_guest_memory_goes_through() {
+        let out = in_a_fresh_process("child_tries_to_release_its_task_name");
+        assert!(out.contains("RELEASE"), "the child printed no release results:\n{out}");
+    }
+
+    #[test]
+    #[ignore = "run by the_task_cannot_give_up_the_name_guest_memory_goes_through, in a process of its own"]
+    fn child_tries_to_release_its_task_name() {
+        if !is_child("child_tries_to_release_its_task_name") {
+            return;
+        }
+        // What a guest that over-releases its own task port can do: every reference one at a time, then all at
+        // once, then the name itself. The kernel pins this right, so the last of each is refused, and the reader
+        // and writer still work. On a kernel that let a task release it, this is the test that would show it.
+        // (Each refusal may also raise a guard exception, by the task's policy: none, a crash report, or the end of
+        // the process, which this test then reports as a failed child.)
+        let t = task();
+        let refs = send_refs(t);
+        let mut ok = 0u32;
+        let mut last = 0i32;
+        for _ in 0..refs + 3 {
+            last = unsafe { mach_port_deallocate(t, t) };
+            if last != 0 {
+                break;
+            }
+            ok += 1;
+        }
+        let left = send_refs(t);
+        let all = unsafe { mach_port_mod_refs(t, t, MACH_PORT_RIGHT_SEND, -(left as i32)) };
+        let destroy = unsafe { mach_port_destroy(t, t) };
+        println!("RELEASE refs={refs} deallocated={ok} then kr={last}; mod_refs -{left} kr={all}; destroy kr={destroy}");
+        assert!(left == 1 && last == KERN_INVALID_CAPABILITY && all == KERN_INVALID_CAPABILITY && destroy == KERN_INVALID_CAPABILITY,
+                "the kernel let the task release its own task name, or refused an earlier step (left {left}; kr {last}, {all}, {destroy}): the reader's name is not protected as expected");
+        let mut word = 0x0123_4567_89ab_cdefu64;
+        let p = &mut word as *mut u64 as u64;
+        let mut b = [0u8; 8];
+        assert!(read(p, &mut b) && u64::from_le_bytes(b) == 0x0123_4567_89ab_cdef, "after the release attempts a read of a stack word failed");
+        assert!(write(p, &7u64.to_le_bytes()) && word == 7, "after the release attempts a write of a stack word failed");
+        println!("GUESTMEM-CHILD child_tries_to_release_its_task_name ok");
+    }
+
+    #[test]
+    fn a_child_of_libc_fork_reads_and_writes_through_its_own_task_name() {
+        // The runtime forks only through libc's fork, whose child handler sets mach_task_self_ again, so the
+        // child's reads go through the child's own task, and the name must name it (pid_for_task). The child's
+        // name is usually the same number as the parent's (the control port is the first right in a new space),
+        // so this cannot tell a stale copy of that number from a fresh read; it shows the child works. The child
+        // runs only Mach calls on its own stack words (a failed read would also format a warning), and an alarm
+        // ends a child that hangs.
+        let parent = task();
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "control: fork failed");
+        if pid == 0 {
+            unsafe { libc::alarm(10) };
+            let mut owner = 0i32;
+            let names_me = unsafe { pid_for_task(task(), &mut owner) } == 0 && owner == unsafe { libc::getpid() };
+            let mut word = 41u64;
+            let p = &mut word as *mut u64 as u64;
+            let mut b = [0u8; 8];
+            let read_ok = read(p, &mut b) && u64::from_le_bytes(b) == 41;
+            let write_ok = write(p, &42u64.to_le_bytes()) && word == 42;
+            let code = if !names_me { 4 } else if !read_ok { 3 } else if !write_ok { 2 } else { 0 };
+            unsafe { libc::_exit(code) };
+        }
+        let mut status = 0;
+        let w = loop {
+            let r = unsafe { libc::waitpid(pid, &mut status, 0) };
+            if r != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                break r;
+            }
+        };
+        assert!(w == pid, "control: waitpid");
+        assert!(libc::WIFEXITED(status), "the forked child did not exit normally (an alarm ends a hang): status {status:#x}");
+        let code = libc::WEXITSTATUS(status);
+        let what = match code { 4 => "task name does not name the child", 3 => "read", _ => "write" };
+        assert!(code == 0, "in a child of libc fork the {what} failed (exit {code})");
+        assert!(task() == parent, "control: the parent's task name changed across the fork");
     }
 }
