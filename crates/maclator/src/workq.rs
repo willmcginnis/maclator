@@ -129,19 +129,67 @@ impl Kev {
     }
 }
 
-fn host_kqueue() -> i32 {
-    let r = hostsys::unix(SYS_KQUEUE, &[0; 8]);
+/// A new host kqueue, or the errno the host refused it with.
+fn host_kqueue() -> Result<i32, i32> {
+    kqueue_from(hostsys::unix(SYS_KQUEUE, &[0; 8]))
+}
+
+/// `host_kqueue` from the host's answer `r`. A refusal is never taken for a descriptor: with the carry set, rax holds
+/// the errno, and a sandbox that lists the system calls a program may make refuses kqueue with EPERM, which is 1.
+/// Taken as a descriptor, that 1 was duplicated and then closed: the program's standard output.
+fn kqueue_from(r: hostsys::SysResult) -> Result<i32, i32> {
+    if r.carry {
+        return Err(r.rax as i32);
+    }
     let fd = r.rax as i32;
     // Move it out of the guest's usual descriptor range.
     unsafe {
-        let high = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 900);
+        let mut high = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 900);
+        let mut rl: libc::rlimit = std::mem::zeroed();
+        if high < 0 && libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0 && rl.rlim_cur <= 900 && rl.rlim_max > 901 {
+            // The soft descriptor limit is below that range (256 for most processes launchd starts): raised for the
+            // move alone and put back, so the program keeps its limit and never reaches the kqueue's number (natively
+            // the kernel's kqueues are no descriptors of the program's).
+            let soft = rl.rlim_cur;
+            rl.rlim_cur = rl.rlim_max.min(1024);
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &rl) == 0 {
+                high = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 900);
+                rl.rlim_cur = soft;
+                libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
+            }
+        }
         if high >= 0 {
             libc::close(fd);
-            return high;
+            return Ok(high);
         }
+        // Where even the hard limit does not reach that range: kept low, but never in a standard descriptor's place
+        // (one the program closed would be found open), and still not inherited by an exec.
+        if fd <= 2 {
+            let moved = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3);
+            let e = *libc::__error();
+            libc::close(fd);
+            return if moved >= 0 { Ok(moved) } else { Err(e) };
+        }
+        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
     }
-    fd
+    Ok(fd)
 }
+
+/// What a monitor does when its wait on its kqueue failed (EINTR excepted): say so once per process, then pause before
+/// waiting again, 1 ms after the first failure in a row and twice as long after each, at most about a second. It does
+/// not park: nothing would wake it, since the errors its own kqueue can give (a descriptor the guest closed or
+/// replaced, a shortage) end on their own or never. So a wait that keeps failing costs one call a second, not a core.
+fn pause_after_failed_wait(which: &str, warned: &std::sync::atomic::AtomicBool, errno: i32, fails: &mut u32) {
+    if !warned.swap(true, Ordering::Relaxed) {
+        eprintln!("maclator: the {which} monitor's wait on its kqueue failed (errno {errno}); waiting again after a pause");
+    }
+    std::thread::sleep(std::time::Duration::from_millis(1 << (*fails).min(10)));
+    *fails = fails.saturating_add(1);
+}
+
+/// What the guest is answered when a host kqueue the emulation needs could not be made: the kernel's answer when it
+/// cannot allocate one.
+const NO_KQUEUE: i64 = libc::ENOMEM as i64;
 
 fn kevent_qos(kq: i32, changes: u64, nchanges: u64, out: u64, nout: u64, data: u64, avail: u64, flags: u64) -> hostsys::SysResult {
     hostsys::unix(SYS_KEVENT_QOS, &[kq as u64, changes, nchanges, out, nout, data, avail, flags])
@@ -419,22 +467,26 @@ static ANON_KQ: AtomicI32 = AtomicI32::new(-1);
 /// a std Once cannot be reset in a fork child.
 pub(crate) static ANON_START: FMutex<()> = FMutex::new(());
 
-fn anon_kq() -> i32 {
+/// The workq kqueue, made and its monitor started on first use; or the errno to answer the guest.
+fn anon_kq() -> Result<i32, i64> {
     let kq = ANON_KQ.load(Ordering::SeqCst);
     if kq >= 0 {
-        return kq;
+        return Ok(kq);
     }
     let _g = ANON_START.lock().unwrap();
     if ANON_KQ.load(Ordering::SeqCst) < 0 {
-        ANON_KQ.store(host_kqueue(), Ordering::SeqCst);
+        let kq = host_kqueue().map_err(|_| NO_KQUEUE)?;
+        ANON_KQ.store(kq, Ordering::SeqCst);
         crate::forksync::spawn_host("maclator-workq", 2 << 20, Box::new(anon_monitor)).unwrap();
     }
-    ANON_KQ.load(Ordering::SeqCst)
+    Ok(ANON_KQ.load(Ordering::SeqCst))
 }
 
 /// Deliver each event fired on the workq kqueue to a worker thread.
 fn anon_monitor() {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let kq = ANON_KQ.load(Ordering::SeqCst);
+    let mut fails = 0;
     loop {
         let Some(w) = take_worker() else {
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -445,8 +497,12 @@ fn anon_monitor() {
         let r = kevent_qos(kq, 0, 0, list, 1, w.data_buf(), &mut avail as *mut u64 as u64, KEVENT_FLAG_STACK_DATA);
         if r.carry || r.rax == 0 {
             IDLE.lock().unwrap().push(w);
+            if r.carry && r.rax as i32 != libc::EINTR {
+                pause_after_failed_wait("workqueue", &WARNED, r.rax as i32, &mut fails);
+            }
             continue;
         }
+        fails = 0;
         let mut ev = unsafe { Kev::read(list) };
         restore_anon_qos(&mut ev);
         unsafe { ev.write(list) };
@@ -615,29 +671,37 @@ fn with_wl<R>(f: impl FnOnce(&mut WlState) -> R) -> R {
     f(st)
 }
 
-fn wl_mon_kq() -> i32 {
+/// The workloop monitor's kqueue, made and the monitor started on first use; or the errno to answer the guest.
+fn wl_mon_kq() -> Result<i32, i64> {
     let kq = WL_MON_KQ.load(Ordering::SeqCst);
     if kq >= 0 {
-        return kq;
+        return Ok(kq);
     }
     let _g = WL_MON_START.lock().unwrap();
     if WL_MON_KQ.load(Ordering::SeqCst) < 0 {
-        WL_MON_KQ.store(host_kqueue(), Ordering::SeqCst);
+        let kq = host_kqueue().map_err(|_| NO_KQUEUE)?;
+        WL_MON_KQ.store(kq, Ordering::SeqCst);
         crate::forksync::spawn_host("maclator-workloops", 2 << 20, Box::new(wl_monitor)).unwrap();
     }
-    WL_MON_KQ.load(Ordering::SeqCst)
+    Ok(WL_MON_KQ.load(Ordering::SeqCst))
 }
 
 /// Watch every workloop's host kqueue; when one has pending events and no
 /// servicer, bind a worker to it.
 fn wl_monitor() {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let mon = WL_MON_KQ.load(Ordering::SeqCst);
     let mut buf = [0u8; 72 * 8];
+    let mut fails = 0;
     loop {
         let r = kevent_qos(mon, 0, 0, buf.as_mut_ptr() as u64, 8, 0, 0, 0);
         if r.carry {
+            if r.rax as i32 != libc::EINTR {
+                pause_after_failed_wait("workloop", &WARNED, r.rax as i32, &mut fails);
+            }
             continue;
         }
+        fails = 0;
         for i in 0..r.rax {
             let ev = unsafe { Kev::read(buf.as_ptr() as u64 + i * KEV_SIZE) };
             let wl_id = ev.udata;
@@ -652,13 +716,14 @@ fn wl_monitor() {
     }
 }
 
-/// Arm the monitor to watch `fd` (one-shot until re-enabled).
-fn watch_wl_kq(fd: i32, wl_id: u64, first: bool) {
-    let mon = wl_mon_kq();
+/// Arm the monitor to watch `fd` (one-shot until re-enabled). False when the monitor's kqueue could not be made, or it
+/// refused the watch.
+fn watch_wl_kq(fd: i32, wl_id: u64, first: bool) -> bool {
+    let Ok(mon) = wl_mon_kq() else { return false };
     let ev = Kev { ident: fd as u64, filter: EVFILT_READ, flags: if first { EV_ADD | EV_DISPATCH } else { EV_ENABLE | EV_DISPATCH }, udata: wl_id, ..Default::default() };
     let mut b = [0u8; 72];
     unsafe { ev.write(b.as_mut_ptr() as u64) };
-    kevent_qos(mon, b.as_ptr() as u64, 1, 0, 0, 0, 0, KEVENT_FLAG_IMMEDIATE);
+    !kevent_qos(mon, b.as_ptr() as u64, 1, 0, 0, 0, 0, KEVENT_FLAG_IMMEDIATE).carry
 }
 
 /// If the workloop needs a servicer and has none, bind a worker to it.
@@ -735,7 +800,13 @@ fn wl_apply(st: &mut WlState, wl_id: u64, ke: &Kev) -> i64 {
         let first = {
             let wl = st.loops.entry(wl_id).or_insert_with(|| Workloop { kq: -1, ..Default::default() });
             if wl.kq < 0 {
-                wl.kq = host_kqueue();
+                // Watched before it is kept, so a workloop never keeps a kqueue nobody watches.
+                let Ok(kq) = host_kqueue() else { return NO_KQUEUE };
+                if !watch_wl_kq(kq, wl_id, true) {
+                    unsafe { libc::close(kq) };
+                    return NO_KQUEUE;
+                }
+                wl.kq = kq;
                 true
             } else {
                 false
@@ -744,7 +815,6 @@ fn wl_apply(st: &mut WlState, wl_id: u64, ke: &Kev) -> i64 {
         let fd = st.loops[&wl_id].kq;
         if first {
             st.by_fd.insert(fd, wl_id);
-            watch_wl_kq(fd, wl_id, true);
         }
         let mut b = [0u8; 72];
         let mut out = [0u8; 72];
@@ -911,9 +981,13 @@ pub fn kevent_redirect(n: u64, args: &[u64; 8]) -> Option<hostsys::SysResult> {
             if flags & KEVENT_FLAG_WORKQ == 0 {
                 return None;
             }
+            let kq = match anon_kq() {
+                Ok(kq) => kq,
+                Err(e) => return Some(hostsys::SysResult { rax: e as u64, rdx: 0, carry: true }),
+            };
             record_anon_qos(args[1], args[2]);
             let mut a = *args;
-            a[0] = anon_kq() as u64;
+            a[0] = kq as u64;
             a[7] = flags & !(KEVENT_FLAG_WORKQ | KEVENT_FLAG_PARKING);
             if a[4] == 0 {
                 a[7] |= KEVENT_FLAG_IMMEDIATE;
@@ -932,7 +1006,8 @@ pub fn kernreturn(_cpu: &mut Cpu, a: &[u64; 8]) -> Result<u64, u64> {
         WQOPS_QUEUE_REQTHREADS | WQOPS_QUEUE_REQTHREADS2 => {
             let count = requested_thread_count(a)?;
             let pp = a[3];
-            anon_kq();
+            // Starts the workq kqueue's monitor. The threads asked for need no kqueue, so they start without one.
+            let _ = anon_kq();
             for _ in 0..count {
                 let Some(w) = take_worker() else { return Err(libc::EAGAIN as u64) };
                 let mut flags = flags_for(pp);
@@ -950,9 +1025,10 @@ pub fn kernreturn(_cpu: &mut Cpu, a: &[u64; 8]) -> Result<u64, u64> {
         }
         WQOPS_THREAD_KEVENT_RETURN | WQOPS_THREAD_RETURN => {
             if a[0] == WQOPS_THREAD_KEVENT_RETURN && a[1] != 0 && (a[2] as i64) > 0 {
-                let kq = anon_kq();
-                record_anon_qos(a[1], a[2]);
-                kevent_qos(kq, a[1], a[2], 0, 0, 0, 0, KEVENT_FLAG_IMMEDIATE);
+                if let Ok(kq) = anon_kq() {
+                    record_anon_qos(a[1], a[2]);
+                    kevent_qos(kq, a[1], a[2], 0, 0, 0, 0, KEVENT_FLAG_IMMEDIATE);
+                }
             }
             park();
             Ok(0)
@@ -1019,6 +1095,180 @@ fn requested_thread_count(a: &[u64; 8]) -> Result<u64, u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    extern "C" {
+        fn sandbox_init_with_parameters(profile: *const libc::c_char, flags: u64, parameters: *const *const libc::c_char, errorbuf: *mut *mut libc::c_char) -> libc::c_int;
+    }
+
+    /// Run `f` in a child forked with every translator lock held (forksafe::fork), and return the code it exits with.
+    /// The child is killed after `secs`.
+    fn in_child(secs: u32, f: impl FnOnce() -> i32) -> i32 {
+        let pid = crate::forksafe::fork();
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe { libc::alarm(secs) };
+            let code = f();
+            unsafe { libc::_exit(code) };
+        }
+        let mut st = 0;
+        loop {
+            let r = unsafe { libc::waitpid(pid, &mut st, 0) };
+            if r == pid {
+                break;
+            }
+            assert!(r < 0 && unsafe { *libc::__error() } == libc::EINTR, "waitpid");
+        }
+        if libc::WIFEXITED(st) {
+            libc::WEXITSTATUS(st)
+        } else {
+            1000 + libc::WTERMSIG(st)
+        }
+    }
+
+    /// In a child: apply a sandbox that allows everything but the kqueue system call, as Apple's profiles that list
+    /// their calls do (WindowManager's allows the kevent calls and not kqueue). 0 when it is in force: the host then
+    /// refuses kqueue with EPERM.
+    fn refuse_kqueue_from_now_on() -> i32 {
+        let p = c"(version 2)(allow default)(deny syscall-unix (syscall-number SYS_kqueue))";
+        let mut err: *mut libc::c_char = std::ptr::null_mut();
+        if unsafe { sandbox_init_with_parameters(p.as_ptr(), 0, std::ptr::null(), &mut err) } != 0 {
+            return 20;
+        }
+        let r = hostsys::unix(SYS_KQUEUE, &[0; 8]);
+        if !r.carry || r.rax != libc::EPERM as u64 {
+            if !r.carry {
+                unsafe { libc::close(r.rax as i32) };
+            }
+            return 21;
+        }
+        0
+    }
+
+    fn fd_open(fd: i32) -> bool {
+        unsafe { libc::fcntl(fd, libc::F_GETFD) != -1 }
+    }
+
+    #[test]
+    fn a_refused_kqueue_is_an_errno_and_standard_output_stays_open() {
+        let code = in_child(20, || match kqueue_from(hostsys::SysResult { rax: libc::EPERM as u64, rdx: 0, carry: true }) {
+            Err(e) if e == libc::EPERM && fd_open(1) => 0,
+            Err(_) => 2,
+            Ok(_) if !fd_open(1) => 3,
+            Ok(_) => 4,
+        });
+        assert_eq!(code, 0, "2 another errno, 3 a descriptor and standard output closed, 4 a descriptor");
+    }
+
+    #[test]
+    fn a_kqueue_the_host_made_is_kept_and_not_inherited_by_an_exec() {
+        let r = hostsys::unix(SYS_KQUEUE, &[0; 8]);
+        assert!(!r.carry, "control: the host makes a kqueue here");
+        let fd = kqueue_from(r).expect("a kqueue");
+        let mut b = [0u8; 72];
+        let probe = kevent_qos(fd, 0, 0, b.as_mut_ptr() as u64, 1, 0, 0, KEVENT_FLAG_IMMEDIATE);
+        let cloexec = unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC != 0;
+        unsafe { libc::close(fd) };
+        assert!(!probe.carry && probe.rax == 0, "not a working kqueue: {probe:?}");
+        assert!(cloexec, "an exec would inherit it");
+    }
+
+    #[test]
+    fn a_kqueue_is_put_above_a_low_soft_limit_and_the_limit_kept() {
+        // As launchd starts most processes: a soft descriptor limit of 256, a high hard one.
+        let code = in_child(20, || unsafe {
+            let mut rl: libc::rlimit = std::mem::zeroed();
+            libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl);
+            rl.rlim_cur = 256;
+            if rl.rlim_max <= 901 || libc::setrlimit(libc::RLIMIT_NOFILE, &rl) != 0 {
+                return 20;
+            }
+            let fd = kqueue_from(hostsys::unix(SYS_KQUEUE, &[0; 8]));
+            let mut now: libc::rlimit = std::mem::zeroed();
+            libc::getrlimit(libc::RLIMIT_NOFILE, &mut now);
+            match fd {
+                Ok(fd) if fd >= 900 && now.rlim_cur == 256 => 0,
+                Ok(_) if now.rlim_cur != 256 => 3,
+                Ok(_) => 4,
+                Err(_) => 5,
+            }
+        });
+        assert_eq!(code, 0, "20 no reading (limits), 3 the soft limit not put back, 4 kept in the program's range, 5 refused");
+    }
+
+    #[test]
+    fn a_kqueue_kept_low_never_takes_a_standard_descriptors_place() {
+        // A descriptor limit below the high range, and standard output closed by the program: the kqueue made in its
+        // place is moved, and the program still finds it closed.
+        let code = in_child(20, || unsafe {
+            // Both limits low, so the high range cannot be reached at all.
+            let rl = libc::rlimit { rlim_cur: 64, rlim_max: 64 };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &rl) != 0 || libc::close(1) != 0 {
+                return 20;
+            }
+            match kqueue_from(hostsys::unix(SYS_KQUEUE, &[0; 8])) {
+                Ok(fd) if fd > 2 && !fd_open(1) => 0,
+                Ok(_) => 3,
+                Err(_) => 4,
+            }
+        });
+        assert_eq!(code, 0, "20 no reading (limit or close), 3 kept in standard output's place, 4 refused");
+    }
+
+    #[test]
+    fn under_a_sandbox_that_refuses_kqueue_a_workloop_knote_is_enomem_and_stdout_stays_open() {
+        let code = in_child(20, || {
+            let c = refuse_kqueue_from_now_on();
+            if c != 0 {
+                return c;
+            }
+            let mut st = WlState { loops: HashMap::new(), sync: HashMap::new(), by_fd: HashMap::new() };
+            let ke = Kev { ident: 0x5157, filter: EVFILT_USER_, flags: EV_ADD, ..Default::default() };
+            let e = wl_apply(&mut st, 0x6b71, &ke);
+            let w = kevent_redirect(SYS_KEVENT_QOS, &[u64::MAX, 0, 0, 0, 0, 0, 0, KEVENT_FLAG_WORKQ | KEVENT_FLAG_IMMEDIATE]);
+            match (e == NO_KQUEUE, w.is_some_and(|r| r.carry && r.rax as i64 == NO_KQUEUE), fd_open(1)) {
+                (true, true, true) => 0,
+                (_, _, false) => 3,
+                (false, _, _) => 4,
+                (true, false, _) => 5,
+            }
+        });
+        assert_eq!(code, 0, "20 the sandbox was not applied, 21 it did not refuse kqueue (no reading), 3 standard output closed, 4 the knote not ENOMEM, 5 the workq kevent not ENOMEM");
+    }
+
+    /// The workloop monitor, started on `fd` in place of its kqueue.
+    fn start_wl_monitor_on(fd: i32) {
+        WL_MON_KQ.store(fd, Ordering::SeqCst);
+        crate::forksync::spawn_host("test-monitor", 2 << 20, Box::new(wl_monitor)).unwrap();
+    }
+
+    fn cpu_ms() -> u64 {
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
+        let ms = |t: libc::timeval| t.tv_sec as u64 * 1000 + t.tv_usec as u64 / 1000;
+        ms(ru.ru_utime) + ms(ru.ru_stime)
+    }
+
+    #[test]
+    fn a_monitor_whose_wait_fails_pauses_rather_than_spin() {
+        // A pipe is no kqueue: every wait on it fails with EBADF, as on a kqueue descriptor the guest closed and
+        // reused. 600 ms of a spinning monitor costs about as much processor time; a pausing one a few milliseconds.
+        let code = in_child(30, || {
+            let mut p = [-1i32; 2];
+            if unsafe { libc::pipe(p.as_mut_ptr()) } != 0 {
+                return 20;
+            }
+            let before = cpu_ms();
+            start_wl_monitor_on(p[0]);
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            let used = cpu_ms() - before;
+            if used < 150 {
+                0
+            } else {
+                3
+            }
+        });
+        assert_eq!(code, 0, "3: the monitor used 150 ms or more of processor time in 600 ms");
+    }
 
     #[test]
     fn libpthread_thread_request_uses_affinity_argument() {
