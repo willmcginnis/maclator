@@ -173,6 +173,106 @@ fn exit_in_child() {
     }
     note_translated(start + 4 * (block % CODE_INSNS as u64));
     save_profile();
+    // MCL_ONCE_EXEC: not an exit but an exec, as execve saves the profile first: this binary again, for the test it
+    // names, in its after-exec role (the kept re-launch execs the translator itself, as this does).
+    if let Ok(test) = std::env::var("MCL_ONCE_EXEC") {
+        exec_self(&test);
+    }
+}
+
+/// Exec this test binary for `test` in its after-exec role, with a descriptor of a file in the store left open across
+/// the exec on purpose (no close-on-exec): the control that the new program's listing sees what an exec hands it.
+fn exec_self(test: &str) -> ! {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::IntoRawFd;
+    let store = std::path::PathBuf::from(std::env::var_os("MACLATOR_CACHE").unwrap());
+    let canary = std::fs::OpenOptions::new().read(true).write(true).create(true).open(store.join("exec-canary")).unwrap().into_raw_fd();
+    assert_eq!(unsafe { libc::fcntl(canary, libc::F_SETFD, 0) }, 0, "the canary is kept open across the exec");
+    let exe = std::ffi::CString::new(std::env::current_exe().unwrap().as_os_str().as_bytes()).unwrap();
+    let argv: Vec<std::ffi::CString> =
+        [exe.to_bytes(), b"--exact", test.as_bytes(), b"--test-threads=1", b"--nocapture"].iter().map(|a| std::ffi::CString::new(*a).unwrap()).collect();
+    let envp: Vec<std::ffi::CString> = std::env::vars_os()
+        .filter(|(k, _)| k != "MCL_ONCE_ROLE")
+        .map(|(k, v)| [k.as_bytes(), b"=", v.as_bytes()].concat())
+        .chain([b"MCL_ONCE_ROLE=after-exec".to_vec()])
+        .map(|e| std::ffi::CString::new(e).unwrap())
+        .collect();
+    let mut av: Vec<*const libc::c_char> = argv.iter().map(|a| a.as_ptr()).collect();
+    av.push(std::ptr::null());
+    let mut ev: Vec<*const libc::c_char> = envp.iter().map(|e| e.as_ptr()).collect();
+    ev.push(std::ptr::null());
+    unsafe { libc::execve(exe.as_ptr(), av.as_ptr(), ev.as_ptr()) };
+    panic!("the exec failed: {}", std::io::Error::last_os_error());
+}
+
+/// The files of the store this process has open: the name of each open descriptor's file (by device and inode) among
+/// the store's files.
+fn store_fds(store: &std::path::Path) -> Vec<String> {
+    use std::os::unix::fs::MetadataExt;
+    let files: Vec<((u64, u64), String)> = std::fs::read_dir(store)
+        .unwrap()
+        .flatten()
+        .filter_map(|e| Some(((e.metadata().ok()?.dev() as u64, e.metadata().ok()?.ino()), e.file_name().to_string_lossy().into_owned())))
+        .collect();
+    let fds: Vec<i32> = std::fs::read_dir("/dev/fd").unwrap().flatten().filter_map(|e| e.file_name().to_str()?.parse().ok()).collect();
+    let mut names = Vec::new();
+    for fd in fds {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut st) } != 0 {
+            continue;
+        }
+        if let Some((_, name)) = files.iter().find(|(id, _)| *id == (st.st_dev as u64, st.st_ino)) {
+            names.push(name.clone());
+        }
+    }
+    names.sort();
+    names
+}
+
+/// The pid of the process holding a lock on `path` (another one: a process's own locks do not show), "none", or
+/// "missing" when there is no such file.
+fn lock_holder(path: &std::path::Path) -> String {
+    use std::os::unix::io::AsRawFd;
+    let Ok(f) = std::fs::OpenOptions::new().read(true).write(true).open(path) else { return "missing".into() };
+    let mut l = whole_file_lock(libc::F_WRLCK as libc::c_short);
+    assert_eq!(unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETLK, &mut l) }, 0, "F_GETLK on {path:?}");
+    if l.l_type == libc::F_UNLCK as libc::c_short {
+        "none".into()
+    } else {
+        l.l_pid.to_string()
+    }
+}
+
+/// The program an exit exec'd into: what of the store it was handed, in MCL_ONCE_EXEC_REPORT (the store's files it has
+/// open; who holds the record of the image asked for before the exec, once that image's builder, if it forked one, is
+/// building), then its own exit, of that image again (as dyld and the shared cache are the same images in the new
+/// program) and of MCL_ONCE_EXEC_TAG2 (its own main image).
+fn after_exec_in_child() {
+    let store = std::path::PathBuf::from(std::env::var_os("MACLATOR_CACHE").unwrap());
+    let tag: u8 = std::env::var("MCL_ONCE_TAG").unwrap().parse().unwrap();
+    let mut report: String = store_fds(&store).iter().map(|n| format!("fd {n}\n")).collect();
+    if std::env::var_os("MACLATOR_AOT_SYNC").is_none() {
+        let log = std::env::var_os("MCL_TEST_BUILD_LOG").unwrap();
+        let building = || std::fs::read_to_string(&log).unwrap_or_default().lines().any(|l| l.starts_with("start ") && l.contains(&format!(" key={} ", key_of(tag))));
+        let end = Instant::now() + Duration::from_secs(30);
+        while !building() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    let record = store.join(format!("{}.{}.build", identity_prefix(&key_of(tag)).unwrap(), format_tag()));
+    report.push_str(&format!("holder {}\nself {}\n", lock_holder(&record), std::process::id()));
+    std::fs::write(std::env::var_os("MCL_ONCE_EXEC_REPORT").unwrap(), report).unwrap();
+    let (start, end) = map_code(CODE_AT);
+    register_main(&path_of(tag), uuid(tag), start, end, vec![start]);
+    if let Ok(tag2) = std::env::var("MCL_ONCE_EXEC_TAG2") {
+        let tag2: u8 = tag2.parse().unwrap();
+        let (s2, e2) = map_code(CODE_AT_SLID);
+        register_main(&path_of(tag2), uuid(tag2), s2, e2, vec![s2]);
+        note_translated(s2);
+    }
+    ensure_loaded();
+    note_translated(start + 4);
+    save_profile();
 }
 
 /// A test's own store and build log, and the builders it started: any still running when the test ends are killed.
@@ -225,6 +325,9 @@ impl Run {
             .env_remove("MCL_ONCE_LIB_AGAIN")
             .env_remove("MCL_ONCE_TAG2")
             .env_remove("MCL_TEST_NO_ROOM_IF")
+            .env_remove("MCL_ONCE_EXEC")
+            .env_remove("MCL_ONCE_EXEC_REPORT")
+            .env_remove("MCL_ONCE_EXEC_TAG2")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped());
         for (k, v) in env {
@@ -310,9 +413,16 @@ fn gone(pid: u32, secs: u64) -> bool {
 
 macro_rules! child_or {
     () => {
-        if std::env::var("MCL_ONCE_ROLE").as_deref() == Ok("exit") {
-            exit_in_child();
-            return;
+        match std::env::var("MCL_ONCE_ROLE").as_deref() {
+            Ok("exit") => {
+                exit_in_child();
+                return;
+            }
+            Ok("after-exec") => {
+                after_exec_in_child();
+                return;
+            }
+            _ => {}
         }
     };
 }
@@ -592,4 +702,70 @@ fn room_is_asked_about_before_each_image() {
     r.exit(94, 0, &[("MACLATOR_AOT_SYNC", "1"), ("MCL_ONCE_TAG2", "95"), ("MCL_TEST_NO_ROOM_IF", first.to_str().unwrap())]);
     assert!(first.exists(), "control: the first image was built: {:?}", r.builds());
     assert!(!second.exists(), "the second was built though the first took the room: {:?}", r.builds());
+}
+
+/// The report an after-exec program wrote: the store's files it had open, who held the record, and its pid.
+fn exec_report(path: &std::path::Path) -> (Vec<String>, String, u32) {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("no report from the program the exit exec'd ({e})"));
+    let fds = text.lines().filter_map(|l| l.strip_prefix("fd ")).map(str::to_string).collect();
+    let holder = text.lines().find_map(|l| l.strip_prefix("holder ")).unwrap().to_string();
+    let me = text.lines().find_map(|l| l.strip_prefix("self ")).unwrap().parse().unwrap();
+    (fds, holder, me)
+}
+
+/// Run one exit that execs (MCL_ONCE_EXEC) to the end of the program it exec'd, which keeps its pid; that pid.
+fn exec_exit(r: &Run, tag: u8, env: &[(&str, &str)]) -> u32 {
+    let child = r.exit_cmd(tag, 0, env).spawn().unwrap();
+    let pid = child.id();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "the exit or the program it exec'd failed: {}: {}", out.status, String::from_utf8_lossy(&out.stderr));
+    pid
+}
+
+/// Across an exec: the image the exiting program asked to build stays held by its builder (the lock is the builder's,
+/// not the program's, so the exec neither carries it nor drops it), the new program is handed no file of the store, and
+/// it asks for the same image no second time while its own image is asked for once. The exec is of this binary itself,
+/// as the kept re-launch execs the translator; a program the kernel starts is a new image of the translator too.
+#[test]
+fn an_exec_hands_the_new_program_nothing_of_the_store_and_asks_once() {
+    child_or!();
+    const NAME: &str = "aot::once_tests::an_exec_hands_the_new_program_nothing_of_the_store_and_asks_once";
+    let r = Run::new(NAME, "exec");
+    // An earlier exit, so the store has a builder lock that the exiting program opens before its exec (queue_full).
+    r.exit(43, 0, &[("MACLATOR_AOT_SYNC", "1")]);
+    assert_eq!(r.count("end"), 1, "the earlier exit built its image: {:?}", r.builds());
+    let report = r.dir.join("exec-report.txt");
+    let env = [("MCL_ONCE_EXEC", NAME), ("MCL_ONCE_EXEC_REPORT", report.to_str().unwrap()), ("MCL_ONCE_EXEC_TAG2", "45"), ("MCL_TEST_BUILD_DELAY_MS", "3000")];
+    let pid = exec_exit(&r, 44, &env);
+    let (fds, holder, me) = exec_report(&report);
+    assert_eq!(me, pid, "the report is the exec'd program's, in the exit's own process");
+    assert_eq!(fds, vec!["exec-canary".to_string()], "the store's files open in the program the exit exec'd (the canary, kept open on purpose, is the control)");
+    let builder = r.builds().iter().find(|b| b.0 == "start" && b.2 == key_of(44)).map(|b| b.1);
+    assert!(builder.is_some_and(|b| b != pid), "the image asked for before the exec was built by a builder of its own: {:?}", r.builds());
+    assert_eq!(holder, builder.unwrap().to_string(), "who held the image's record while the exec'd program ran (the builder forked before the exec)");
+    assert!(r.wait_for("end", 3, 60), "the builds ended within 60 s: {:?}", r.builds());
+    let starts = |key: &str| r.builds().iter().filter(|b| b.0 == "start" && b.2 == key).count();
+    assert_eq!(starts(&key_of(44)), 1, "builds of the image asked for before the exec and seen again after it: {:?}", r.builds());
+    assert_eq!(starts(&image_key("main", &uuid(45), &path_of(45), CODE_AT_SLID)), 1, "builds of the exec'd program's own image: {:?}", r.builds());
+    assert_eq!(r.count("forked"), 2, "one builder for the exit's exec and one for the exec'd program's exit: {:?}", r.builds());
+}
+
+/// A build made in the exiting process itself (MACLATOR_AOT_SYNC) lets go of every lock and file of the store before
+/// the exec: the new program holds none, and its own image is built once.
+#[test]
+fn a_build_in_the_exiting_process_holds_nothing_across_its_exec() {
+    child_or!();
+    const NAME: &str = "aot::once_tests::a_build_in_the_exiting_process_holds_nothing_across_its_exec";
+    let r = Run::new(NAME, "execsync");
+    let report = r.dir.join("exec-report.txt");
+    let env = [("MACLATOR_AOT_SYNC", "1"), ("MCL_ONCE_EXEC", NAME), ("MCL_ONCE_EXEC_REPORT", report.to_str().unwrap()), ("MCL_ONCE_EXEC_TAG2", "47")];
+    let pid = exec_exit(&r, 46, &env);
+    let (fds, holder, me) = exec_report(&report);
+    assert_eq!(me, pid, "the report is the exec'd program's, in the exit's own process");
+    assert_eq!(fds, vec!["exec-canary".to_string()], "the store's files open in the program the exit exec'd (the canary, kept open on purpose, is the control)");
+    assert_eq!(holder, "none", "who held the record of the image built before the exec, after it");
+    let by = |key: &str| r.builds().iter().filter(|b| b.0 == "start" && b.2 == key).map(|b| b.1).collect::<Vec<_>>();
+    assert_eq!(by(&key_of(46)), vec![pid], "builds of the image built before the exec (and loaded after it): {:?}", r.builds());
+    assert_eq!(by(&image_key("main", &uuid(47), &path_of(47), CODE_AT_SLID)), vec![pid], "builds of the exec'd program's own image: {:?}", r.builds());
+    assert_eq!(r.count("forked"), 0, "nothing forked in-process builds");
 }
