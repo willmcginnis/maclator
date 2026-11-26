@@ -159,6 +159,10 @@ fn kept_reason(rewriting: bool, cwd_record: bool, sandboxed: bool, gpu: bool) ->
 ///   caller named, so a program that finds files from its argv[0]'s directories would find others);
 /// - a path that does not resolve, whose last name is a link, or whose last name is spelled otherwise than its file's
 ///   (the child's argv[0], and the directory it names, would be another's: /usr/bin/view to vim, say);
+/// - a directory in the path, other than a link, spelled otherwise than its own name (another case, or another Unicode
+///   form, on a volume that ignores them: the child's argv[0] would carry the directory's own spelling). A link to a
+///   directory is followed as the kernel follows it, which gives the real path as argv[0] (accepted, as for a program
+///   launchd starts);
 /// - a set-user-ID or set-group-ID program (the kernel would start the child, and with it the runtime and the engine,
 ///   with the file's owner or group; the re-launch execs the translator file, so the child runs with the caller's, as
 ///   before);
@@ -188,6 +192,19 @@ fn kept_for_call(n: u64, args: &[u64; 8], path: &str) -> Option<&'static str> {
     let spelled = std::path::Path::new(path).file_name();
     if spelled.is_none() || spelled != real.file_name() {
         return Some("its last name is spelled otherwise than its file's");
+    }
+    let names: Vec<&str> = path.split('/').skip(1).collect();
+    let mut dir = String::new();
+    for name in &names[..names.len() - 1] {
+        dir.push('/');
+        dir.push_str(name);
+        if std::fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_symlink()) {
+            continue;
+        }
+        let Ok(own) = std::fs::canonicalize(&dir) else { return Some("the path does not resolve") };
+        if own.file_name() != Some(std::ffi::OsStr::new(name)) {
+            return Some("a directory in it is spelled otherwise than its own name");
+        }
     }
     let Ok(meta) = std::fs::metadata(&real) else { return Some("the path does not resolve") };
     if std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o6000 != 0 {
@@ -850,6 +867,16 @@ int main(int argc, char **argv) {
             for n in both {
                 assert_eq!(call(n, &p, &[b"x" as &[u8]], 0), Some("a set-user-ID or set-group-ID program"), "{name} #{n}");
             }
+        }
+        // A directory in the path spelled otherwise than its own name (another case), either call: a copy of the child in
+        // sub/ (the directory the links above were made in), by sub/ and by SUB/. On a case-sensitive volume SUB/ names
+        // nothing.
+        let copy = file(&f, "sub/arm64-copy", &thin);
+        assert_eq!(call(SYS_EXECVE, &copy, &[b"x" as &[u8]], 0), None, "the control: the copy by its own spelling");
+        let other = format!("{here}/SUB/arm64-copy");
+        let want = if std::fs::metadata(&other).is_ok() { "a directory in it is spelled otherwise than its own name" } else { "the path does not resolve" };
+        for n in both {
+            assert_eq!(call(n, &other, &[b"x" as &[u8]], 0), Some(want), "SUB/ #{n}");
         }
     }
 
