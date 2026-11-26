@@ -371,6 +371,9 @@ fn main() {
         }
         spawn::configure(fwd);
     }
+    // Before the program runs: whether the kernel started this process as the program, which decides how its children
+    // are started (spawn.rs).
+    let kernel_route = spawn::detect_route();
 
     if print_plan || dry_run {
         emit_plan(&Plan {
@@ -396,6 +399,9 @@ fn main() {
     }
     if std::env::var_os("MACLATOR_TRACE_FILE").is_some() {
         trace_to_file(unsafe { libc::getpid() });
+    }
+    if syscalls::TRACE.load(Ordering::Relaxed) {
+        eprintln!("[spawn] started by the kernel as the program: {}", if kernel_route { "yes" } else { "no" });
     }
     if gpu_active {
         // The host frameworks must be initialised before the guest runs: CoreFoundation's

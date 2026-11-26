@@ -75,7 +75,7 @@ fn cstr(b: &[u8]) -> String {
 /// FEAT_PAuth_LR (`pacibsppc`), and it must not win just for not being arm64e.
 /// The subtype is the low 24 bits: the top 8 are capability flags
 /// (`CPU_SUBTYPE_MASK`), so 0x100 or 0x102 is an unknown subtype, not ALL or arm64e.
-fn slice_rank(subtype: u32, prefer_e: bool) -> (bool, bool) {
+pub(crate) fn slice_rank(subtype: u32, prefer_e: bool) -> (bool, bool) {
     let s = subtype & !CPU_SUBTYPE_MASK;
     let known = s <= CPU_SUBTYPE_ARM64E; // 0 ALL, 1 V8, 2 arm64e
     (!known, (s == CPU_SUBTYPE_ARM64E) != prefer_e)
