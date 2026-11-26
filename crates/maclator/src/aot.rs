@@ -692,7 +692,6 @@ fn build(img: &Image, profile: &BTreeSet<u64>) -> std::io::Result<bool> {
     // Several applications can finish simultaneously. Each builder writes its
     // own temporary file, then atomically replaces the complete cache.
     let tmp = path.with_extension(format!("aot.{}.tmp", std::process::id()));
-    let mut f = create_private(&tmp)?;
     let mut hdr = Vec::new();
     hdr.extend_from_slice(MAGIC);
     hdr.extend_from_slice(&TRANSLATOR_VERSION.to_le_bytes());
@@ -706,10 +705,19 @@ fn build(img: &Image, profile: &BTreeSet<u64>) -> std::io::Result<bool> {
     while hdr.len() < code_offset(index.len()) {
         hdr.push(0);
     }
-    f.write_all(&hdr)?;
-    f.write_all(&code)?;
-    drop(f);
-    std::fs::rename(tmp, path)?;
+    let published = create_private(&tmp).and_then(|mut f| {
+        f.write_all(&hdr)?;
+        f.write_all(&code)?;
+        drop(f);
+        std::fs::rename(&tmp, &path)
+    });
+    // A file that was not published is removed: nothing else ever removes a temporary file (retirement leaves every
+    // write in flight alone), so one left by a failed write or rename stayed in the store for good, and on a full
+    // volume it was often a large part of a translation.
+    if let Err(e) = published {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     // This image is now cached for the base it is loaded at; anything cached for a base it will never be at
     // again is dead weight. Without this the store grows by one entry per slid exec, for ever.
     retire_superseded(&cache_dir(), &img.key, "build");
@@ -964,6 +972,45 @@ mod owner_tests {
         let ran = std::fs::read(&marker).ok();
         std::fs::remove_dir_all(&d).ok();
         assert!(st.success(), "the child under umask 0002: {st}");
+        assert_eq!(ran.as_deref(), Some(&b"ran"[..]), "the child ran its checks");
+    }
+
+    /// A build whose file cannot be published leaves no temporary file in the store. Run in a child, as the store is
+    /// read from the environment.
+    #[test]
+    fn a_build_that_cannot_publish_leaves_no_temporary_file() {
+        if let Some(marker) = std::env::var_os("MCL_AOT_TMP_LEFT") {
+            let code = rets();
+            let (start, end) = (code.as_ptr() as u64, code.as_ptr() as u64 + 4 * code.len() as u64);
+            let img = Image { name: "t".into(), key: "tmp-left".into(), start, end, entries: vec![], loaded: false, cached: false };
+            let d = cache_dir();
+            // The published file's name is taken by a directory, so the rename that would publish it fails.
+            std::fs::create_dir_all(d.join("tmp-left.aot").join("x")).unwrap();
+            assert!(build(&img, &BTreeSet::from([start])).is_err(), "the rename onto a directory fails");
+            let left: Vec<String> = std::fs::read_dir(&d)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".tmp"))
+                .collect();
+            assert!(left.is_empty(), "temporary files left in the store: {left:?}");
+            std::fs::write(&marker, b"ran").unwrap();
+            return;
+        }
+        let d = std::env::temp_dir().join(format!("mcl-aot-tmp-left-{}", std::process::id()));
+        let cache = d.join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        chmod(&cache, 0o700);
+        let marker = d.join("ran");
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "aot::owner_tests::a_build_that_cannot_publish_leaves_no_temporary_file", "--test-threads=1", "--nocapture"])
+            .env("MCL_AOT_TMP_LEFT", &marker)
+            .env("MACLATOR_CACHE", &cache)
+            .output()
+            .unwrap();
+        let ran = std::fs::read(&marker).ok();
+        std::fs::remove_dir_all(&d).ok();
+        assert!(out.status.success(), "the child: {}: {}", out.status, String::from_utf8_lossy(&out.stderr));
         assert_eq!(ran.as_deref(), Some(&b"ran"[..]), "the child ran its checks");
     }
 
