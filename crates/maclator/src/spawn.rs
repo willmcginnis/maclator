@@ -199,6 +199,8 @@ fn kept_for_call(n: u64, args: &[u64; 8], path: &str) -> Option<&'static str> {
         return Some("a file the kernel does not exec");
     }
     let Ok(slices) = crate::slices::read_slices(&mut f) else { return Some("a file the kernel does not exec") };
+    // Closed before open_arm64 opens the file again: a caller with one descriptor free must get the same answer.
+    drop(f);
     let arm64: Vec<u32> = slices.iter().filter(|s| s.cpu == CPU_TYPE_ARM64).map(|s| s.subtype).collect();
     let kernel = arm64.iter().position(|&s| s & 0x00ff_ffff == 2).unwrap_or(0);
     let engine = (0..arm64.len()).min_by_key(|&i| crate::macho::slice_rank(arm64[i], false)).unwrap_or(0);
@@ -849,6 +851,56 @@ int main(int argc, char **argv) {
                 assert_eq!(call(n, &p, &[b"x" as &[u8]], 0), Some("a set-user-ID or set-group-ID program"), "{name} #{n}");
             }
         }
+    }
+
+    #[test]
+    fn a_caller_with_one_descriptor_free_gets_the_same_answer() {
+        // kept_for_call opens the file one descriptor at a time. In a fresh process with every descriptor below its soft
+        // limit in use but one, the child by its real path still goes to the kernel; the control shows exactly one was
+        // free there, and that the call goes to the kernel with descriptors to spare.
+        let f = fx("one-fd");
+        let child = f.child.clone();
+        let p = CString::new(child.as_str()).unwrap();
+        let (_a, av) = cstrings(&["x"]);
+        let mut args = [0u64; 8];
+        args[0] = p.as_ptr() as u64;
+        args[1] = av.as_ptr() as u64;
+        assert_eq!(kept_for_call(SYS_EXECVE, &args, &child), None, "the control: with descriptors to spare");
+        let code = crate::sandboxcheck::tests::in_child(|| {
+            let null = c"/dev/null";
+            let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } != 0 {
+                return 6;
+            }
+            rl.rlim_cur = rl.rlim_cur.min(512);
+            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rl) } != 0 {
+                return 6;
+            }
+            // open gives the lowest free descriptor: open until the limit refuses, then free the last one given.
+            let mut last = -1;
+            loop {
+                let fd = unsafe { libc::open(null.as_ptr(), libc::O_RDONLY) };
+                if fd >= 0 {
+                    last = fd;
+                } else if unsafe { *libc::__error() } == libc::EMFILE && last >= 0 {
+                    break;
+                } else {
+                    return 5;
+                }
+            }
+            unsafe { libc::close(last) };
+            let one = unsafe { libc::open(null.as_ptr(), libc::O_RDONLY) };
+            let two = unsafe { libc::open(null.as_ptr(), libc::O_RDONLY) };
+            if one != last || two != -1 {
+                return 4;
+            }
+            unsafe { libc::close(one) };
+            match kept_for_call(SYS_EXECVE, &args, &child) {
+                None => 0,
+                Some(_) => 2,
+            }
+        });
+        assert_eq!(code, 0, "2 a reason given with one descriptor free, 4 the control (not exactly one free), 5/6 setup");
     }
 
     #[test]
