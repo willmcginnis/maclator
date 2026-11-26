@@ -155,6 +155,8 @@ fn kept_reason(rewriting: bool, cwd_record: bool, sandboxed: bool, gpu: bool) ->
 ///   chdir file action before the kernel's lookup, would see others);
 /// - an argument that is not UTF-8 (the engine reads its arguments as UTF-8), and more arguments than the runtime hands
 ///   on (RUNTIME_ARGS); arguments that cannot be read are the kernel's to refuse (EFAULT);
+/// - a path with an empty, `.` or `..` name in it (`/opt/pkg/bin/../helper`: its argv[0] would lose the directory the
+///   caller named, so a program that finds files from its argv[0]'s directories would find others);
 /// - a path that does not resolve, whose last name is a link, or whose last name is spelled otherwise than its file's
 ///   (the child's argv[0], and the directory it names, would be another's: /usr/bin/view to vim, say);
 /// - a set-user-ID or set-group-ID program (the kernel would start the child, and with it the runtime and the engine,
@@ -171,6 +173,9 @@ fn kept_reason(rewriting: bool, cwd_record: bool, sandboxed: bool, gpu: bool) ->
 fn kept_for_call(n: u64, args: &[u64; 8], path: &str) -> Option<&'static str> {
     if !path.starts_with('/') {
         return Some("a relative path");
+    }
+    if path.split('/').skip(1).any(|name| name.is_empty() || name == "." || name == "..") {
+        return Some("the path has an empty, . or .. name");
     }
     let aidx = if n == SYS_EXECVE { 1 } else { 3 };
     if let Some(why) = argv_kept(args[aidx]) {
@@ -747,6 +752,14 @@ int main(int argc, char **argv) {
         let here = f.dir.to_string_lossy().into_owned();
         let up = link(&f, "dir-link", &here);
         assert_eq!(call(SYS_EXECVE, &format!("{up}/arm64-child"), &[b"x" as &[u8]], 0), None, "a link in a directory above the program");
+        // A path with an empty, . or .. name, either call: the child itself, spelled through them (sub/ is the directory
+        // the link above was made in).
+        for p in [format!("{here}/sub/../arm64-child"), format!("{here}/./arm64-child"), format!("{here}//arm64-child")] {
+            assert!(std::fs::canonicalize(&p).is_ok_and(|r| r.to_string_lossy() == c), "{p} is not the child");
+            for n in both {
+                assert_eq!(call(n, &p, &[b"x" as &[u8]], 0), Some("the path has an empty, . or .. name"), "{p} #{n}");
+            }
+        }
         let missing = f.dir.join("missing").to_string_lossy().into_owned();
         assert_eq!(call(SYS_EXECVE, &missing, &[b"x" as &[u8]], 0), Some("the path does not resolve"));
         // The last name spelled otherwise than its file's: on a case-insensitive volume (macOS's default) the upper-case
