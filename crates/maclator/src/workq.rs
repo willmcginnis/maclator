@@ -55,6 +55,13 @@ const KEVENT_FLAG_PARKING: u64 = 0x800;
 
 const EVFILT_WORKLOOP: i16 = -17;
 const EVFILT_USER_: i16 = -10;
+/// An EVFILT_USER change's command bits: NOTE_TRIGGER, and the operation on the knote's one value (its fflags).
+const NOTE_TRIGGER: u32 = 0x0100_0000;
+const NOTE_FFCTRLMASK: u32 = 0xc000_0000;
+const NOTE_FFAND: u32 = 0x4000_0000;
+const NOTE_FFOR: u32 = 0x8000_0000;
+const NOTE_FFCOPY: u32 = 0xc000_0000;
+const NOTE_FFLAGSMASK: u32 = 0x00ff_ffff;
 const EVFILT_TIMER: i16 = -7;
 const EVFILT_READ: i16 = -1;
 const EVFILT_WRITE: i16 = -2;
@@ -693,6 +700,11 @@ struct Knote {
     host_enabled: bool,
     /// An EV_DISPATCH knote whose event was delivered: natively it gives no other event until the guest enables it.
     spent: bool,
+    /// A user knote's one value (fflags, data), as the kernel keeps it: the attaching change's fflags and data, then each
+    /// later change's fflags operation and data. Its event reports the value as it is delivered, as natively the event
+    /// is harvested. Kept here, not taken from the host's event, because the monitor takes that event before the
+    /// guest's later changes can reach it.
+    user: (u32, i64),
 }
 
 /// (workloop, filter, ident, and for an EV_UDATA_SPECIFIC knote the guest's udata): what names a knote on its kqueue.
@@ -918,6 +930,35 @@ fn take_staged(st: &mut WlState, wl_id: u64, token: u64, which: impl Fn(&Staged)
     taken.into_iter().collect()
 }
 
+/// The disabled knote `token`'s waiting events are all edge ones whose activation was used up as they were taken (no
+/// EV_DISPATCH or EV_ONESHOT, no message, not its end): enabled, its host knote may be enabled at once, as natively a
+/// fire from then on, or one that came while it was disabled, is one event with the waiting one (stage merges it).
+fn used_up_waiting(st: &WlState, wl_id: u64, token: u64) -> bool {
+    st.loops.get(&wl_id).is_some_and(|wl| {
+        wl.staged.iter().filter(|s| s.token == token).all(|s| !level(&s.ev) && s.msg.is_none() && !gone(&s.ev) && s.ev.flags & (EV_DISPATCH | EV_ONESHOT) == 0)
+    })
+}
+
+/// User knote `token` has an event waiting (taken, not yet delivered): natively a trigger of a knote whose event is
+/// queued is that same event, so the caller gives the host the change without NOTE_TRIGGER (its knote would give a
+/// second event).
+fn user_event_waits(st: &WlState, wl_id: u64, token: u64) -> bool {
+    st.loops.get(&wl_id).is_some_and(|wl| wl.staged.iter().any(|s| s.token == token && s.msg.is_none() && !gone(&s.ev)))
+}
+
+/// A user knote's value `v` touched by the guest's successful change `ke`, as filt_usertouch does: its fflags by the
+/// change's operation, its data replaced.
+fn user_touched(v: (u32, i64), ke: &Kev) -> (u32, i64) {
+    let f = ke.fflags & NOTE_FFLAGSMASK;
+    let fflags = match ke.fflags & NOTE_FFCTRLMASK {
+        NOTE_FFAND => v.0 & f,
+        NOTE_FFOR => v.0 | f,
+        NOTE_FFCOPY => f,
+        _ => v.0,
+    };
+    (fflags, ke.data)
+}
+
 /// What a disable takes back: natively a disabled knote's queued event is dequeued, and comes again once it is enabled
 /// if its filter still says so. For a level-triggered knote the host says so again once its knote is enabled; a message
 /// already received, or an activation used up as the event was taken, is kept here until then.
@@ -1006,7 +1047,11 @@ fn knote_add(st: &mut WlState, kq: i32, wl_id: u64, key: KnoteKey, found: Option
                 Some((_, o)) => (o.gflags, o.enabled),
                 None => (ke.flags & PROTOCOL_FLAGS, true),
             };
-            let kn = Knote { wl: wl_id, key, filter: ke.filter, ident: ke.ident, udata: ke.udata, gflags, params: *ke, specific, enabled, deferred: false, host_enabled: false, spent: false };
+            let user = match retimed {
+                Some((_, o)) => o.user,
+                None => (ke.fflags, ke.data),
+            };
+            let kn = Knote { wl: wl_id, key, filter: ke.filter, ident: ke.ident, udata: ke.udata, gflags, params: *ke, specific, enabled, deferred: false, host_enabled: false, spent: false, user };
             (st.next_token, kn, true)
         }
     };
@@ -1014,10 +1059,14 @@ fn knote_add(st: &mut WlState, kq: i32, wl_id: u64, key: KnoteKey, found: Option
     let staged = staged_count(st, wl_id, token);
     if !new && staged > 0 && st.loops[&wl_id].staged.iter().any(|s| s.token == token && s.ev.flags & EV_ONESHOT != 0) {
         // An EV_ONESHOT knote whose event waits: the host dropped it, or deferred its deletion, as it gave that event.
-        // Natively the knote is there until the event is delivered, and is then gone; the change is kept for it.
+        // Natively the knote is there until the event is delivered, and is then gone; the change is kept for it, a user
+        // knote's touch of its value included.
         kn.udata = ke.udata;
         kn.params = *ke;
         kn.enabled = enabled;
+        if kn.filter == EVFILT_USER_ {
+            kn.user = user_touched(kn.user, ke);
+        }
         st.knotes.insert(token, kn);
         if !enabled {
             drop(take_staged(st, wl_id, token, taken_back));
@@ -1049,16 +1098,23 @@ fn knote_add(st: &mut WlState, kq: i32, wl_id: u64, key: KnoteKey, found: Option
         host_enabled = if !enabled {
             h.flags |= EV_DISABLE;
             false
-        } else if !kn.host_enabled && staged == 0 {
+        } else if !kn.host_enabled && (staged == 0 || used_up_waiting(st, wl_id, token)) {
             h.flags |= EV_ENABLE;
             true
         } else {
             kn.host_enabled
         };
+        if kn.filter == EVFILT_USER_ && user_event_waits(st, wl_id, token) {
+            h.fflags &= !NOTE_TRIGGER;
+        }
     }
     let err = host_change(kq, &h);
     if err != 0 {
         return err;
+    }
+    // The change is taken, so a user knote's value is touched by it (an attachment's was set from it).
+    if !new && kn.filter == EVFILT_USER_ {
+        kn.user = user_touched(kn.user, ke);
     }
     if let Some((t, o)) = retimed {
         if o.specific {
@@ -1095,6 +1151,11 @@ fn knote_toggle(st: &mut WlState, kq: i32, token: u64, ke: &Kev) -> i64 {
         return knote_add(st, kq, kn.wl, kn.key, Some(token), ke);
     }
     let mut h = Kev { fflags: ke.fflags, data: ke.data, ext: ke.ext, qos: ke.qos, ..host_kev(&kn, token, ke.flags & !EV_UDATA_SPECIFIC) };
+    // Natively a knote whose deletion is deferred gives the change to no filter; any other user knote's is a touch.
+    let touch = kn.filter == EVFILT_USER_ && !kn.deferred;
+    if touch && user_event_waits(st, kn.wl, token) {
+        h.fflags &= !NOTE_TRIGGER;
+    }
     let mut send = true;
     let mut enables = false;
     if ke.flags & EV_ENABLE != 0 && ke.flags & EV_DISABLE == 0 {
@@ -1107,7 +1168,7 @@ fn knote_toggle(st: &mut WlState, kq: i32, token: u64, ke: &Kev) -> i64 {
             }
             send = staged_count(st, kn.wl, token) == 0;
             enables = send;
-        } else if kn.enabled || staged_count(st, kn.wl, token) > 0 {
+        } else if kn.enabled || (staged_count(st, kn.wl, token) > 0 && !used_up_waiting(st, kn.wl, token)) {
             // Natively enabling an enabled knote changes nothing, and its event, if one is queued, stays so. The host knote
             // may be quiet with an event of it taken (staged, or still with the monitor): it stays so until that event is
             // delivered, and is given the rest of the change.
@@ -1125,6 +1186,9 @@ fn knote_toggle(st: &mut WlState, kq: i32, token: u64, ke: &Kev) -> i64 {
     let k = st.knotes.get_mut(&token).unwrap();
     // The kernel gives every change to the filter, and takes a new udata for a knote not named by it.
     k.params = *ke;
+    if touch {
+        k.user = user_touched(k.user, ke);
+    }
     if k.gflags & EV_UDATA_SPECIFIC == 0 {
         k.udata = ke.udata;
     }
@@ -1331,6 +1395,7 @@ fn stage(st: &mut WlState, kq: i32, ev: Kev, msg: Option<(Vec<u8>, usize)>) {
         } else {
             w.data = ev.data;
         }
+        // (A user knote's event reports the knote's value as it is delivered, whatever its fires said.)
         w.fflags |= ev.fflags;
         w.flags |= ev.flags & (EV_EOF | EV_ONESHOT | EV_ERROR);
         w.ext = ev.ext;
@@ -1389,6 +1454,11 @@ fn deliver(st: &mut WlState, kq: i32, wl_id: u64, out: u64, nmax: u64, data: u64
         e.udata = kn.udata;
         if kn.gflags & EV_UDATA_SPECIFIC == 0 {
             e.flags &= !EV_UDATA_SPECIFIC;
+        }
+        if kn.filter == EVFILT_USER_ && !deleted(&e) {
+            // The knote's value as it is now, as natively the event is harvested (the value stays: measured, an EV_CLEAR
+            // knote's fflags are reported again by its next event).
+            (e.fflags, e.data) = kn.user;
         }
         if let Some((b, off)) = &s.msg {
             unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), at as *mut u8, b.len()) };
@@ -1990,7 +2060,6 @@ pub(crate) mod tests {
         crate::forksync::spawn_host("test-monitor", 2 << 20, Box::new(wl_monitor)).unwrap();
     }
 
-    const NOTE_TRIGGER: u32 = 0x0100_0000;
     const EVFILT_MACHPORT: i16 = -8;
 
     /// A change on workloop `wl` through the global state, as kevent_id applies it.
@@ -2817,14 +2886,21 @@ pub(crate) mod tests {
         let code = in_child(30, || {
             let w = 0x7f0b;
             hold(w);
+            // Measured on a plain kqueue: triggered with NOTE_FFCOPY 1 and data 11, then added again with NOTE_FFCOPY 2
+            // and data 22, an EV_ONESHOT user knote gives one event (2, 22), then none.
             let o = user(0xb3, EV_ADD | EV_CLEAR | EV_ONESHOT, 0x10c);
-            if apply(w, o) != 0 || apply(w, trigger(o)) != 0 || wait_staged(w, 1, 3000) != 1 {
+            if apply(w, o) != 0 || apply(w, Kev { fflags: NOTE_TRIGGER | NOTE_FFCOPY | 1, data: 11, ..trigger(o) }) != 0 || wait_staged(w, 1, 3000) != 1 {
                 return 3;
             }
             let token = with_wl(|st| st.by_key.get(&(w, EVFILT_USER_, 0xb3, None)).copied());
             let Some(token) = token else { return 4 };
-            if apply(w, o) != 0 || poll(w, None).len() != 1 {
+            if apply(w, Kev { fflags: NOTE_FFCOPY | 2, data: 22, ..o }) != 0 {
                 return 5;
+            }
+            match poll(w, None).as_slice() {
+                [e] if (e.fflags & NOTE_FFLAGSMASK, e.data) == (2, 22) => {}
+                [_] => return 7,
+                _ => return 5,
             }
             // Delivered, the knote is gone, and so is any host knote under its token.
             let host = host_change(WL_KQ.load(Ordering::SeqCst), &Kev { ident: 0xb3, filter: EVFILT_USER_, flags: EV_DELETE | EV_UDATA_SPECIFIC, udata: token, ..Default::default() });
@@ -2833,7 +2909,7 @@ pub(crate) mod tests {
             }
             0
         });
-        assert_eq!(code, 0, "3 not staged, 4 no record, 5 not delivered once, 6 a host knote left");
+        assert_eq!(code, 0, "3 not staged, 4 no record, 5 not delivered once, 6 a host knote left, 7 the event not the value the second change left");
     }
 
     #[test]
@@ -2880,51 +2956,172 @@ pub(crate) mod tests {
 
     #[test]
     fn an_edge_knote_added_again_or_disabled_and_enabled_while_its_event_waits_fires_again_later() {
-        // Its activation was used up as its event was taken: the host knote stays enabled, so a trigger before its event
-        // is delivered is one event with it, and a later trigger gives an event, as natively.
+        // An EV_CLEAR read knote, its activation used up as its event was taken: its host knote stays enabled (or is
+        // enabled again with the knote), so more data before its event is delivered is one event with it, then none, and
+        // more data later gives an event, as natively (measured on a plain kqueue, with such a knote on a pipe given one
+        // byte, then added again, disabled and enabled, or disabled and added again enabled, then given a second byte:
+        // one event, data 2, then none).
         let code = in_child(30, || {
             let w = 0x7f10;
             hold(w);
-            for (i, again) in [[EV_ADD | EV_CLEAR, 0], [EV_DISABLE, EV_ENABLE]].into_iter().enumerate() {
-                let c = user(0xc1 + i as u64, EV_ADD | EV_CLEAR, 0x110);
-                if apply(w, c) != 0 || apply(w, trigger(c)) != 0 || wait_staged(w, 1, 3000) != 1 {
+            let changes: [&[u16]; 3] = [&[EV_ADD | EV_CLEAR], &[EV_DISABLE, EV_ENABLE], &[EV_DISABLE, EV_ADD | EV_ENABLE | EV_CLEAR]];
+            for (i, again) in changes.into_iter().enumerate() {
+                let mut p = [-1i32; 2];
+                if unsafe { libc::pipe(p.as_mut_ptr()) } != 0 {
+                    return 20;
+                }
+                let more = || unsafe { libc::write(p[1], b"x".as_ptr().cast(), 1) } == 1;
+                let c = Kev { ident: p[0] as u64, filter: EVFILT_READ, flags: EV_ADD | EV_CLEAR, udata: 0x110 + i as u64, ..Default::default() };
+                if apply(w, c) != 0 || !more() || wait_staged(w, 1, 3000) != 1 {
                     return 3;
                 }
-                for f in again.into_iter().filter(|f| *f != 0) {
-                    if apply(w, Kev { flags: f, ..c }) != 0 {
+                for f in again {
+                    if apply(w, Kev { flags: *f, ..c }) != 0 {
                         return 4;
                     }
                 }
-                if i == 0 {
-                    // Triggered again before its event is delivered: wait until the monitor has kept that fire too.
-                    let before = STAGED.load(Ordering::SeqCst);
-                    if apply(w, trigger(c)) != 0 {
-                        return 4;
+                if !more() {
+                    return 20;
+                }
+                // Wait until the waiting event says both bytes: the host's fires since are merged into it.
+                let t0 = std::time::Instant::now();
+                while with_wl(|st| st.loops[&w].staged.iter().map(|s| s.ev.data).max()) != Some(2) {
+                    if t0.elapsed() > std::time::Duration::from_secs(3) {
+                        return 22;
                     }
-                    let t0 = std::time::Instant::now();
-                    while STAGED.load(Ordering::SeqCst) == before {
-                        if t0.elapsed() > std::time::Duration::from_secs(3) {
-                            return 22;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(2));
-                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
                 }
                 if poll(w, None).len() != 1 {
                     return 5;
                 }
-                if i == 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(300));
-                    if staged(w) != 0 {
-                        return 8;
-                    }
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                if staged(w) != 0 {
+                    return 8;
                 }
-                if apply(w, trigger(c)) != 0 || wait_staged(w, 1, 3000) != 1 || poll(w, None).len() != 1 {
-                    return 6 + i as i32;
+                if !more() || wait_staged(w, 1, 3000) != 1 || poll(w, None).len() != 1 {
+                    return 10 + i as i32;
+                }
+                unsafe {
+                    libc::close(p[0]);
+                    libc::close(p[1]);
                 }
             }
             0
         });
-        assert_eq!(code, 0, "3 not staged, 4 refused, 5 not delivered, 6 no event after it was added again, 7 none after disable and enable, 8 a trigger while its event waited came as an event of its own, 22 the monitor took no second fire in 3 s (the host knote not left armed)");
+        assert_eq!(code, 0, "20 the test's pipes, 3 not staged, 4 refused, 5 not one event, 8 more data while its event waited came as an event of its own, 10-12 no event for later data (added again; disabled and enabled; disabled and added again enabled), 22 the waiting event did not take the later data in 3 s (the host knote not left armed)");
+    }
+
+    #[test]
+    fn a_user_knotes_changes_while_its_event_waits_are_that_event_as_natively() {
+        // Measured on a plain kqueue (every change of a user knote touches its value: its fflags by the operation, its
+        // data replaced, an enable's 0 too): an EV_CLEAR user knote triggered with NOTE_FFCOPY 1 and data 11, then given
+        // NOTE_FFCOPY 2 and data 22 with a trigger, without one, with EV_ADD again, or with EV_ADD again and a trigger,
+        // before its event is harvested, gives one event (2, 22), then none; triggered so, disabled, triggered with
+        // NOTE_FFCOPY 2 and data 22, and enabled, one event (2, 0), then none. Harvested, the knote keeps its fflags, so a
+        // bare trigger (data 0) then gives (2, 0). No second fire comes from the host.
+        let code = in_child(30, || {
+            for case in 0..5u64 {
+                let w = 0x7f1f + (case << 4);
+                hold(w);
+                let c = user(0xc7 + case, EV_ADD | EV_CLEAR, 0x121 + case);
+                let copy = |f: u32, d: i64, trig: bool| Kev { fflags: (if trig { NOTE_TRIGGER } else { 0 }) | NOTE_FFCOPY | f, data: d, ..trigger(c) };
+                if apply(w, c) != 0 || apply(w, copy(1, 11, true)) != 0 || wait_staged(w, 1, 3000) != 1 {
+                    return 3;
+                }
+                let taken = TAKEN.load(Ordering::SeqCst);
+                let (r, want) = match case {
+                    0 => (apply(w, copy(2, 22, true)), (2, 22)),
+                    1 => (apply(w, copy(2, 22, false)), (2, 22)),
+                    3 => (apply(w, Kev { fflags: NOTE_FFCOPY | 2, data: 22, ..c }), (2, 22)),
+                    4 => (apply(w, Kev { fflags: NOTE_TRIGGER | NOTE_FFCOPY | 2, data: 22, ..c }), (2, 22)),
+                    _ => ([Kev { flags: EV_DISABLE, ..c }, copy(2, 22, true), Kev { flags: EV_ENABLE, ..c }].into_iter().map(|k| apply(w, k)).find(|e| *e != 0).unwrap_or(0), (2, 0)),
+                };
+                if r != 0 {
+                    return 3;
+                }
+                match poll(w, None).as_slice() {
+                    [e] if (e.fflags & NOTE_FFLAGSMASK, e.data) == want => {}
+                    [_] => return 4,
+                    _ => return 5,
+                }
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                if staged(w) != 0 || TAKEN.load(Ordering::SeqCst) != taken {
+                    return 6;
+                }
+                if apply(w, trigger(c)) != 0 || wait_staged(w, 1, 3000) != 1 {
+                    return 3;
+                }
+                match poll(w, None).as_slice() {
+                    [e] if (e.fflags & NOTE_FFLAGSMASK, e.data) == (2, 0) => {}
+                    [_] => return 7,
+                    _ => return 5,
+                }
+            }
+            0
+        });
+        assert_eq!(code, 0, "3 refused or not staged, 4 not the value the changes left, 5 not one event, 6 a second fire from the host, 7 the value not kept after a delivery");
+    }
+
+    #[test]
+    fn a_user_knotes_change_the_kernel_refuses_leaves_its_waiting_event_as_it_was() {
+        // Measured on a plain kqueue: an EV_UDATA_SPECIFIC user knote triggered with NOTE_FFCOPY 1 and data 11, then
+        // given a change with EV_VANISHED (NOTE_FFCOPY 2, data 22): EINVAL, and its event is (1, 11).
+        let code = in_child(30, || {
+            let w = 0x7f7f;
+            hold(w);
+            let c = user(0xcb, EV_ADD | EV_CLEAR | EV_UDATA_SPECIFIC, 0x131);
+            if apply(w, c) != 0 || apply(w, Kev { fflags: NOTE_TRIGGER | NOTE_FFCOPY | 1, data: 11, ..trigger(c) }) != 0 || wait_staged(w, 1, 3000) != 1 {
+                return 3;
+            }
+            if apply(w, Kev { flags: EV_UDATA_SPECIFIC | EV_VANISHED, fflags: NOTE_FFCOPY | 2, data: 22, ..c }) != libc::EINVAL as i64 {
+                return 4;
+            }
+            match poll(w, None).as_slice() {
+                [e] if (e.fflags & NOTE_FFLAGSMASK, e.data) == (1, 11) => 0,
+                [_] => 5,
+                _ => 6,
+            }
+        });
+        assert_eq!(code, 0, "3 refused or not staged, 4 the change not EINVAL, 5 the event changed by it, 6 not one event");
+    }
+
+    #[test]
+    fn a_user_knotes_change_as_its_event_is_being_taken_is_in_that_event() {
+        // A change that comes while the monitor is taking the knote's event (taken, not yet kept): with a trigger it
+        // reaches the host and fires again, and the two fires are one event; without one the host gives nothing more.
+        // Either way the event reports the value the change left (NOTE_FFCOPY 2 and data 22, not 1 and 11, nor 1|2), as
+        // natively, where the change touches the knote whose event is queued.
+        let code = in_child(30, || {
+            for (i, trig) in [true, false].into_iter().enumerate() {
+                let w = 0x7f50 + ((i as u64) << 4);
+                hold(w);
+                let c = user(0xca + i as u64, EV_ADD | EV_CLEAR, 0x130 + i as u64);
+                let copy = |f: u32, d: i64, t: bool| Kev { fflags: (if t { NOTE_TRIGGER } else { 0 }) | NOTE_FFCOPY | f, data: d, ..trigger(c) };
+                if apply(w, c) != 0 {
+                    return 3;
+                }
+                let before = STAGED.load(Ordering::SeqCst);
+                match changes_as_it_is_taken(w, |st| wl_apply(st, w, &copy(1, 11, true)) == 0, &[copy(2, 22, trig)]) {
+                    None => return 22,
+                    Some(v) if v != [0] => return 3,
+                    Some(_) => {}
+                }
+                let t0 = std::time::Instant::now();
+                while STAGED.load(Ordering::SeqCst) < before + if trig { 2 } else { 1 } {
+                    if t0.elapsed() > std::time::Duration::from_secs(3) {
+                        return 23;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                match poll(w, None).as_slice() {
+                    [e] if (e.fflags & NOTE_FFLAGSMASK, e.data) == (2, 22) => {}
+                    [_] => return 4 + 10 * i as i32,
+                    _ => return 5,
+                }
+            }
+            0
+        });
+        assert_eq!(code, 0, "3 refused, 22/23 no reading (the monitor took or kept no fire), 4/14 not the value the change left (with a trigger / without), 5 not one event");
     }
 
     #[test]
