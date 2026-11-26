@@ -2505,7 +2505,9 @@ fn bsd_inner(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
             let closes = n != 90 || args[0] as i32 != fd;
             let tokens = if closes { crate::workq::fd_closing(fd) } else { Vec::new() };
             let r = hostsys::unix(n, &args);
-            if !r.carry {
+            if r.carry {
+                crate::workq::fd_close_failed(&tokens);
+            } else {
                 crate::workq::fd_closed(&tokens);
             }
             set_res(cpu, r);

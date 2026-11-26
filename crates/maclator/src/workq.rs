@@ -934,11 +934,19 @@ fn staged_count(st: &WlState, wl_id: u64, token: u64) -> usize {
 }
 
 fn forget_knote(st: &mut WlState, token: u64) {
-    if let Some(kn) = st.knotes.remove(&token) {
+    unkey(st, token);
+    st.knotes.remove(&token);
+}
+
+/// Knote `token` is no longer found by its key: a registration of the same key from now on is a knote of its own.
+/// Keys another knote has taken since are left as they are.
+fn unkey(st: &mut WlState, token: u64) {
+    let Some(kn) = st.knotes.get(&token) else { return };
+    if st.by_key.get(&kn.key) == Some(&token) {
         st.by_key.remove(&kn.key);
-        if !kn.specific {
-            st.plain.remove(&(kn.filter, kn.ident));
-        }
+    }
+    if !kn.specific && st.plain.get(&(kn.filter, kn.ident)) == Some(&token) {
+        st.plain.remove(&(kn.filter, kn.ident));
     }
 }
 
@@ -1171,11 +1179,38 @@ fn knote_delete(st: &mut WlState, kq: i32, token: u64, ke: &Kev) -> i64 {
 }
 
 /// Before the guest closes `fd` (close, or dup2 onto it): the tokens of the workloop knotes on it, for `fd_closed`.
-/// Taken first, so a knote registered on the number once it is free again is not taken for one of them.
+/// Taken first, so a knote registered on the number once it is free again is not taken for one of them; and the ones
+/// the close drops (all but those that asked for EV_VANISHED, which stay until the guest deletes them) no longer found
+/// by their keys, so the same registration made on the number then (another thread's, between the host's close and
+/// `fd_closed`) is a knote of its own, as natively, where the kernel drops them before the number is free again.
 pub(crate) fn fd_closing(fd: i32) -> Vec<u64> {
     let mut g = WL.lock().unwrap();
     let Some(st) = g.as_mut() else { return Vec::new() };
-    st.knotes.iter().filter(|(_, kn)| on_fd(kn) && kn.ident == fd as u64).map(|(t, _)| *t).collect()
+    let tokens: Vec<u64> = st.knotes.iter().filter(|(_, kn)| on_fd(kn) && kn.ident == fd as u64).map(|(t, _)| *t).collect();
+    for t in &tokens {
+        if st.knotes[t].gflags & EV_VANISHED == 0 {
+            unkey(st, *t);
+        }
+    }
+    tokens
+}
+
+/// The guest's close of a descriptor whose knotes were `tokens` (fd_closing) failed: they are found by their keys
+/// again, where no knote has taken a key since.
+pub(crate) fn fd_close_failed(tokens: &[u64]) {
+    if tokens.is_empty() {
+        return;
+    }
+    let mut g = WL.lock().unwrap();
+    let Some(st) = g.as_mut() else { return };
+    for t in tokens {
+        let Some(kn) = st.knotes.get(t) else { continue };
+        let (key, plain) = (kn.key, (!kn.specific).then_some((kn.filter, kn.ident)));
+        st.by_key.entry(key).or_insert(*t);
+        if let Some(p) = plain {
+            st.plain.entry(p).or_insert(*t);
+        }
+    }
 }
 
 /// After the guest closed a descriptor whose knotes were `tokens` (fd_closing): natively the kernel drops them with
@@ -2893,6 +2928,55 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_same_registration_on_a_reused_descriptor_outlives_the_close_of_the_old_one() {
+        // The same workloop, filter and number, registered once another file has the number (another thread's, between
+        // the host's close and the end of the guest's): natively the closed descriptor's knote was dropped before the
+        // number was free again, so this is a knote of its own, and its events come.
+        let code = in_child(30, || {
+            let mut p = [-1i32; 2];
+            if unsafe { libc::pipe(p.as_mut_ptr()) } != 0 {
+                return 20;
+            }
+            let w = 0x7f20;
+            hold(w);
+            let r = |udata| Kev { ident: p[0] as u64, filter: EVFILT_READ, flags: EV_ADD, udata, ..Default::default() };
+            if apply(w, r(0x122)) != 0 {
+                return 3;
+            }
+            let tokens = fd_closing(p[0]);
+            unsafe {
+                libc::close(p[0]);
+                libc::close(p[1]);
+            }
+            let mut q = [-1i32; 2];
+            if unsafe { libc::pipe(q.as_mut_ptr()) } != 0 {
+                return 20;
+            }
+            if q[0] != p[0] {
+                return 21;
+            }
+            if tokens.len() != 1 || apply(w, r(0x123)) != 0 {
+                return 4;
+            }
+            fd_closed(&tokens);
+            if !with_wl(|st| st.by_key.contains_key(&(w, EVFILT_READ, q[0] as u64, None))) {
+                return 5;
+            }
+            if unsafe { libc::write(q[1], b"x".as_ptr().cast(), 1) } != 1 {
+                return 20;
+            }
+            if wait_staged(w, 1, 3000) != 1 {
+                return 6;
+            }
+            match poll(w, None).as_slice() {
+                [e] if e.udata == 0x123 => 0,
+                _ => 7,
+            }
+        });
+        assert_eq!(code, 0, "20 the test's pipes, 21 no reading (the number not reused), 3/4 refused, 5 the new knote given up with the old, 6 no event, 7 not its event");
+    }
+
+    #[test]
     fn a_registration_on_a_reused_descriptor_outlives_the_close_of_the_old_one() {
         // A close gives up the knotes it found before the descriptor was closed: one made on the number once it was free
         // again (another thread's) is not one of them.
@@ -3004,6 +3088,47 @@ pub(crate) mod tests {
             }
         });
         assert_eq!(code, 0, "20 no pipe, 3 not staged, 4 the read delivered, 5 nothing delivered");
+    }
+
+    #[test]
+    fn a_vanishing_knote_closed_through_the_guests_close_is_found_until_it_is_deleted() {
+        // The kernel keeps a knote that asked for EV_VANISHED after its descriptor's close, under its ident, filter and
+        // udata, until the guest deletes it: enabled at the close, or disabled then and enabled after.
+        let code = in_child(30, || {
+            for (i, disabled) in [false, true].into_iter().enumerate() {
+                let mut p = [-1i32; 2];
+                if unsafe { libc::pipe(p.as_mut_ptr()) } != 0 {
+                    return 20;
+                }
+                let w = 0x7f21 + i as u64;
+                hold(w);
+                let r = Kev { ident: p[0] as u64, filter: EVFILT_READ, flags: EV_ADD | EV_DISPATCH | EV_UDATA_SPECIFIC | EV_VANISHED, udata: 0x124 + i as u64, ..Default::default() };
+                if apply(w, r) != 0 || (disabled && apply(w, Kev { flags: EV_DISABLE | EV_UDATA_SPECIFIC, ..r }) != 0) {
+                    return 3;
+                }
+                let tokens = fd_closing(p[0]);
+                unsafe {
+                    libc::close(p[0]);
+                    libc::close(p[1]);
+                }
+                fd_closed(&tokens);
+                if disabled && apply(w, Kev { flags: EV_ENABLE | EV_UDATA_SPECIFIC, ..r }) != 0 {
+                    return 4;
+                }
+                match deliver_one(w) {
+                    Some(f) if f & EV_VANISHED != 0 => {}
+                    _ => return 5,
+                }
+                if apply(w, Kev { flags: EV_DELETE | EV_ENABLE | EV_UDATA_SPECIFIC, ..r }) != 0 {
+                    return 6;
+                }
+                if with_wl(|st| st.by_key.contains_key(&(w, EVFILT_READ, p[0] as u64, Some(r.udata)))) {
+                    return 7;
+                }
+            }
+            0
+        });
+        assert_eq!(code, 0, "20 no pipe, 3 refused, 4 its enable after the close refused, 5 no vanishing delivered, 6 its deletion not 0, 7 still there after it");
     }
 
     #[test]
