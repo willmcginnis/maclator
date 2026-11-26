@@ -13,6 +13,10 @@ process; it waits its turn behind a running builder, up to 20 minutes), `MACLATO
 `MACLATOR_SYSROOT`.
 Signals: `kill -USR1 <pid>` all guest threads (pc/regs/backtrace), `kill -USR2 <pid>` lock-free
 register dump of the interrupted thread + JIT counters (works in forked children).
+A guest fault (BRK, an undefined or an unimplemented instruction) ends the process by SIGTRAP or SIGILL, as a
+native run of the same instruction ends; its report (registers, disassembly, backtrace) goes to stderr and to
+`crash/crash-NN.log` in the translation cache directory (the last 16, at most 4 of them one program's, at most 64 KiB
+each; none in a sandboxed process).
 `maclator --jit-dump <hex insns…>` prints generated x86 hex for a block (disassemble via a `.byte`
 file + `clang -c` + `objdump -d --x86-asm-syntax=intel`). `ipsw dyld a2s/disass` (on the test Mac) maps
 shared-cache addresses to symbols (unslid vaddr = `0x180000000 + (pc - 0x600000000)`).

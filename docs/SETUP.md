@@ -116,4 +116,5 @@ Intel Mac; on GPUs without Metal support it cannot work.
 | `~/bin/maclator`, `~/bin/gpu/` | the emulator and GPU bridge libraries |
 | `~/maclator-sysroot/<build>__<model>/` | arm64e dyld shared cache |
 | `~/Library/Caches/Maclator/aot/` | persistent translation cache (override: `MACLATOR_CACHE`) |
+| `~/Library/Caches/Maclator/aot/crash/` | the last 16 crash reports of guest faults (4 per program at most) |
 | `/tmp/maclator-*.log` | fault dumps / traces when the corresponding flags are used |

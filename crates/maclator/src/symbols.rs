@@ -76,6 +76,14 @@ pub fn describe(addr: u64) -> String {
 }
 
 pub fn backtrace(cpu: &Cpu) {
+    for line in backtrace_lines(cpu) {
+        eprintln!("{line}");
+    }
+}
+
+/// The guest's frame chain from `cpu`, a line per frame, as `backtrace` prints it.
+pub fn backtrace_lines(cpu: &Cpu) -> Vec<String> {
+    let mut lines = Vec::new();
     let mut fp = cpu.x[29];
     for i in 0..32 {
         if fp == 0 || fp & 7 != 0 {
@@ -91,9 +99,15 @@ pub fn backtrace(cpu: &Cpu) {
             }
             (v[0], v[1])
         };
-        eprintln!("  #{i:<2} {:#x} {}", lr, describe(lr));
+        lines.push(format!("  #{i:<2} {:#x} {}", lr, describe(lr)));
         fp = next;
     }
+    lines
+}
+
+/// The first image added, which in a run is the main executable's file name. None when another thread holds the list.
+pub(crate) fn main_name() -> Option<String> {
+    IMAGES.try_lock().ok()?.first().map(|i| i.name.clone())
 }
 
 extern "C" {

@@ -239,6 +239,7 @@ mod tests {
         ("cache", "maclator/src/cache.rs", include_str!("cache.rs")),
         ("commpage", "maclator/src/commpage.rs", include_str!("commpage.rs")),
         ("engine", "maclator/src/engine.rs", include_str!("engine.rs")),
+        ("engine::crash_tests", "maclator/src/engine_crash_tests.rs", include_str!("engine_crash_tests.rs")),
         ("forksafe", "maclator/src/forksafe.rs", include_str!("forksafe.rs")),
         ("forksafe::adapt", "maclator/src/forksafe_adapt.rs", include_str!("forksafe_adapt.rs")),
         ("forksafe::v4tests", "maclator/src/forksafe_v4tests.rs", include_str!("forksafe_v4tests.rs")),

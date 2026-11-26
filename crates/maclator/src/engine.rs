@@ -400,51 +400,61 @@ pub fn handle_exit(cpu: &mut Cpu, e: Exit) -> bool {
             crate::jit::invalidate_range(addr & !63, 64);
             true
         }
+        // A native run of these gets EXC_BREAKPOINT (SIGTRAP) and EXC_BAD_INSTRUCTION (SIGILL). An instruction the
+        // translator lacks is one the hardware would run: the program ends as for an undefined one.
         Exit::Brk(imm) => {
-            crash(cpu, &format!("guest executed BRK #{imm:#x} (trap)"));
-            false
+            crash(cpu, &format!("guest executed BRK #{imm:#x} (trap)"), libc::SIGTRAP);
         }
         Exit::Udf(insn) => {
-            crash(cpu, &format!("guest executed undefined instruction {insn:#010x}"));
-            false
+            crash(cpu, &format!("guest executed undefined instruction {insn:#010x}"), libc::SIGILL);
         }
         Exit::Unimplemented(insn) => {
-            crash(cpu, &format!("unimplemented instruction {insn:#010x}  {}", disasm(insn)));
-            false
+            crash(cpu, &format!("unimplemented instruction {insn:#010x}  {}", disasm(insn)), libc::SIGILL);
         }
     }
 }
 
-pub fn crash(cpu: &Cpu, why: &str) -> ! {
-    eprintln!("\nmaclator: {why}");
-    eprintln!("  at pc {:#x} {}", cpu.pc, crate::symbols::describe(cpu.pc));
-    eprintln!("{}", cpu.dump());
-    eprintln!("  lr {}", crate::symbols::describe(cpu.x[30]));
+/// End the process for a guest fault, or a failure of the translator's own, after saying what happened: on stderr as
+/// before, and in a crash report file (`write_crash_report`), since a launchd daemon's stderr is /dev/null. The process
+/// then ends by `sig` at its default action, as a native run ends for a fault it does not handle, so launchd, a
+/// waiting parent and the crash reporter see that signal (it used to exit with status 134).
+pub fn crash(cpu: &Cpu, why: &str, sig: i32) -> ! {
+    use std::fmt::Write as _;
+    // Until the one bounded write at the end, fd 2 is /dev/null: a note written on the way (a refused guest read) must
+    // not block on a full stderr before the report is saved and the signal sent.
+    let stderr = quiet_stderr();
+    let mut text = String::new();
+    let _ = writeln!(text, "\nmaclator: {why}");
+    let _ = writeln!(text, "  at pc {:#x} {}", cpu.pc, crate::symbols::describe(cpu.pc));
+    let _ = writeln!(text, "{}", cpu.dump());
+    let _ = writeln!(text, "  lr {}", crate::symbols::describe(cpu.x[30]));
     let n: u64 = std::env::var("MACLATOR_DISAS").ok().and_then(|v| v.parse().ok()).unwrap_or(12);
     let start = cpu.pc.wrapping_sub(n * 4);
     for i in 0..(n + 4) {
-        let a = start + i * 4;
+        let a = start.wrapping_add(i * 4);
         if let Some(w) = crate::guestmem::read_u64(a & !7) {
             let insn = if a & 4 != 0 { (w >> 32) as u32 } else { w as u32 };
-            eprintln!("  {} {:#x}: {:08x}  {}", if a == cpu.pc { "=>" } else { "  " }, a, insn, disasm(insn));
+            let _ = writeln!(text, "  {} {:#x}: {:08x}  {}", if a == cpu.pc { "=>" } else { "  " }, a, insn, disasm(insn));
         }
     }
-    crate::symbols::backtrace(cpu);
+    for line in crate::symbols::backtrace_lines(cpu) {
+        let _ = writeln!(text, "{line}");
+    }
     // Strings materialised by ADRP+ADD just before the crash (crash messages).
     for i in 1..24u64 {
         let a = cpu.pc.wrapping_sub(i * 4);
-        let (Some(w1), Some(w2)) = (read_insn(a), read_insn(a + 4)) else { continue };
+        let (Some(w1), Some(w2)) = (read_insn(a), read_insn(a.wrapping_add(4))) else { continue };
         if w1 & 0x9F00_0000 == 0x9000_0000 && w2 & 0xFFC0_0000 == 0x9100_0000 && (w1 & 31) == ((w2 >> 5) & 31) {
             let immlo = ((w1 >> 29) & 3) as u64;
             let immhi = ((w1 >> 5) & 0x7ffff) as u64;
             let imm = (((immhi << 2) | immlo) << 43) as i64 >> 31;
             let page = (a & !0xfff).wrapping_add(imm as u64);
-            let target = page + ((w2 >> 10) & 0xfff) as u64;
+            let target = page.wrapping_add(((w2 >> 10) & 0xfff) as u64);
             let mut b = [0u8; 160];
             if crate::guestmem::read(target, &mut b) {
                 let len = b.iter().position(|&c| c == 0).unwrap_or(0);
                 if len >= 6 && b[..len].iter().all(|&c| (0x20..0x7f).contains(&c)) {
-                    eprintln!("  message? \"{}\"", String::from_utf8_lossy(&b[..len]));
+                    let _ = writeln!(text, "  message? \"{}\"", String::from_utf8_lossy(&b[..len]));
                 }
             }
         }
@@ -455,11 +465,241 @@ pub fn crash(cpu: &Cpu, why: &str) -> ! {
         if crate::guestmem::read(cpu.x[i], &mut b) {
             let len = b.iter().position(|&c| c == 0).unwrap_or(0);
             if len >= 6 && b[..len].iter().all(|&c| (0x20..0x7f).contains(&c) || c == b'\n') {
-                eprintln!("  x{i} -> \"{}\"", String::from_utf8_lossy(&b[..len]));
+                let _ = writeln!(text, "  x{i} -> \"{}\"", String::from_utf8_lossy(&b[..len]));
             }
         }
     }
-    std::process::exit(134);
+    // The file first, then stderr for at most CRASH_STDERR_MS: a stderr that blocks (a full pipe no one reads) must
+    // cost neither the report nor the signal. A report file that may not grow (RLIMIT_FSIZE) fails rather than ending
+    // the process by SIGXFSZ.
+    unsafe { libc::signal(libc::SIGXFSZ, libc::SIG_IGN) };
+    write_crash_report(&crate::aot::cache_dir().join("crash"), &report_header(why, sig), &text);
+    write_stderr_bounded(stderr, text.into_bytes());
+    end_by_signal(sig)
+}
+
+/// What stderr was, once a crash has put /dev/null on fd 2: -1 before, -2 while a thread is putting it there.
+static KEPT_STDERR: AtomicI32 = AtomicI32::new(-1);
+
+/// Put /dev/null on fd 2, and return a descriptor of what stderr was (fd 2 itself when it cannot be kept). Once per
+/// process: a second thread crashing at once gets the same descriptor, not a duplicate of /dev/null.
+fn quiet_stderr() -> i32 {
+    match KEPT_STDERR.compare_exchange(-1, -2, Ordering::SeqCst, Ordering::SeqCst) {
+        Ok(_) => {}
+        Err(_) => {
+            // Another thread is crashing too: wait (briefly) for what it kept.
+            for _ in 0..200 {
+                let k = KEPT_STDERR.load(Ordering::SeqCst);
+                if k != -2 {
+                    return k;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            return 2;
+        }
+    }
+    let kept = quiet_stderr_once();
+    KEPT_STDERR.store(kept, Ordering::SeqCst);
+    kept
+}
+
+fn quiet_stderr_once() -> i32 {
+    unsafe {
+        let kept = libc::fcntl(2, libc::F_DUPFD_CLOEXEC, 3);
+        if kept < 0 {
+            return 2;
+        }
+        let null = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+        if null < 0 || libc::dup2(null, 2) < 0 {
+            if null >= 0 {
+                libc::close(null);
+            }
+            libc::close(kept);
+            return 2;
+        }
+        libc::close(null);
+        kept
+    }
+}
+
+/// How long the crash path waits for stderr to take its report.
+const CRASH_STDERR_MS: u64 = 2000;
+
+/// Write `bytes` to `fd` on a thread of its own and wait for it at most CRASH_STDERR_MS. A write that blocks (a full
+/// pipe no one reads, or one another writer filled after it looked free) then blocks only that thread, which ends with
+/// the process. Not by making the descriptor non-blocking: that flag belongs to the open file, which other processes
+/// share. SIGPIPE is ignored first, so a reader that has gone ends the write, not the process by the wrong signal. The
+/// wait is a flag polled with sleeps, not a channel: in a fork child a channel's wait would park on the parent's
+/// semaphore, which the child does not have.
+fn write_stderr_bounded(fd: i32, bytes: Vec<u8>) {
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let told = done.clone();
+    let writer = Box::new(move || {
+        let mut rest = &bytes[..];
+        while !rest.is_empty() {
+            let k = unsafe { libc::write(fd, rest.as_ptr() as *const libc::c_void, rest.len()) };
+            if k > 0 {
+                rest = &rest[k as usize..];
+            } else if !(k < 0 && unsafe { *libc::__error() } == libc::EINTR) {
+                break;
+            }
+        }
+        told.store(true, Ordering::SeqCst);
+    });
+    if crate::forksync::spawn_host("maclator-crash-stderr", 1 << 16, writer).is_ok() {
+        let end = std::time::Instant::now() + std::time::Duration::from_millis(CRASH_STDERR_MS);
+        while !done.load(Ordering::SeqCst) && std::time::Instant::now() < end {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+}
+
+/// How many crash reports the store keeps, how many of them one program may hold, and the most bytes one may take; the
+/// oldest is written over first. A program that crashes every few seconds keeps CRASH_PER_PROGRAM, not all of them.
+const CRASH_KEEP: usize = 16;
+const CRASH_PER_PROGRAM: usize = 4;
+const CRASH_MAX_BYTES: usize = 64 << 10;
+
+fn signal_name(sig: i32) -> &'static str {
+    match sig {
+        libc::SIGTRAP => "SIGTRAP",
+        libc::SIGILL => "SIGILL",
+        libc::SIGABRT => "SIGABRT",
+        _ => "signal",
+    }
+}
+
+/// The lines a report file starts with: nothing the translator did not already know or print, and no guest data
+/// beyond the text it prints on stderr.
+fn report_header(why: &str, sig: i32) -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let engine = crate::aot::own_uuid().map(|u| u.iter().map(|b| format!("{b:02x}")).collect::<String>()).unwrap_or_else(|| "unknown".into());
+    format!(
+        "maclator crash report\nprogram: {}\npid: {}\ntime: {now}\nsignal: {} ({sig})\nreason: {why}\nengine: {engine}\n",
+        crate::symbols::main_name().unwrap_or_else(|| "unknown".into()),
+        unsafe { libc::getpid() },
+        signal_name(sig)
+    )
+}
+
+/// The "program: " line of a report's header (empty when it has none).
+fn report_program(header: &str) -> &str {
+    header.lines().find_map(|l| l.strip_prefix("program: ")).unwrap_or("")
+}
+
+/// The slot to write `program`'s report in: its own oldest once it holds CRASH_PER_PROGRAM, else the first one unused,
+/// else the one written longest ago.
+fn crash_slot(dir: &std::path::Path, program: &str) -> usize {
+    let mut oldest: Option<(std::time::SystemTime, usize)> = None;
+    let mut mine: Vec<(std::time::SystemTime, usize)> = Vec::new();
+    let mut unused = None;
+    for i in 0..CRASH_KEEP {
+        let path = dir.join(format!("crash-{i:02}.log"));
+        match std::fs::symlink_metadata(&path) {
+            Err(_) => {
+                unused.get_or_insert(i);
+            }
+            Ok(md) => {
+                let t = md.modified().unwrap_or(std::time::UNIX_EPOCH);
+                if oldest.is_none_or(|(o, _)| t < o) {
+                    oldest = Some((t, i));
+                }
+                // The header is in the first few hundred bytes.
+                let mut head = [0u8; 512];
+                let n = std::fs::File::open(&path).and_then(|mut f| std::io::Read::read(&mut f, &mut head)).unwrap_or(0);
+                if report_program(&String::from_utf8_lossy(&head[..n])) == program {
+                    mine.push((t, i));
+                }
+            }
+        }
+    }
+    if mine.len() >= CRASH_PER_PROGRAM {
+        return mine.iter().min().map_or(0, |&(_, i)| i);
+    }
+    unused.or(oldest.map(|(_, i)| i)).unwrap_or(0)
+}
+
+/// Write `header` and `text` to a report file in `dir`, cut to CRASH_MAX_BYTES, in one of CRASH_KEEP slots (at most
+/// CRASH_PER_PROGRAM of them the header's program's), through a temporary file of this process renamed into place;
+/// temporary files a minute old (a writer that died) are removed.
+/// Nothing is written in a sandboxed process (the translator's stores are left alone there) or in a directory that is
+/// not ours alone. The report's path, if one was written.
+pub(crate) fn write_crash_report(dir: &std::path::Path, header: &str, text: &str) -> Option<std::path::PathBuf> {
+    if crate::sandboxcheck::sandboxed() {
+        return None;
+    }
+    let uid = unsafe { libc::geteuid() };
+    if !dir.parent().is_some_and(|store| crate::aot::owned_dir(store, uid)) || !crate::aot::owned_dir(dir, uid) {
+        return None;
+    }
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        let now = std::time::SystemTime::now();
+        for ent in rd.flatten() {
+            let stale = ent.metadata().and_then(|m| m.modified()).ok().and_then(|t| now.duration_since(t).ok()).is_some_and(|a| a.as_secs() >= 60);
+            if ent.file_name().to_str().is_some_and(|n| n.starts_with("crash-") && n.ends_with(".tmp")) && stale {
+                let _ = std::fs::remove_file(ent.path());
+            }
+        }
+    }
+    let mut report = format!("{header}\n{text}");
+    if report.len() > CRASH_MAX_BYTES {
+        let note = format!("\n[maclator: report cut at {CRASH_MAX_BYTES} bytes]\n");
+        let mut cut = CRASH_MAX_BYTES - note.len();
+        while !report.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        report.truncate(cut);
+        report.push_str(&note);
+    }
+    let slot = crash_slot(dir, report_program(header));
+    let path = dir.join(format!("crash-{slot:02}.log"));
+    // Two threads of one process can crash at once: each writes a temporary file of its own.
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!("crash-{slot:02}.log.{}-{seq}.tmp", unsafe { libc::getpid() }));
+    let written = {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&tmp)
+            .and_then(|mut f| f.write_all(report.as_bytes()))
+            .and_then(|()| std::fs::rename(&tmp, &path))
+    };
+    match written {
+        Ok(()) => Some(path),
+        Err(_) => {
+            let _ = std::fs::remove_file(&tmp);
+            None
+        }
+    }
+}
+
+/// End this process by `sig` at its default action, whatever the guest set for it (a native process that does not
+/// handle a fault dies of it). `raise` targets this thread, with the signal unblocked here. Not by an instruction that
+/// faults (int3, ud2), which would give the crash reporter EXC_BREAKPOINT or EXC_BAD_INSTRUCTION as natively: the
+/// guest's Mach messages reach the kernel as they are, task_set_exception_ports among them, so a guest's own exception
+/// handler would be sent an x86 thread state it cannot read, and could resume it into the same fault. A signal that
+/// kills the process reaches the crash reporter as EXC_CRASH, which no handler can resume.
+fn end_by_signal(sig: i32) -> ! {
+    unsafe {
+        let mut act: libc::sigaction = std::mem::zeroed();
+        act.sa_sigaction = libc::SIG_DFL;
+        libc::sigemptyset(&mut act.sa_mask);
+        libc::sigaction(sig, &act, std::ptr::null_mut());
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, sig);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+        libc::raise(sig);
+        // Not reached unless something holds the signal off (a tracer): say it with the status a shell would.
+        libc::_exit(128 + sig)
+    }
 }
 
 fn read_insn(a: u64) -> Option<u32> {
@@ -471,7 +711,7 @@ fn read_insn(a: u64) -> Option<u32> {
 pub fn interp_loop(cpu: &mut Cpu) {
     loop {
         if let Err(errno) = crate::signals::poll(cpu) {
-            crash(cpu, &format!("guest signal delivery failed: errno {errno}"));
+            crash(cpu, &format!("guest signal delivery failed: errno {errno}"), libc::SIGABRT);
         }
         match interp::step(cpu) {
             Ok(()) => {}
@@ -481,5 +721,133 @@ pub fn interp_loop(cpu: &mut Cpu) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[path = "engine_crash_tests.rs"]
+mod crash_tests;
+
+#[cfg(test)]
+mod crash_report_tests {
+    use super::*;
+
+    /// A store of a test's own (0700) and the crash directory in it; removed when the test ends.
+    struct Dir(std::path::PathBuf);
+
+    impl Dir {
+        fn new(tag: &str) -> Self {
+            let d = std::env::temp_dir().join(format!("mcl-crash-report-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(d.join("store")).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(d.join("store"), std::fs::Permissions::from_mode(0o700)).unwrap();
+            Dir(d)
+        }
+        fn crash(&self) -> std::path::PathBuf {
+            self.0.join("store").join("crash")
+        }
+        fn names(&self) -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(self.crash()).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+            v.sort();
+            v
+        }
+    }
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn reports_are_kept_to_their_count_and_the_oldest_goes_first() {
+        let d = Dir::new("count");
+        for i in 0..40 {
+            // Ten programs, four reports each: the store's count binds, not a program's.
+            let header = format!("maclator crash report\nprogram: p{}\n", i % 10);
+            assert!(write_crash_report(&d.crash(), &header, &format!("report {i}\n")).is_some(), "report {i} written");
+        }
+        let names = d.names();
+        assert_eq!(names.len(), CRASH_KEEP, "files after 40 reports: {names:?}");
+        assert!(names.iter().all(|n| n.starts_with("crash-") && n.ends_with(".log")), "and no temporary file: {names:?}");
+        let mut kept: Vec<usize> = names
+            .iter()
+            .map(|n| std::fs::read_to_string(d.crash().join(n)).unwrap())
+            .map(|t| t.trim_end().rsplit(' ').next().unwrap().parse().unwrap())
+            .collect();
+        kept.sort();
+        assert_eq!(kept, (40 - CRASH_KEEP..40).collect::<Vec<_>>(), "the newest {CRASH_KEEP} are kept");
+    }
+
+    #[test]
+    fn a_program_that_crashes_again_and_again_keeps_its_share_and_no_more() {
+        let d = Dir::new("share");
+        let w = |program: &str, i: usize| write_crash_report(&d.crash(), &format!("maclator crash report\nprogram: {program}\n"), &format!("report {program} {i}\n")).unwrap();
+        for i in 0..5 {
+            w("quiet", i);
+        }
+        for i in 0..200 {
+            w("loops", i);
+        }
+        let texts: Vec<String> = d.names().iter().map(|n| std::fs::read_to_string(d.crash().join(n)).unwrap()).collect();
+        let of = |p: &str| texts.iter().filter(|t| report_program(t) == p).count();
+        assert_eq!(of("loops"), CRASH_PER_PROGRAM, "the program that loops keeps its share: {texts:?}");
+        assert_eq!(of("quiet"), CRASH_PER_PROGRAM, "and the other keeps its newest reports");
+        assert!(texts.iter().any(|t| t.ends_with("report loops 199\n")) && texts.iter().any(|t| t.ends_with("report quiet 4\n")), "the newest of each");
+        assert_eq!(texts.len(), 2 * CRASH_PER_PROGRAM);
+    }
+
+    #[test]
+    fn a_report_is_cut_to_its_size() {
+        let d = Dir::new("size");
+        let big = "x".repeat(3 * CRASH_MAX_BYTES);
+        let p = write_crash_report(&d.crash(), "header\n", &big).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.len() <= CRASH_MAX_BYTES, "{} bytes", text.len());
+        assert!(text.starts_with("header\n") && text.ends_with(&format!("[maclator: report cut at {CRASH_MAX_BYTES} bytes]\n")), "cut, and says so");
+        // A cut inside a character keeps the file valid text: one byte first, so the cut falls inside a two-byte "é".
+        let wide = format!("x{}", "é".repeat(CRASH_MAX_BYTES));
+        assert!(!format!("h\n\n{wide}").is_char_boundary(CRASH_MAX_BYTES - format!("\n[maclator: report cut at {CRASH_MAX_BYTES} bytes]\n").len()), "control: the cut falls inside a character");
+        let p = write_crash_report(&d.crash(), "h\n", &wide).unwrap();
+        assert!(std::fs::read_to_string(&p).is_ok(), "valid UTF-8 after the cut");
+        // A small one is written whole.
+        let p = write_crash_report(&d.crash(), "h\n", "small\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "h\n\nsmall\n");
+    }
+
+    #[test]
+    fn a_dead_writers_temporary_file_goes_and_a_live_ones_stays() {
+        let d = Dir::new("tmp");
+        assert!(write_crash_report(&d.crash(), "h\n", "first\n").is_some());
+        let (old, new) = (d.crash().join("crash-05.log.123.tmp"), d.crash().join("crash-06.log.124.tmp"));
+        std::fs::write(&old, b"half").unwrap();
+        std::fs::write(&new, b"half").unwrap();
+        let then = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+        std::fs::File::options().write(true).open(&old).unwrap().set_modified(then).unwrap();
+        assert!(write_crash_report(&d.crash(), "h\n", "second\n").is_some());
+        assert!(!old.exists() && new.exists(), "the two-minute-old one went, the new one stayed: {:?}", d.names());
+    }
+
+    #[test]
+    fn no_report_where_the_store_is_not_ours_alone() {
+        let d = Dir::new("mode");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(d.0.join("store"), std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(write_crash_report(&d.crash(), "h\n", "x\n"), None, "a store others can write");
+        std::fs::set_permissions(d.0.join("store"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(write_crash_report(&d.crash(), "h\n", "x\n").is_some(), "control: ours again");
+        let mode = std::fs::metadata(d.crash()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "the crash directory is made ours alone");
+    }
+
+    #[test]
+    fn the_header_names_the_signal_and_no_guest_data() {
+        let h = report_header("guest executed BRK #0x1 (trap)", libc::SIGTRAP);
+        let lines: Vec<&str> = h.lines().collect();
+        assert_eq!(lines[0], "maclator crash report");
+        let keys: Vec<&str> = lines[1..].iter().map(|l| l.split_once(": ").unwrap().0).collect();
+        assert_eq!(keys, ["program", "pid", "time", "signal", "reason", "engine"], "{h}");
+        assert!(h.contains("\nsignal: SIGTRAP (5)\n"), "{h}");
     }
 }
