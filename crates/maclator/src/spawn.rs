@@ -157,6 +157,9 @@ fn kept_reason(rewriting: bool, cwd_record: bool, sandboxed: bool, gpu: bool) ->
 ///   on (RUNTIME_ARGS); arguments that cannot be read are the kernel's to refuse (EFAULT);
 /// - a path that does not resolve, whose last name is a link, or whose last name is spelled otherwise than its file's
 ///   (the child's argv[0], and the directory it names, would be another's: /usr/bin/view to vim, say);
+/// - a set-user-ID or set-group-ID program (the kernel would start the child, and with it the runtime and the engine,
+///   with the file's owner or group; the re-launch execs the translator file, so the child runs with the caller's, as
+///   before);
 /// - a file the kernel does not exec: only a thin 64-bit Mach-O or a big-endian 32-bit fat file (the translator also
 ///   reads little-endian and 64-bit fat files);
 /// - a file whose arm64 slice the kernel would choose otherwise than the translator: the kernel's signature for the
@@ -180,6 +183,10 @@ fn kept_for_call(n: u64, args: &[u64; 8], path: &str) -> Option<&'static str> {
     let spelled = std::path::Path::new(path).file_name();
     if spelled.is_none() || spelled != real.file_name() {
         return Some("its last name is spelled otherwise than its file's");
+    }
+    let Ok(meta) = std::fs::metadata(&real) else { return Some("the path does not resolve") };
+    if std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o6000 != 0 {
+        return Some("a set-user-ID or set-group-ID program");
     }
     let mut magic = [0u8; 4];
     let Ok(mut f) = std::fs::File::open(path) else { return Some("the path does not resolve") };
@@ -816,6 +823,19 @@ int main(int argc, char **argv) {
         sized[at..at + 8].copy_from_slice(&0x4000u64.to_le_bytes());
         let sized = file(&f, "arm64-child-stack", &sized);
         assert_eq!(call(SYS_EXECVE, &sized, &[b"x" as &[u8]], 0), Some("it declares a main-thread stack size"));
+        // A set-user-ID or set-group-ID program, either call: copies of the child with the bit set (the group made this
+        // process's own first, as the owner may set S_ISGID only for a group it is in); the mode is read back, so a bit
+        // the volume dropped fails here and not as a pass.
+        use std::os::unix::fs::PermissionsExt;
+        for (name, mode) in [("arm64-child-suid", 0o4755), ("arm64-child-sgid", 0o2755)] {
+            let p = file(&f, name, &thin);
+            std::os::unix::fs::chown(&p, None, Some(unsafe { libc::getegid() })).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o7777, mode, "{name}: the mode was not set");
+            for n in both {
+                assert_eq!(call(n, &p, &[b"x" as &[u8]], 0), Some("a set-user-ID or set-group-ID program"), "{name} #{n}");
+            }
+        }
     }
 
     #[test]
