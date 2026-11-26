@@ -60,6 +60,11 @@ pub(crate) fn dumps_done() -> u64 {
 }
 static DUMP_W: AtomicI32 = AtomicI32::new(-1);
 
+/// The dump request pipe's two ends (-1 when there is none): what an AOT builder keeps when it closes the rest.
+pub(crate) fn dump_pipe() -> [i32; 2] {
+    [DUMP_R.load(Ordering::SeqCst), DUMP_W.load(Ordering::SeqCst)]
+}
+
 /// SIGUSR2 lines handled (tests: the positive control of the SIGUSR2 scenario).
 static USR2_DONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 

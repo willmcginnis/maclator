@@ -8,8 +8,9 @@ guest regs + disasm to `/tmp/maclator-fault-<pid>.log`), `MACLATOR_STATS=1`,
 `MACLATOR_FALLBACK_HIST=1` (histogram of instructions falling back to the interpreter, written
 to `/tmp/maclator-hist-<pid>.txt`, digit-normalised so exact forms show),
 `MACLATOR_JIT_THRESHOLD`, `MACLATOR_JIT_DISABLE=dpimm,branch,ldst,dpreg,simd,…`,
-`MACLATOR_SPIN_DEBUG=1` (reports a dispatcher spinning on one pc), `MACLATOR_AOT_SYNC`,
-`MACLATOR_NO_AOT_BUILD`, `MACLATOR_CACHE`, `MACLATOR_SYSROOT`.
+`MACLATOR_SPIN_DEBUG=1` (reports a dispatcher spinning on one pc), `MACLATOR_AOT_SYNC` (build in the exiting
+process; it waits its turn behind a running builder, up to 20 minutes), `MACLATOR_NO_AOT_BUILD`, `MACLATOR_CACHE`,
+`MACLATOR_SYSROOT`.
 Signals: `kill -USR1 <pid>` all guest threads (pc/regs/backtrace), `kill -USR2 <pid>` lock-free
 register dump of the interrupted thread + JIT counters (works in forked children).
 `maclator --jit-dump <hex insns…>` prints generated x86 hex for a block (disassemble via a `.byte`

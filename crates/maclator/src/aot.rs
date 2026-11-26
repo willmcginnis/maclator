@@ -11,8 +11,10 @@
 //!  * feedback: every block the JIT translated during a run is recorded in a
 //!    profile, and the next AOT build includes it.
 //!
-//! On exit, if new blocks were seen, a forked child rebuilds the AOT files in
-//! the background, so the next launch starts with warm translations.
+//! On exit, an image with no translation the run could load is built by a forked child in the background, so the
+//! next launch starts with warm translations: once per image and translation format, by one builder at a time (see
+//! "One build per image" below). Blocks a later run sees beyond the translation go into the profile, which the next
+//! engine's build of the image uses.
 
 use crate::jit::emit::{self, StubKind, Unit};
 use iced_x86::BlockEncoderOptions;
@@ -435,26 +437,24 @@ fn cache_layout(head: &[u8; 32], file_len: u64) -> Option<(usize, usize, usize)>
     Some((n, code_len, code_off))
 }
 
-fn load_file(path: &std::path::Path, start: u64, end: u64) -> std::io::Result<usize> {
-    // A sandboxed process reads the store only where its sandbox lets it, asked first so a refusal is never logged.
-    if !crate::sandboxcheck::may_read(path) {
-        crate::sandboxcheck::note_left_alone("not reading saved translations its sandbox does not let it read");
-        return Ok(0);
-    }
+/// A translation file at `path` that this engine would load for an image in [start, end): ours, in a directory of ours,
+/// this format's header with sizes that fit the file, and an index every entry of which is in the image. The open file,
+/// its index, and (blocks, code length, code offset). None: it would not be loaded.
+fn validated(path: &std::path::Path, start: u64, end: u64) -> std::io::Result<Option<(std::fs::File, Vec<u8>, usize, usize, usize)>> {
     let mut f = std::fs::File::open(path)?;
     // The code is run as it is, so only a file of ours in a directory of ours, both writable by no one else.
     let uid = unsafe { libc::geteuid() };
     let dir_ok = path.parent().is_some_and(|d| std::fs::symlink_metadata(d).is_ok_and(|md| md.is_dir() && owned(&md, uid)));
     if !dir_ok || !f.metadata().is_ok_and(|md| md.is_file() && owned(&md, uid)) {
-        return Ok(0);
+        return Ok(None);
     }
     let mut head = [0u8; 32];
     if f.read_exact(&mut head).is_err() {
-        return Ok(0);
+        return Ok(None);
     }
     let rd64 = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
     let Some((n, code_len, code_off)) = cache_layout(&head, f.metadata()?.len()) else {
-        return Ok(0);
+        return Ok(None);
     };
     let mut idx = vec![0u8; n * 16];
     f.read_exact(&mut idx)?;
@@ -463,9 +463,20 @@ fn load_file(path: &std::path::Path, start: u64, end: u64) -> std::io::Result<us
     for entry in idx.chunks_exact(16) {
         let pc = rd64(entry, 0);
         if pc < start || pc >= end || pc & 3 != 0 || rd64(entry, 8) >= code_len as u64 {
-            return Ok(0);
+            return Ok(None);
         }
     }
+    Ok(Some((f, idx, n, code_len, code_off)))
+}
+
+fn load_file(path: &std::path::Path, start: u64, end: u64) -> std::io::Result<usize> {
+    // A sandboxed process reads the store only where its sandbox lets it, asked first so a refusal is never logged.
+    if !crate::sandboxcheck::may_read(path) {
+        crate::sandboxcheck::note_left_alone("not reading saved translations its sandbox does not let it read");
+        return Ok(0);
+    }
+    let Some((mut f, idx, n, code_len, code_off)) = validated(path, start, end)? else { return Ok(0) };
+    let rd64 = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
     // Copy the code into the JIT code cache. (Mapping the file itself PROT_EXEC makes macOS
     // run a Gatekeeper assessment on every cache file and pop up "could not verify" dialogs.)
     let cc = crate::jit::code_cache();
@@ -490,8 +501,8 @@ fn read_profile(path: &std::path::Path) -> BTreeSet<u64> {
     s
 }
 
-/// Save this run's profile; if it contains new blocks, rebuild AOT files in
-/// a background (forked) process.
+/// Save this run's profile; if an image has no translation that this run could load, and none has been made or tried
+/// for it (see "One build per image" below), build it in a background (forked) process.
 pub fn save_profile() {
     if !ENABLED.load(Ordering::Relaxed) || SAVED.swap(true, Ordering::SeqCst) {
         return;
@@ -505,7 +516,8 @@ pub fn save_profile() {
     flush_pending();
     let imgs = IMAGES.lock().unwrap().clone();
     let seen = SEEN.lock().unwrap().clone();
-    if !owned_dir(&cache_dir(), unsafe { libc::geteuid() }) {
+    let dir = cache_dir();
+    if !owned_dir(&dir, unsafe { libc::geteuid() }) {
         return;
     }
     let mut rebuild = Vec::new();
@@ -514,10 +526,12 @@ pub fn save_profile() {
         let mut prof = read_profile(&path);
         let before = prof.len();
         prof.extend(seen[i].iter().copied());
-        // A file left by an older translator is present but unusable. Rebuild
-        // it even when this run saw no blocks beyond the existing profile.
+        // A file left by an older translator is present but unusable: such an image is built even when this run saw
+        // no blocks beyond the existing profile. An image whose translation was loaded is built already, and blocks
+        // this run saw beyond it only go into its profile, for the next engine's build.
         let aot_missing = !img.cached;
-        if prof.len() != before || (aot_missing && (!prof.is_empty() || !img.entries.is_empty())) {
+        let wanted = aot_missing && (!prof.is_empty() || !img.entries.is_empty());
+        if prof.len() != before || wanted {
             let mut buf = Vec::with_capacity(prof.len() * 8);
             for pc in &prof {
                 buf.extend_from_slice(&pc.to_le_bytes());
@@ -525,12 +539,35 @@ pub fn save_profile() {
             // Retire what this image left at other bases only once its new profile is written: under disk pressure
             // the write can fail, and the old entry is then all there is.
             if std::fs::write(&path, buf).is_ok() {
-                retire_superseded(&cache_dir(), &img.key, "save_profile");
+                retire_superseded(&dir, &img.key, "save_profile");
             }
+        }
+        if wanted {
             rebuild.push((img.clone(), prof));
         }
     }
     if rebuild.is_empty() || std::env::var_os("MACLATOR_NO_AOT_BUILD").is_some() {
+        return;
+    }
+    // Asked before forking, so an exit with nothing to build forks nothing. Nothing is locked or written here: the
+    // builder decides again under the image's lock, and this answer only spares it the fork.
+    let me = Asker::now();
+    // A dead builder's temporary file may be what takes the room, and only a builder sweeps: sweep here too (it removes
+    // only files older than any builder lives, AOT_TMP_STALE_S).
+    if !has_room(&dir) && (sweep_stale_tmps(&dir) == 0 || !has_room(&dir)) {
+        trace_build(format_args!("not building: under {} MiB free in the store", AOT_MIN_FREE >> 20));
+        return;
+    }
+    // A library unmapped and replaced since it was registered is not this run's to build (nor to defer: the identity's
+    // record is shared with a copy of it mapped elsewhere, which may be live).
+    let read = crate::jit::guest_reader();
+    rebuild.retain(|(img, _)| still_there(img, &read));
+    rebuild.retain(|(img, _)| wants_build(&dir, img, &me));
+    if rebuild.is_empty() {
+        return;
+    }
+    if queue_full(&dir) {
+        trace_build(format_args!("not building: a builder is running and {AOT_QUEUE} are waiting"));
         return;
     }
     let sync = std::env::var_os("MACLATOR_AOT_SYNC").is_some();
@@ -541,36 +578,657 @@ pub fn save_profile() {
         return;
     }
     if !sync {
+        #[cfg(test)]
+        once_tests::fork_hook();
         unsafe {
             libc::setsid();
+            // What the program had open goes first, so the builder has descriptors to open anything with, and keeps
+            // none of the program's lock files or sockets.
+            close_inherited(&crate::engine::dump_pipe());
             let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
             libc::dup2(null, 0);
             libc::dup2(null, 1);
             libc::dup2(null, 2);
+            if null > 2 {
+                libc::close(null);
+            }
+            become_background_builder();
         }
     }
     // With MACLATOR_AOT_DONE_FILE set, the builder
     // says it finished, and how each image went, in that file (written whole, by rename) as its
     // last act: "aot-build pid=<pid> images=<n> ok=<k> skipped=<s> failed=<f>", where ok counts images whose
     // file was published and skipped those with no block to translate. A test can then tell a builder
-    // that finished from one still running or killed, which a count of .aot files cannot.
-    let done = std::env::var_os("MACLATOR_AOT_DONE_FILE");
-    let (mut ok, mut skipped, mut failed) = (0usize, 0usize, 0usize);
-    let images = rebuild.len();
-    for (img, prof) in rebuild {
-        match build(&img, &prof) {
-            Ok(true) => ok += 1,
-            Ok(false) => skipped += 1,
-            Err(_) => failed += 1,
+    // that finished from one still running or killed, which a count of .aot files cannot. A builder that found
+    // nothing left to build, or no room in the queue, writes no line.
+    if let Some((images, ok, skipped, failed)) = build_queued(&dir, rebuild, &me, sync) {
+        if let Some(done) = std::env::var_os("MACLATOR_AOT_DONE_FILE") {
+            let pid = std::process::id();
+            write_done(std::path::Path::new(&done), pid, &format!("aot-build pid={pid} images={images} ok={ok} skipped={skipped} failed={failed}\n"));
         }
-    }
-    if let Some(done) = done {
-        let pid = std::process::id();
-        write_done(std::path::Path::new(&done), pid, &format!("aot-build pid={pid} images={images} ok={ok} skipped={skipped} failed={failed}\n"));
     }
     if !sync {
         unsafe { libc::_exit(0) };
     }
+}
+
+// ---- One build per image, one builder at a time ----
+//
+// Every exit used to fork a builder when the image had no translation it could load or its run had seen a block the
+// profile lacked. A daemon that dies and is started again every few seconds therefore kept many builders running at
+// once, each translating the same image again, and they took half of a small machine's CPU. Now:
+//  * an image is built at most once per AOT format: its identity (`identity_prefix`: kind, UUID, path) has a build
+//    record, and an image whose record says it was built, or that its build failed with this engine, is not built
+//    again (a failure is retried by another engine, a build deferred for want of space or another passing reason, a
+//    translation found missing or unloadable and an image found at another base, each after an hour or in a later
+//    boot);
+//  * one builder at a time builds, per store: it holds `aot-builder.lock`. Up to AOT_QUEUE more wait their turn,
+//    each holding one `aot-queue-<n>.lock`; a request that finds the queue full is dropped (a later exit asks again);
+//  * a builder holds a write lock on each image record it took, while it waits and while it builds, so a second
+//    request for an image that is queued or being built is a no-op. The kernel drops a dead process's locks, so a
+//    builder that dies leaves no image held: its record says "building" with its lock free, which the next request
+//    reads as a builder that died, and builds again, at most AOT_MAX_ATTEMPTS times per engine and boot;
+//  * the builder keeps nothing the program had open (a lock file, a socket), runs at background priority, and is
+//    ended after AOT_BUILD_CPU_S of CPU (a build that loops) or AOT_BUILD_WALL_S of time (one that is stuck).
+// The locks are fcntl record locks on files of ours (0600, in the store's 0700 directory, never followed through a
+// symlink). Rosetta's oahd translates each binary once and keeps it; this keeps that rule in the store, which every
+// engine sharing it reads. An engine that predates the records ignores them, and is fought at most once an hour: an
+// image whose record says built and whose file another engine's format replaced is built again after the hour.
+
+/// Builders that may wait while one builds, per store.
+const AOT_QUEUE: usize = 2;
+/// How long a waiting builder waits for its turn before it gives up (a later exit asks again).
+const AOT_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+/// A builder that has used this much CPU is ended (SIGXCPU: a build that loops), and its images count one attempt each.
+/// CPU, not time: a builder at background priority on a busy machine may take long without being stuck.
+const AOT_BUILD_CPU_S: u64 = 20 * 60;
+/// A builder still building after this long is ended (SIGALRM: one blocked without using CPU), its images counting an
+/// attempt each.
+const AOT_BUILD_WALL_S: u32 = 3 * 60 * 60;
+/// Builds of one image by one engine that may die before the image is left alone for that engine.
+const AOT_MAX_ATTEMPTS: u32 = 2;
+/// Below this much free space in the store nothing is built (nor forked): a translation runs to tens of MiB.
+const AOT_MIN_FREE: u64 = 256 << 20;
+/// A deferred build (no space, no descriptors or memory), a translation found missing or unloadable since it was built,
+/// and another engine's failed or dead build are tried again after this long, or in a later boot.
+const AOT_RETRY_S: u64 = 60 * 60;
+/// A builder's temporary file this old belongs to a builder that died: no builder lives longer (its queue wait and its
+/// wall deadline), so one paused (a guest suspended) is not swept from under it.
+const AOT_TMP_STALE_S: u64 = AOT_QUEUE_WAIT.as_secs() + AOT_BUILD_WALL_S as u64 + 60 * 60;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BuildState {
+    Built,
+    Failed,
+    Building,
+    /// Failed for a reason that passes: no space, no descriptors, no memory.
+    Deferred,
+}
+
+impl BuildState {
+    fn word(self) -> &'static str {
+        match self {
+            BuildState::Built => "built",
+            BuildState::Failed => "failed",
+            BuildState::Building => "building",
+            BuildState::Deferred => "deferred",
+        }
+    }
+    fn from_word(w: &str) -> Option<Self> {
+        Some(match w {
+            "built" => BuildState::Built,
+            "failed" => BuildState::Failed,
+            "building" => BuildState::Building,
+            "deferred" => BuildState::Deferred,
+            _ => return None,
+        })
+    }
+}
+
+/// One image identity's build record, one line in `<identity>.<format>.build`, ending in a checksum of the rest so a
+/// torn write reads as no record (which costs one build at most).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BuildRecord {
+    state: BuildState,
+    /// The engine that wrote it (`engine_id`).
+    engine: String,
+    /// The base the image was at (`Image::start`).
+    base: u64,
+    /// The boot it was written in (kern.bootsessionuuid; empty when unknown).
+    boot: String,
+    /// Builds of this image by this engine begun so far, the one in progress included.
+    attempts: u32,
+    /// Seconds since the epoch.
+    time: u64,
+    pid: u32,
+    /// Blocks in the profile it was built from.
+    blocks: usize,
+}
+
+impl BuildRecord {
+    fn line(&self) -> String {
+        let body = format!(
+            "state={} engine={} base={:x} boot={} attempts={} time={} pid={} blocks={}",
+            self.state.word(),
+            self.engine,
+            self.base,
+            self.boot,
+            self.attempts,
+            self.time,
+            self.pid,
+            self.blocks
+        );
+        let sum = fnv(&[body.as_bytes()]);
+        format!("{body} sum={sum}\n")
+    }
+
+    fn parse(bytes: &[u8]) -> Option<Self> {
+        let line = std::str::from_utf8(bytes).ok()?.split_once('\n')?.0;
+        let (body, sum) = line.rsplit_once(" sum=")?;
+        if fnv(&[body.as_bytes()]) != sum {
+            return None;
+        }
+        let mut fields = body.split(' ').map(|f| f.split_once('='));
+        let mut next = |name: &str| match fields.next() {
+            Some(Some((k, v))) if k == name => Some(v.to_string()),
+            _ => None,
+        };
+        let state = BuildState::from_word(&next("state")?)?;
+        let engine = next("engine")?;
+        let base = u64::from_str_radix(&next("base")?, 16).ok()?;
+        let boot = next("boot")?;
+        let attempts = next("attempts")?.parse().ok()?;
+        let time = next("time")?.parse().ok()?;
+        let pid = next("pid")?.parse().ok()?;
+        let blocks = next("blocks")?.parse().ok()?;
+        Some(BuildRecord { state, engine, base, boot, attempts, time, pid, blocks })
+    }
+}
+
+/// Who is asking whether an image is due: this engine, in this boot, now.
+#[derive(Clone, Debug)]
+struct Asker {
+    engine: String,
+    boot: String,
+    now: u64,
+}
+
+impl Asker {
+    fn now() -> Self {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        #[cfg(test)]
+        if let Ok(boot) = std::env::var("MCL_TEST_BOOT") {
+            return Asker { engine: engine_id(), boot, now };
+        }
+        Asker { engine: engine_id(), boot: crate::cache::boot_session_uuid().unwrap_or_default(), now }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Due {
+    /// Build it; `attempts` builds of it by this engine began before and died.
+    Yes { attempts: u32 },
+    No(&'static str),
+}
+
+/// Whether the image at `base` is due a build, from its record (read under its lock, or as a hint before forking)
+/// and whether a translation of this format for this base is in the store (`aot_loadable`). The caller already knows
+/// that this run did not load one.
+fn build_due(rec: Option<&BuildRecord>, me: &Asker, base: u64, loadable: bool) -> Due {
+    let Some(r) = rec else { return Due::Yes { attempts: 0 } };
+    let later_boot = !me.boot.is_empty() && !r.boot.is_empty() && r.boot != me.boot;
+    let retry_due = later_boot || me.now >= r.time.saturating_add(AOT_RETRY_S);
+    match r.state {
+        // Its file is gone or cannot be loaded: the store was cleared, a run of the image at another base retired it
+        // (a profile written for that base retires the other bases' entries), another engine's format replaced it, or
+        // it was torn. Built again, but not at once: an image that alternates between two bases, or between two
+        // engines' formats, would otherwise be built again after every run of the other.
+        BuildState::Built if r.base == base => {
+            if loadable {
+                Due::No("built")
+            } else if retry_due {
+                Due::Yes { attempts: 0 }
+            } else {
+                Due::No("built, and its file gone or unloadable since, within the hour")
+            }
+        }
+        // It moved. In the same boot it is sliding from exec to exec, and a translation for this base would be
+        // used by no later run; in a later boot this is where it lives now.
+        // An hour later too: a record written when the boot could not be read must not keep a moved image unbuilt.
+        BuildState::Built => {
+            if retry_due {
+                Due::Yes { attempts: 0 }
+            } else {
+                Due::No("built at another base within the hour")
+            }
+        }
+        // Another engine tries a failure again, but not at once: two engines of one format taking turns in one store
+        // would otherwise each build the failing image after every run of the other.
+        BuildState::Failed => {
+            if r.engine == me.engine {
+                Due::No("its build failed with this engine")
+            } else if retry_due {
+                Due::Yes { attempts: 0 }
+            } else {
+                Due::No("its build failed with another engine within the hour")
+            }
+        }
+        BuildState::Deferred => {
+            if retry_due {
+                Due::Yes { attempts: 0 }
+            } else {
+                Due::No("its build was deferred within the hour")
+            }
+        }
+        // Read with its lock free: the builder that wrote it is gone, killed or ended by its deadline, or by a reboot.
+        // After AOT_MAX_ATTEMPTS in one boot it is left until a later boot or another engine: a builder that dies
+        // because the machine is too busy may get through in another boot, and one that dies of the image itself
+        // dies AOT_MAX_ATTEMPTS times a boot at most.
+        BuildState::Building => {
+            if loadable && r.base == base {
+                // It published before it died, between the rename and the record.
+                Due::No("built")
+            } else if later_boot {
+                Due::Yes { attempts: 0 }
+            } else if r.engine != me.engine {
+                if retry_due {
+                    Due::Yes { attempts: 0 }
+                } else {
+                    Due::No("another engine's builder died within the hour")
+                }
+            } else if r.attempts >= AOT_MAX_ATTEMPTS {
+                Due::No("its builder died every time")
+            } else {
+                Due::Yes { attempts: r.attempts }
+            }
+        }
+    }
+}
+
+/// The translation format: what decides whether a file can be loaded (`cache_layout`).
+fn format_tag() -> String {
+    format!("v{TRANSLATOR_VERSION}-{:x}", flags_word())
+}
+
+/// The engine, for a build record: the format and this binary's LC_UUID, so a new build of the engine tries again
+/// what an older one could not build.
+fn engine_id() -> String {
+    #[cfg(test)]
+    if let Ok(id) = std::env::var("MCL_TEST_ENGINE_ID") {
+        return id;
+    }
+    format!("{}-{}", format_tag(), own_uuid().map(|u| hex(&u)).unwrap_or_else(|| "nouuid".into()))
+}
+
+/// This binary's LC_UUID, read from its own Mach-O header in memory.
+pub(crate) fn own_uuid() -> Option<[u8; 16]> {
+    let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+    if unsafe { libc::dladdr(own_uuid as *const libc::c_void, &mut info) } == 0 || info.dli_fbase.is_null() {
+        return None;
+    }
+    let base = info.dli_fbase as u64;
+    let rd = |o: u64| unsafe { std::ptr::read_unaligned((base + o) as *const u32) };
+    // mach_header_64: magic, cputype, cpusubtype, filetype, ncmds at +16, sizeofcmds at +20; commands from +32.
+    if rd(0) != 0xfeed_facf {
+        return None;
+    }
+    let (ncmds, end) = (rd(16), 32 + rd(20) as u64);
+    let mut off = 32u64;
+    for _ in 0..ncmds.min(4096) {
+        let (cmd, size) = (rd(off), rd(off + 4) as u64);
+        if size < 8 || off + size > end {
+            return None;
+        }
+        if cmd == 0x1b && size >= 24 {
+            let mut uuid = [0u8; 16];
+            uuid.copy_from_slice(unsafe { std::slice::from_raw_parts((base + off + 8) as *const u8, 16) });
+            return Some(uuid);
+        }
+        off += size;
+    }
+    None
+}
+
+fn record_path(dir: &std::path::Path, img: &Image) -> std::path::PathBuf {
+    let identity = identity_prefix(&img.key).unwrap_or(&img.key);
+    dir.join(format!("{identity}.{}.build", format_tag()))
+}
+
+/// Open a file of the store's bookkeeping (a build record or a lock), made 0600 if `create`; refused unless it is a
+/// regular file of ours that no one else can write, reached without a symlink.
+fn open_store_file(path: &std::path::Path, create: bool) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(create)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let md = f.metadata()?;
+    if !(md.is_file() && owned(&md, unsafe { libc::geteuid() })) {
+        return Err(std::io::Error::other("not a file of ours alone"));
+    }
+    Ok(f)
+}
+
+fn whole_file_lock(kind: libc::c_short) -> libc::flock {
+    let mut l: libc::flock = unsafe { std::mem::zeroed() };
+    l.l_type = kind;
+    l.l_whence = libc::SEEK_SET as libc::c_short;
+    l
+}
+
+/// Take the write lock on all of `f` if no other process holds a lock on it. Locks are this process's: closing any
+/// descriptor of the file in this process drops them, so a file locked here is opened nowhere else in the process.
+fn try_lock(f: &std::fs::File) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let mut l = whole_file_lock(libc::F_WRLCK as libc::c_short);
+    unsafe { libc::fcntl(f.as_raw_fd(), libc::F_SETLK, &mut l) == 0 }
+}
+
+/// Whether another process holds a lock on `f`. When the kernel cannot say, the answer is yes: the caller then leaves
+/// the file alone, which costs at most a build this exit does not ask for.
+fn locked_elsewhere(f: &std::fs::File) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let mut l = whole_file_lock(libc::F_WRLCK as libc::c_short);
+    let r = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETLK, &mut l) };
+    r != 0 || l.l_type != libc::F_UNLCK as libc::c_short
+}
+
+fn read_record(f: &std::fs::File) -> Option<BuildRecord> {
+    use std::os::unix::fs::FileExt;
+    let mut buf = [0u8; 512];
+    let n = f.read_at(&mut buf, 0).ok()?;
+    BuildRecord::parse(&buf[..n])
+}
+
+/// Replace the record in `f` (whose lock this process holds): one write of a line under 512 bytes, then the file cut
+/// to it.
+fn write_record(f: &std::fs::File, r: &BuildRecord) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    let line = r.line();
+    f.write_all_at(line.as_bytes(), 0)?;
+    f.set_len(line.len() as u64)
+}
+
+/// Whether the store holds a translation this engine would load for `img`: every check `load_file` makes before it
+/// copies the code (`validated`). Not a file of another engine's format, a torn or truncated one, one whose index is
+/// damaged, or one not ours alone.
+fn aot_loadable(img: &Image) -> bool {
+    validated(&file_for(img, "aot"), img.start, img.end).is_ok_and(|v| v.is_some())
+}
+
+/// Before forking: whether `img` is worth a builder (its record says it is due, and no builder holds it).
+fn wants_build(dir: &std::path::Path, img: &Image, me: &Asker) -> bool {
+    let why = match open_store_file(&record_path(dir, img), false) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(_) => "its build record is not a file of ours",
+        Ok(f) if locked_elsewhere(&f) => "a builder holds it",
+        Ok(f) => match build_due(read_record(&f).as_ref(), me, img.start, aot_loadable(img)) {
+            Due::Yes { .. } => return true,
+            Due::No(why) => why,
+        },
+    };
+    trace_build(format_args!("{}: not building ({why})", img.name));
+    false
+}
+
+/// Before forking: whether a builder is building and every place in the queue is taken.
+fn queue_full(dir: &std::path::Path) -> bool {
+    let held = |name: &str| open_store_file(&dir.join(name), false).is_ok_and(|f| locked_elsewhere(&f));
+    held("aot-builder.lock") && (0..AOT_QUEUE).all(|i| held(&format!("aot-queue-{i}.lock")))
+}
+
+/// Whether the store's volume has AOT_MIN_FREE free. When it cannot be read, yes: the build then fails or not on
+/// its own, and a failure for want of space is recorded as such.
+fn has_room(dir: &std::path::Path) -> bool {
+    #[cfg(test)]
+    if let Some(free) = std::env::var("MCL_TEST_FREE_BYTES").ok().and_then(|v| v.parse::<u64>().ok()) {
+        return free >= AOT_MIN_FREE;
+    }
+    // A test's store has no room while the file it names exists.
+    #[cfg(test)]
+    if let Some(p) = std::env::var_os("MCL_TEST_NO_ROOM_IF") {
+        return !std::path::Path::new(&p).exists();
+    }
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else { return true };
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return true;
+    }
+    // ST_RDONLY (1): a store on a read-only volume has no room, so no exit forks a builder that can record nothing.
+    st.f_flag & 1 == 0 && (st.f_bavail as u64).saturating_mul(st.f_frsize as u64) >= AOT_MIN_FREE
+}
+
+fn trace_build(what: std::fmt::Arguments) {
+    if std::env::var_os("MACLATOR_TRACE").is_some() || std::env::var_os("MACLATOR_STATS").is_some() {
+        eprintln!("[maclator] aot: {what}");
+    }
+}
+
+/// The builder process, once forked: in its own session at background priority (CPU and I/O); every signal it can
+/// take at its default action and unblocked, so it ends when it is told to (it runs no guest code, so the guest's
+/// handlers, which the fork kept, would only swallow a SIGTERM or a deadline's signal), but SIGUSR1/SIGUSR2, which are
+/// the translator's own dumps; no core file; nothing the program had open but stdio and the dump pipe (a builder that
+/// kept them would hold the program's lock files and sockets while it waits and builds, and a restarted program could
+/// not take them back); and an alarm that ends it if it has not got its turn and finished by then.
+unsafe fn become_background_builder() {
+    for sig in 1..32 {
+        if !matches!(sig, libc::SIGKILL | libc::SIGSTOP | libc::SIGUSR1 | libc::SIGUSR2) {
+            libc::signal(sig, libc::SIG_DFL);
+        }
+    }
+    let mut none: libc::sigset_t = std::mem::zeroed();
+    libc::sigemptyset(&mut none);
+    libc::sigprocmask(libc::SIG_SETMASK, &none, std::ptr::null_mut());
+    libc::setpriority(libc::PRIO_DARWIN_PROCESS, 0, libc::PRIO_DARWIN_BG);
+    let no_core = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    libc::setrlimit(libc::RLIMIT_CORE, &no_core);
+    // Room for a descriptor per claimed image and the locks, whatever soft limit the program ran with.
+    let mut files: libc::rlimit = std::mem::zeroed();
+    if libc::getrlimit(libc::RLIMIT_NOFILE, &mut files) == 0 && files.rlim_cur < 1024 {
+        files.rlim_cur = files.rlim_max.min(1024);
+        libc::setrlimit(libc::RLIMIT_NOFILE, &files);
+    }
+    libc::alarm(AOT_QUEUE_WAIT.as_secs() as libc::c_uint + AOT_BUILD_WALL_S);
+}
+
+/// Close every descriptor above stdio but those in `keep`: those /dev/fd lists (the listing's own descriptor is closed
+/// before the others are), or, when no descriptor is free to list them with, every number up to the soft limit.
+fn close_inherited(keep: &[i32]) {
+    let fds: Vec<i32> = match std::fs::read_dir("/dev/fd") {
+        Ok(rd) => rd.flatten().filter_map(|e| e.file_name().to_str()?.parse().ok()).collect(),
+        Err(_) => {
+            let mut l: libc::rlimit = unsafe { std::mem::zeroed() };
+            let top = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut l) } == 0 { l.rlim_cur.min(1 << 16) as i32 } else { 1 << 16 };
+            (3..top).collect()
+        }
+    };
+    for fd in fds {
+        if fd > 2 && !keep.contains(&fd) {
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
+/// Once the builder has its turn: at most AOT_BUILD_CPU_S more of CPU (SIGXCPU, at its default action, ends it) and
+/// AOT_BUILD_WALL_S of time (SIGALRM).
+unsafe fn set_build_deadline() {
+    let mut used: libc::rusage = std::mem::zeroed();
+    libc::getrusage(libc::RUSAGE_SELF, &mut used);
+    let spent = (used.ru_utime.tv_sec + used.ru_stime.tv_sec).max(0) as u64;
+    let mut lim: libc::rlimit = std::mem::zeroed();
+    libc::getrlimit(libc::RLIMIT_CPU, &mut lim);
+    let want = spent.saturating_add(AOT_BUILD_CPU_S) as libc::rlim_t;
+    lim.rlim_cur = want.min(lim.rlim_max);
+    libc::setrlimit(libc::RLIMIT_CPU, &lim);
+    libc::alarm(AOT_BUILD_WALL_S);
+}
+
+/// An image this builder holds: the open (and locked) record and the builds begun before.
+struct Claim {
+    file: std::fs::File,
+    attempts: u32,
+}
+
+/// Take `img`'s record and decide under its lock. None: another builder holds it, or it is not due.
+fn claim(dir: &std::path::Path, img: &Image, me: &Asker) -> Option<Claim> {
+    let f = open_store_file(&record_path(dir, img), true).ok()?;
+    if !try_lock(&f) {
+        trace_build(format_args!("{}: not building (a builder holds it)", img.name));
+        return None;
+    }
+    let rec = read_record(&f);
+    match build_due(rec.as_ref(), me, img.start, aot_loadable(img)) {
+        Due::Yes { attempts } => Some(Claim { file: f, attempts }),
+        Due::No(why) => {
+            trace_build(format_args!("{}: not building ({why})", img.name));
+            None
+        }
+    }
+}
+
+enum Turn {
+    Mine(std::fs::File),
+    Dropped(&'static str),
+}
+
+/// Wait for this builder's turn: `aot-builder.lock`, at once, or from a place in the queue for at most `wait`.
+fn wait_turn(dir: &std::path::Path, wait: std::time::Duration) -> Turn {
+    let Ok(lock) = open_store_file(&dir.join("aot-builder.lock"), true) else { return Turn::Dropped("the builder lock is not a file of ours") };
+    if try_lock(&lock) {
+        return Turn::Mine(lock);
+    }
+    let place = (0..AOT_QUEUE).find_map(|i| open_store_file(&dir.join(format!("aot-queue-{i}.lock")), true).ok().filter(try_lock));
+    let Some(place) = place else { return Turn::Dropped("the queue is full") };
+    let end = std::time::Instant::now() + wait;
+    while std::time::Instant::now() < end {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        if try_lock(&lock) {
+            drop(place);
+            return Turn::Mine(lock);
+        }
+    }
+    Turn::Dropped("its turn did not come")
+}
+
+/// A builder's temporary file: `<key>.aot.<pid>.tmp`, or `<key>.aot.tmp` from before upstream #7.
+fn is_builder_tmp(name: &str) -> bool {
+    let Some(s) = name.strip_suffix(".tmp") else { return false };
+    if s.ends_with(".aot") {
+        return true;
+    }
+    s.rsplit_once('.').is_some_and(|(stem, pid)| stem.ends_with(".aot") && !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Remove the temporary files of builders that died: older than AOT_TMP_STALE_S (no live builder's is that old). How
+/// many went.
+fn sweep_stale_tmps(dir: &std::path::Path) -> usize {
+    let Ok(rd) = std::fs::read_dir(dir) else { return 0 };
+    let now = std::time::SystemTime::now();
+    let mut gone = 0;
+    for ent in rd.flatten() {
+        let name = ent.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !is_builder_tmp(name) {
+            continue;
+        }
+        let age = ent.metadata().and_then(|m| m.modified()).ok().and_then(|t| now.duration_since(t).ok());
+        if age.is_some_and(|a| a.as_secs() >= AOT_TMP_STALE_S) && std::fs::remove_file(ent.path()).is_ok() {
+            trace_build(format_args!("removed {name}, left by a builder that died"));
+            gone += 1;
+        }
+    }
+    gone
+}
+
+/// A failure that passes: no space, no descriptors, no memory, interrupted, a file gone. Such a build is deferred, not
+/// failed.
+fn is_transient(e: &std::io::Error) -> bool {
+    // ENOENT: the temporary file was removed before its rename (the store cleared under the builder).
+    matches!(e.raw_os_error(), Some(libc::ENOSPC | libc::EDQUOT | libc::EMFILE | libc::ENFILE | libc::ENOMEM | libc::EAGAIN | libc::EINTR | libc::ENOENT))
+}
+
+/// Build the images this builder can claim, in its turn. None: it claimed none, or its turn did not come.
+fn build_queued(dir: &std::path::Path, rebuild: Vec<(Image, BTreeSet<u64>)>, me: &Asker, sync: bool) -> Option<(usize, usize, usize, usize)> {
+    // One claim per record: two images of one identity (at two bases) would lock one file twice, and closing either
+    // descriptor would drop the lock both rely on.
+    let mut seen = HashSet::new();
+    let read = crate::jit::guest_reader();
+    let claims: Vec<_> = rebuild
+        .into_iter()
+        // Before the de-duplication: a stale registration of a library must not stand in for a live copy of it.
+        .filter(|(img, _)| still_there(img, &read))
+        .filter(|(img, _)| seen.insert(record_path(dir, img)))
+        .filter_map(|(img, prof)| claim(dir, &img, me).map(|c| (c, img, prof)))
+        .collect();
+    if claims.is_empty() {
+        return None;
+    }
+    let lock = match wait_turn(dir, AOT_QUEUE_WAIT) {
+        Turn::Mine(lock) => lock,
+        Turn::Dropped(why) => {
+            trace_build(format_args!("not building ({why})"));
+            return None;
+        }
+    };
+    if !sync {
+        unsafe { set_build_deadline() };
+    }
+    sweep_stale_tmps(dir);
+    let (mut ok, mut skipped, mut failed) = (0usize, 0usize, 0usize);
+    let images = claims.len();
+    for (c, img, prof) in claims {
+        let rec = |state| BuildRecord {
+            state,
+            engine: me.engine.clone(),
+            base: img.start,
+            boot: me.boot.clone(),
+            attempts: c.attempts + 1,
+            time: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+            pid: std::process::id(),
+            blocks: prof.len(),
+        };
+        // Asked again for each image: the one before may have taken the room.
+        if !has_room(dir) {
+            let _ = write_record(&c.file, &rec(BuildState::Deferred));
+            failed += 1;
+            continue;
+        }
+        // A build it cannot record is not begun: a store that cannot take a line cannot take a translation, and
+        // building without a record is building again at every exit.
+        if write_record(&c.file, &rec(BuildState::Building)).is_err() {
+            failed += 1;
+            continue;
+        }
+        let state = match build(&img, &prof) {
+            Ok(true) => {
+                ok += 1;
+                BuildState::Built
+            }
+            // Nothing could be read to translate, or the library is no longer mapped where it was registered: maybe
+            // in another run, so deferred, not failed.
+            Ok(false) => {
+                skipped += 1;
+                BuildState::Deferred
+            }
+            Err(e) => {
+                failed += 1;
+                if is_transient(&e) {
+                    BuildState::Deferred
+                } else {
+                    BuildState::Failed
+                }
+            }
+        };
+        let _ = write_record(&c.file, &rec(state));
+        trace_build(format_args!("{}: {}", img.name, state.word()));
+        // Dropping the claim closes the record and frees the image.
+    }
+    drop(lock);
+    Some((images, ok, skipped, failed))
 }
 
 /// The temporary file a builder writes its done line to, beside `done`. Builders inheriting one
@@ -648,7 +1306,19 @@ fn create_private(p: &std::path::Path) -> std::io::Result<std::fs::File> {
 
 /// Translate `img` and publish its AOT file. `Ok(false)`: no block could be read, so nothing was published.
 fn build(img: &Image, profile: &BTreeSet<u64>) -> std::io::Result<bool> {
+    #[cfg(test)]
+    once_tests::build_hook(img, "start");
+    let r = build_image(img, profile);
+    #[cfg(test)]
+    once_tests::build_hook(img, if r.is_ok() { "end" } else { "fail" });
+    r
+}
+
+fn build_image(img: &Image, profile: &BTreeSet<u64>) -> std::io::Result<bool> {
     let read = crate::jit::guest_reader();
+    if !still_there(img, &read) {
+        return Ok(false);
+    }
     let mut blocks: BTreeSet<u64> = profile.clone();
     if !img.entries.is_empty() {
         blocks.extend(discover(&img.entries, img.start, img.end, &read, 400_000));
@@ -722,6 +1392,36 @@ fn build(img: &Image, profile: &BTreeSet<u64>) -> std::io::Result<bool> {
     // again is dead weight. Without this the store grows by one entry per slid exec, for ever.
     retire_superseded(&cache_dir(), &img.key, "build");
     Ok(true)
+}
+
+/// Whether a library is still the one its key names. It was registered when dyld mapped it (`register_image_at`), and
+/// it may have been unmapped since and another mapped at its addresses; its code must not be published under the other's
+/// UUID. Read from the Mach-O header at its start, where dyld maps a library's __TEXT. Other kinds are not unmapped.
+fn still_there(img: &Image, read: &dyn Fn(u64) -> Option<u32>) -> bool {
+    let Some(uuid) = img.key.strip_prefix("lib-").and_then(|k| k.split('-').next()) else { return true };
+    let at = img.start;
+    if read(at) != Some(0xfeed_facf) || read(at + 4) != Some(0x0100_000c) {
+        return false;
+    }
+    let Some(ncmds) = read(at + 16) else { return false };
+    let mut off = 32u64;
+    for _ in 0..ncmds.min(512) {
+        let (Some(cmd), Some(size)) = (read(at + off), read(at + off + 4)) else { return false };
+        let size = size as u64;
+        if size < 8 || off + size > 0x4000 {
+            return false;
+        }
+        if cmd == 0x1b && size >= 24 {
+            let mut bytes = Vec::with_capacity(16);
+            for i in 0..4 {
+                let Some(w) = read(at + off + 8 + 4 * i) else { return false };
+                bytes.extend_from_slice(&w.to_le_bytes());
+            }
+            return hex(&bytes) == uuid;
+        }
+        off += size;
+    }
+    false
 }
 
 /// `maclator --aot <exe>`: translate the main executable ahead of time
@@ -1350,5 +2050,136 @@ mod retire_tests {
         assert_eq!(retire_superseded(&gone, "main-aa-bb-500000000", "test"), 0);
         assert_eq!(retire_superseded(&d, "main-aa-bb-500000000", "test"), 0);
         std::fs::remove_dir_all(&d).ok();
+    }
+}
+
+#[cfg(test)]
+#[path = "aot_once_tests.rs"]
+mod once_tests;
+
+#[cfg(test)]
+mod build_record_tests {
+    use super::*;
+
+    fn rec(state: BuildState) -> BuildRecord {
+        BuildRecord { state, engine: "e1".into(), base: 0x5_0000_0000, boot: "B1".into(), attempts: 1, time: 1000, pid: 7, blocks: 3 }
+    }
+
+    fn me() -> Asker {
+        Asker { engine: "e1".into(), boot: "B1".into(), now: 1000 }
+    }
+
+    #[test]
+    fn a_record_reads_back_and_a_torn_one_reads_as_none() {
+        let r = rec(BuildState::Building);
+        let line = r.line();
+        assert!(line.len() < 512 && line.ends_with('\n'), "one short line: {line:?}");
+        assert_eq!(BuildRecord::parse(line.as_bytes()), Some(r.clone()));
+        // Bytes of an older, longer record after the line (a write cut off before the file was) do not count.
+        let mut longer = line.clone().into_bytes();
+        longer.extend_from_slice(b"state=built engine=x");
+        assert_eq!(BuildRecord::parse(&longer), Some(r.clone()), "what follows the line is not read");
+        for cut in [0, 1, line.len() / 2, line.len() - 1] {
+            assert_eq!(BuildRecord::parse(&line.as_bytes()[..cut]), None, "a record cut at {cut} bytes");
+        }
+        // One byte changed in the body: the checksum no longer matches.
+        let mut flipped = line.clone().into_bytes();
+        let at = line.find("attempts=").unwrap() + "attempts=".len();
+        flipped[at] = b'2';
+        assert_eq!(BuildRecord::parse(&flipped), None, "a changed byte");
+        // An older record's tail under a newer, shorter head (state=built over state=building): the checksum says no.
+        let mut mixed = rec(BuildState::Built).line().into_bytes();
+        mixed.truncate(20);
+        mixed.extend_from_slice(&line.as_bytes()[20..]);
+        assert_eq!(BuildRecord::parse(&mixed), None, "a head and a tail of two records");
+        assert_eq!(BuildRecord::parse(b"garbage\n"), None);
+    }
+
+    #[test]
+    fn whether_an_image_is_due() {
+        let m = me();
+        let at = |r: BuildRecord, f: &dyn Fn(&mut BuildRecord)| {
+            let mut r = r;
+            f(&mut r);
+            r
+        };
+        let base = 0x5_0000_0000;
+        assert_eq!(build_due(None, &m, base, false), Due::Yes { attempts: 0 }, "no record");
+        assert_eq!(build_due(Some(&rec(BuildState::Built)), &m, base, true), Due::No("built"));
+        assert_eq!(build_due(Some(&rec(BuildState::Built)), &m, base, false), Due::No("built, and its file gone or unloadable since, within the hour"));
+        let hour = Asker { now: 1000 + AOT_RETRY_S, ..me() };
+        assert_eq!(build_due(Some(&rec(BuildState::Built)), &hour, base, false), Due::Yes { attempts: 0 }, "built, and its file gone or unloadable an hour ago");
+        let next = Asker { boot: "B2".into(), ..me() };
+        assert_eq!(build_due(Some(&rec(BuildState::Built)), &next, base, false), Due::Yes { attempts: 0 }, "built, and its file gone in a later boot");
+        let moved = rec(BuildState::Built);
+        assert_eq!(build_due(Some(&moved), &m, base + 0x4000, false), Due::No("built at another base within the hour"));
+        let earlier = at(rec(BuildState::Built), &|r| r.boot = "B0".into());
+        assert_eq!(build_due(Some(&earlier), &m, base + 0x4000, false), Due::Yes { attempts: 0 }, "moved, in a later boot");
+        let unknown = Asker { boot: String::new(), ..me() };
+        assert_eq!(build_due(Some(&earlier), &unknown, base + 0x4000, false), Due::No("built at another base within the hour"), "boot unknown: not taken for a later one");
+        let unknown_later = Asker { boot: String::new(), now: 1000 + AOT_RETRY_S, ..me() };
+        let unrecorded = at(rec(BuildState::Built), &|r| r.boot = String::new());
+        assert_eq!(build_due(Some(&unrecorded), &unknown_later, base + 0x4000, false), Due::Yes { attempts: 0 }, "moved, the boot unknown when it was built, an hour later");
+        assert_eq!(build_due(Some(&rec(BuildState::Failed)), &m, base, false), Due::No("its build failed with this engine"));
+        assert_eq!(build_due(Some(&rec(BuildState::Failed)), &m, base + 0x4000, false), Due::No("its build failed with this engine"), "a failure is the image's, wherever it is");
+        let other = at(rec(BuildState::Failed), &|r| r.engine = "e0".into());
+        assert_eq!(build_due(Some(&other), &m, base, false), Due::No("its build failed with another engine within the hour"));
+        let later = Asker { now: 1000 + AOT_RETRY_S, ..me() };
+        assert_eq!(build_due(Some(&other), &later, base, false), Due::Yes { attempts: 0 }, "failed with another engine an hour ago");
+        let next_boot = Asker { boot: "B2".into(), ..me() };
+        assert_eq!(build_due(Some(&other), &next_boot, base, false), Due::Yes { attempts: 0 }, "failed with another engine in an earlier boot");
+        assert_eq!(build_due(Some(&rec(BuildState::Deferred)), &m, base, false), Due::No("its build was deferred within the hour"));
+        let by_other_deferred = at(rec(BuildState::Deferred), &|r| r.engine = "e0".into());
+        assert_eq!(build_due(Some(&by_other_deferred), &m, base, false), Due::No("its build was deferred within the hour"), "whichever engine deferred it");
+        assert_eq!(build_due(Some(&rec(BuildState::Deferred)), &later, base, false), Due::Yes { attempts: 0 }, "deferred an hour ago");
+        assert_eq!(build_due(Some(&rec(BuildState::Deferred)), &next_boot, base, false), Due::Yes { attempts: 0 }, "deferred in an earlier boot");
+        assert_eq!(build_due(Some(&rec(BuildState::Building)), &m, base, false), Due::Yes { attempts: 1 }, "its builder died once");
+        assert_eq!(build_due(Some(&rec(BuildState::Building)), &m, base, true), Due::No("built"), "its builder died after it published");
+        let twice = at(rec(BuildState::Building), &|r| r.attempts = AOT_MAX_ATTEMPTS);
+        assert_eq!(build_due(Some(&twice), &m, base, false), Due::No("its builder died every time"));
+        assert_eq!(build_due(Some(&twice), &next_boot, base, false), Due::Yes { attempts: 0 }, "cut off by a reboot");
+        let by_other = at(twice.clone(), &|r| r.engine = "e0".into());
+        assert_eq!(build_due(Some(&by_other), &m, base, false), Due::No("another engine's builder died within the hour"));
+        assert_eq!(build_due(Some(&by_other), &later, base, false), Due::Yes { attempts: 0 }, "another engine's builder died an hour ago");
+        assert_eq!(build_due(Some(&by_other), &next_boot, base, false), Due::Yes { attempts: 0 }, "another engine's builder died in an earlier boot");
+    }
+
+    #[test]
+    fn a_failure_that_passes_is_deferred_and_one_that_stays_is_failed() {
+        for e in [libc::ENOSPC, libc::EDQUOT, libc::EMFILE, libc::ENFILE, libc::ENOMEM, libc::EAGAIN, libc::EINTR, libc::ENOENT] {
+            assert!(is_transient(&std::io::Error::from_raw_os_error(e)), "errno {e}");
+        }
+        for e in [libc::EISDIR, libc::EACCES, libc::EINVAL] {
+            assert!(!is_transient(&std::io::Error::from_raw_os_error(e)), "errno {e}");
+        }
+        assert!(!is_transient(&std::io::Error::other("no errno")));
+        assert_eq!(BuildRecord::parse(rec(BuildState::Deferred).line().as_bytes()).map(|r| r.state), Some(BuildState::Deferred));
+    }
+
+    #[test]
+    fn only_old_builder_temporary_files_are_swept() {
+        let d = std::env::temp_dir().join(format!("mcl-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let names = ["k.aot.123.tmp", "k.aot.tmp", "k.aot.9.tmp", "k.profile.123.tmp", "k.aot", "k.aot.x.tmp", "done.123.tmp", "k.aot.123.tmp.keep"];
+        for n in names {
+            std::fs::write(d.join(n), b"x").unwrap();
+        }
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(AOT_TMP_STALE_S + 60);
+        for n in names.iter().filter(|n| **n != "k.aot.9.tmp") {
+            std::fs::File::options().write(true).open(d.join(n)).unwrap().set_modified(old).unwrap();
+        }
+        sweep_stale_tmps(&d);
+        let mut left: Vec<String> = std::fs::read_dir(&d).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, vec!["done.123.tmp", "k.aot", "k.aot.123.tmp.keep", "k.aot.9.tmp", "k.aot.x.tmp", "k.profile.123.tmp"], "an old builder's temporary file goes; a new one and anything else stays");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn this_binary_has_an_engine_id() {
+        assert!(own_uuid().is_some(), "the test binary's own LC_UUID");
+        let id = engine_id();
+        assert!(id.starts_with(&format_tag()) && !id.contains(' ') && !id.ends_with("nouuid"), "{id}");
     }
 }

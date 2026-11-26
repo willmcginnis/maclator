@@ -147,7 +147,7 @@ thread_local! {
 }
 
 /// kern.bootsessionuuid: a new value each boot.
-fn boot_session_uuid() -> Option<String> {
+pub(crate) fn boot_session_uuid() -> Option<String> {
     let mut buf = [0u8; 64];
     let mut len = buf.len();
     let r = unsafe { libc::sysctlbyname(c"kern.bootsessionuuid".as_ptr(), buf.as_mut_ptr() as *mut _, &mut len, std::ptr::null_mut(), 0) };

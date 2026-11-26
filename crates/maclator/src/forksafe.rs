@@ -233,6 +233,7 @@ mod tests {
     /// checks the paths against the files on disk.
     const SOURCES: &[(&str, &str, &str)] = &[
         ("aot", "maclator/src/aot.rs", include_str!("aot.rs")),
+        ("aot::once_tests", "maclator/src/aot_once_tests.rs", include_str!("aot_once_tests.rs")),
         ("appsandbox", "maclator/src/appsandbox.rs", include_str!("appsandbox.rs")),
         ("bundle", "maclator/src/bundle.rs", include_str!("bundle.rs")),
         ("cache", "maclator/src/cache.rs", include_str!("cache.rs")),

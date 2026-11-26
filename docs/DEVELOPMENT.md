@@ -20,8 +20,8 @@ Open problems, the bug list (so you recognise symptoms), and a short history.
 5. GPU: done for Chromium via the Metal bridge (see "GPU passthrough"); apps that present through
    `CAMetalLayer`/`MTKView` directly still need that bridged.
 6. Robustness: stale-IBTC hazard if a thread only ever hits IBTC entries after invalidation
-   (accepted risk); AOT profile saving only on graceful exit; concurrent builders write the same
-   files (last writer wins, atomic rename); `MACLATOR_SPIN_DEBUG` for infinite-dispatch bugs.
+   (accepted risk); AOT profile saving only on graceful exit; each image is built once per format, one
+   builder at a time per store (see ARCHITECTURE.md); `MACLATOR_SPIN_DEBUG` for infinite-dispatch bugs.
 7. Overcast / iOS-on-Mac apps: would need the iOS-on-Mac runtime and unencrypted binaries;
    FairPlay-encrypted App Store binaries are not runnable off Apple Silicon and circumventing DRM
    is out of scope. Suggested alternative: build your own UIKit "Designed for iPad" or Mac

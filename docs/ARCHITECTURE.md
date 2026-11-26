@@ -33,12 +33,19 @@ Images registered: main exe (fixed base), dyld, shared cache, and **every dyld-l
 library** (registered when dyld `mmap`s its executable `__TEXT` at file offset 0; key =
 `lib-<uuid>-<base>`). Bases are deterministic because `mach_vm_allocate(ANYWHERE)` is served from
 a 64 GB arena (`syscalls.rs`, candidate bases tried in order). Every block that executes
-(cold-interpreted or JIT-translated) is recorded; on exit `save_profile()` forks a builder that
-writes `<key>.aot` (position-independent x86 + index). Loaded by **copying into the JIT code
+(cold-interpreted or JIT-translated) is recorded; on exit `save_profile()` forks a builder for an image
+with no translation the run could load, which writes `<key>.aot` (position-independent x86 + index). Each image
+(kind, UUID, path) is built once per translation format, by one builder at a time per store: its record
+`<identity>.<format>.build` says built, failed (tried again by another engine), deferred (no space, descriptors
+or memory) or building (its builder died: built again, twice a boot at most), and a builder holds a lock on it while
+the image waits or builds (`aot-builder.lock`, `aot-queue-<n>.lock`); a later run's new blocks only go into the
+profile. A translation found missing or unloadable, a deferred build and another engine's failure are tried again
+after an hour or in a later boot, so to force a rebuild remove the image's `.build` record with its `.aot`. Loaded by
+**copying into the JIT code
 cache** — do NOT mmap the files PROT_EXEC (macOS Gatekeeper pops "Apple could not verify…"
-dialogs for every file). Bump `TRANSLATOR_VERSION` (currently **15**) whenever codegen changes. Every
+dialogs for every file). Bump `TRANSLATOR_VERSION` (currently **26**) whenever codegen changes. Every
 version bump invalidates the *whole* cache (files are shared between binaries: two builds with different versions on
-the same machine keep overwriting each other's cache, so A/B-test translators with `--no-aot`).
+the same machine build each image once each, and the last one's file stays, so A/B-test translators with `--no-aot`).
 Processes that are killed (`kill -9`) do not save profiles; quit gracefully (e.g. DevTools
 `Browser.close`, see `wsonly.py`) to build the cache. Rebuilds can take several minutes.
 
