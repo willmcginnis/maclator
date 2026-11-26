@@ -878,6 +878,17 @@ int main(int argc, char **argv) {
         for n in both {
             assert_eq!(call(n, &other, &[b"x" as &[u8]], 0), Some(want), "SUB/ #{n}");
         }
+        // The same by the path's first directory in another case (/PRIVATE/var/... for a fixture under /private/var),
+        // so a check that left out the leading directories fails here too.
+        let first = here.split('/').nth(1).unwrap_or_default();
+        let upper = first.to_uppercase();
+        if upper != first {
+            let other = format!("/{upper}{}/sub/arm64-copy", &here[1 + first.len()..]);
+            let want = if std::fs::metadata(&other).is_ok() { "a directory in it is spelled otherwise than its own name" } else { "the path does not resolve" };
+            for n in both {
+                assert_eq!(call(n, &other, &[b"x" as &[u8]], 0), Some(want), "{upper}/ #{n}");
+            }
+        }
     }
 
     #[test]
